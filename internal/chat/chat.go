@@ -328,6 +328,13 @@ func hasAdditionalFolderWork(folder string) bool {
 }
 
 func printCatalog(catalog []retrieval.CatalogEntry) string {
+	reply := catalogText(catalog)
+	fmt.Println("\nAthena")
+	fmt.Println(reply)
+	return reply
+}
+
+func catalogText(catalog []retrieval.CatalogEntry) string {
 	var b strings.Builder
 	if len(catalog) == 0 {
 		b.WriteString("Your vault is empty.")
@@ -345,10 +352,7 @@ func printCatalog(catalog []retrieval.CatalogEntry) string {
 			fmt.Fprintf(&b, "\n• %s — %s", note.Title, folder)
 		}
 	}
-	reply := b.String()
-	fmt.Println("\nAthena")
-	fmt.Println(reply)
-	return reply
+	return b.String()
 }
 
 // isBookMoveRequest recognizes a high-confidence organization request that

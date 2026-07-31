@@ -1,9 +1,9 @@
-# Configuration and bootstrap
+# Configuration and startup
 
 ## Ownership
 
 - `cmd/athena/main.go` composes dependencies and registers action handlers.
-- `internal/config` loads and saves user configuration.
+- `internal/config` loads and saves local YAML configuration.
 
 ## Startup flow
 
@@ -24,5 +24,4 @@ directory, not inside this repository.
 - Add an action handler in `buildDispatcher` whenever an action is advertised
   in `internal/ai/prompt.go`.
 - Keep startup wiring in `main`; do not put note business rules there.
-- Configuration is local and can contain filesystem paths. Do not log secrets
-  if credentials are added later.
+- Do not log future credentials or secrets.

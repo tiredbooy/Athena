@@ -77,9 +77,20 @@ func (s *Service) BuildContextWithProgress(
 		return nil, err
 	}
 	out.Catalog = catalog
+	reportProgress(progress, fmt.Sprintf("Inventory ready: %d notes", len(catalog)))
+	pathsByID := make(map[int64]string, len(catalog))
+	for _, entry := range catalog {
+		pathsByID[entry.ID] = entry.Rel
+	}
+	reportProgress(progress, "Reading folder tree")
+	folders, err := utils.ListFolders(s.vaultPath)
+	if err != nil {
+		return nil, fmt.Errorf("list folder tree: %w", err)
+	}
 
 	var builder strings.Builder
 	builder.WriteString(formatCatalog(catalog))
+	builder.WriteString(formatFolders(folders))
 	builder.WriteString("\n")
 
 	// Empty vault: skip the embedding round-trip entirely.
@@ -88,7 +99,7 @@ func (s *Service) BuildContextWithProgress(
 		return out, nil
 	}
 
-	reportProgress(progress, "Searching note content")
+	reportProgress(progress, fmt.Sprintf("Embedding your question with %s", s.ai.EmbedModel()))
 	results, err := s.Search(ctx, query, topK)
 	if err != nil {
 		return nil, err
@@ -102,12 +113,13 @@ func (s *Service) BuildContextWithProgress(
 			continue
 		}
 
+		if rel := pathsByID[r.Chunk.NoteID]; rel != "" {
+			reportProgress(progress, fmt.Sprintf("Reading %s", rel))
+		}
 		note, err := s.noteStore.GetByID(r.Chunk.NoteID)
 		if err != nil || note == nil {
 			continue
 		}
-		rel, _ := s.withRel(s.vaultPath, note.Path)
-		reportProgress(progress, fmt.Sprintf("Reading %s", rel))
 		// One hit per note — keep the highest-scoring chunk (results are
 		// already ranked descending).
 		if seen[note.ID] {
@@ -211,6 +223,20 @@ func formatCatalog(catalog []CatalogEntry) string {
 			}
 		}
 		b.WriteString(fmt.Sprintf("- note_id=%d | %s | folder=%s (%s%s)\n", e.ID, e.Title, loc, kind, extra))
+	}
+	return b.String()
+}
+
+func formatFolders(folders []string) string {
+	if len(folders) == 0 {
+		return "Folder tree: vault root only.\n"
+	}
+	var b strings.Builder
+	b.WriteString("Folder tree:\n")
+	for _, folder := range folders {
+		b.WriteString("- ")
+		b.WriteString(folder)
+		b.WriteByte('\n')
 	}
 	return b.String()
 }

@@ -38,6 +38,9 @@ type Action struct {
 	Content   string   `json:"content,omitempty"`
 	Tags      []string `json:"tags,omitempty"`
 	Folder    string   `json:"folder,omitempty"`
+	// Path is accepted from weaker models that use a generic path field for a
+	// folder action. normalizeAction maps it into Folder before dispatch.
+	Path      string   `json:"path,omitempty"`
 	NewFolder string   `json:"new_folder,omitempty"`
 	Paths     []string `json:"paths,omitempty"`
 	Done      bool     `json:"done,omitempty"`
@@ -175,7 +178,7 @@ func decodeActions(payload string) []Action {
 		return nil
 	}
 	if action.Type != "" {
-		return []Action{action}
+		return validActions([]Action{action})
 	}
 
 	var envelope struct {
@@ -190,9 +193,35 @@ func decodeActions(payload string) []Action {
 func validActions(actions []Action) []Action {
 	valid := actions[:0]
 	for _, action := range actions {
+		action = normalizeAction(action)
 		if action.Type != "" {
 			valid = append(valid, action)
 		}
 	}
 	return valid
+}
+
+func normalizeAction(action Action) Action {
+	if action.Folder == "" {
+		action.Folder = action.Path
+	}
+	switch strings.ToLower(strings.ReplaceAll(action.Type, "-", "_")) {
+	case "createfolder", "make_folder", "makefolder":
+		action.Type = "create_folder"
+	case "deletefolder", "remove_folder", "removefolder":
+		action.Type = "delete_folder"
+	case "ensurefolders":
+		action.Type = "ensure_folders"
+	case "movenote":
+		action.Type = "move_note"
+	case "movefolder":
+		action.Type = "move_folder"
+	case "renamefolder":
+		action.Type = "rename_folder"
+	case "createnote":
+		action.Type = "create_note"
+	case "createtask":
+		action.Type = "create_task"
+	}
+	return action
 }

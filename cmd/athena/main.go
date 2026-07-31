@@ -14,6 +14,7 @@ import (
 	"github.com/tiredbooy/internal/retrieval"
 	"github.com/tiredbooy/internal/storage"
 	"github.com/tiredbooy/internal/tools"
+	"github.com/tiredbooy/internal/tui"
 )
 
 func main() {
@@ -50,7 +51,11 @@ func main() {
 	fmt.Println("second-brain ready.")
 	fmt.Printf("  vault: %s\n  db:    %s\n  model: %s\n\n", cfg.VaultPath, cfg.DBPath, cfg.ChatModel)
 
-	chat.NewLoop(client, retrievalSvc, dispatcher, cfg).Run()
+	loop := chat.NewLoop(client, retrievalSvc, dispatcher, cfg)
+	session := chat.NewSession(loop)
+	if err := tui.RunBubble(session.Submit, session.Clear); err != nil {
+		fatal("run terminal UI", err)
+	}
 }
 
 // buildDispatcher registers every action type the model is allowed to

@@ -218,6 +218,7 @@ func (c *Client) StreamChatWith(ctx context.Context, messages []models.Message, 
 		Model:     model,
 		Messages:  messages,
 		Stream:    true,
+		Think:     false,
 		KeepAlive: "60s",
 	})
 	if err != nil {
@@ -242,6 +243,7 @@ func (c *Client) StreamChatWith(ctx context.Context, messages []models.Message, 
 	}
 
 	var full strings.Builder
+	visible := false
 	decoder := json.NewDecoder(resp.Body)
 	for {
 		var chunk chatResponse
@@ -255,11 +257,15 @@ func (c *Client) StreamChatWith(ctx context.Context, messages []models.Message, 
 			cb.OnThinking(chunk.Message.Thinking)
 		}
 		if chunk.Message.Content != "" {
+			visible = true
 			if cb.OnToken != nil {
 				cb.OnToken(chunk.Message.Content)
 			}
 			full.WriteString(chunk.Message.Content)
 		}
+	}
+	if !visible {
+		return "", fmt.Errorf("model %q produced no visible response", model)
 	}
 	return full.String(), nil
 }

@@ -99,6 +99,14 @@ func TestExtractActions_BatchEnvelope(t *testing.T) {
 	}
 }
 
+func TestExtractActions_NormalizesWeakModelFolderAction(t *testing.T) {
+	raw := "```action\n" + `{"type":"createfolder","path":"projects/ideas"}` + "\n```"
+	_, found := ExtractActions(raw)
+	if len(found) != 1 || found[0].Type != "create_folder" || found[0].Folder != "projects/ideas" {
+		t.Fatalf("actions = %+v, want normalized create folder action", found)
+	}
+}
+
 func TestExtractActions_NoFence(t *testing.T) {
 	raw := "Just a normal reply with no tools."
 	cleaned, found := ExtractActions(raw)

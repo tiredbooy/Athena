@@ -1,25 +1,29 @@
 # Athena documentation
 
-This folder documents Athena by domain. Read this file first, then open the
-domain that matches the change you are making.
+This folder documents Athena by responsibility. Each domain has its own folder
+and `README.md`. Future proposals live outside this folder in `/plans`.
 
 | Domain | Responsibility | Document |
 | --- | --- | --- |
-| Bootstrap and configuration | Starts the application and owns local configuration. | [configuration](domains/configuration.md) |
-| Notes and vault files | Markdown notes, folders, tasks, archive, and trash. | [notes-and-vault](domains/notes-and-vault.md) |
-| Storage and retrieval | SQLite records, embeddings, and search context. | [storage-and-retrieval](domains/storage-and-retrieval.md) |
-| AI and actions | Ollama client, prompt, action JSON, and dispatching. | [ai-and-actions](domains/ai-and-actions.md) |
-| Chat and terminal UI | Turn orchestration, status display, and commands. | [chat-and-tui](domains/chat-and-tui.md) |
-| Planned work | Recommendation policy and the TypeScript TUI migration. | [planned-work](planned-work.md) |
+| Application startup | Composition root and YAML configuration. | [configuration](configuration/README.md) |
+| Notes and vault files | Markdown notes, folders, tasks, archive, and trash. | [notes](notes/README.md) |
+| Data and search | SQLite records, embeddings, and retrieval context. | [retrieval](retrieval/README.md) |
+| AI planning and execution | Ollama client, action extraction, batches, and dispatching. | [ai](ai/README.md) |
+| Chat behavior | Turn orchestration, shortcuts, history, and visible errors. | [chat](chat/README.md) |
+| Terminal user interface | Bubble Tea workspace, command palette, streaming, and themes. | [tui](tui/README.md) |
+
+## Future plans
+
+- [Organization recommendations](../plans/organization-recommendations.md)
 
 ## Architectural rule
 
 The dependency direction is:
 
 ```text
-Terminal UI / future TypeScript UI
-            ↓
-          chat
+Terminal UI
+    ↓
+chat / application orchestration
             ↓
  notes, retrieval, AI actions
             ↓
