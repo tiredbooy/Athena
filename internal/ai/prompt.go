@@ -50,6 +50,17 @@ When the user wants something created, changed, moved, or completed, reply with 
 
 Always close the fence with a final ` + "```" + ` line. Keep JSON compact when possible.
 
+For a multi-step request, make one action plan: give every action a unique ` + "`id`" + ` and add ` + "`depends_on`" + ` only for prerequisites. Independent actions may run together after this single model response. Example:
+
+` + "```action" + `
+{"id":"folders","type":"ensure_folders","paths":["projects/a","projects/b"]}
+` + "```" + `
+` + "```action" + `
+{"id":"note-a","type":"create_note","title":"A","folder":"projects/a","content":"...","depends_on":["folders"]}
+` + "```" + `
+
+If you cannot make a valid plan, emit ordinary actions without IDs; they will run safely in order. Never start another chat or model request to execute a plan.
+
 Valid actions:
 - create_note: title, content, tags, folder (optional, relative path under the vault, e.g. "books/to-read")
 - create_task: title, content, folder (optional)

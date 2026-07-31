@@ -26,6 +26,12 @@ import (
 //   - archive_note:      NoteID
 //   - unarchive_note:   NoteID
 type Action struct {
+	// ID identifies an action within a batch plan. It is optional for
+	// single/legacy actions; a batch runs concurrently only when every action
+	// has a unique ID.
+	ID string `json:"id,omitempty"`
+	// DependsOn names actions that must succeed before this one can run.
+	DependsOn []string `json:"depends_on,omitempty"`
 	Type      string   `json:"type"`
 	NoteID    int64    `json:"note_id,omitempty"`
 	Title     string   `json:"title,omitempty"`
@@ -38,9 +44,11 @@ type Action struct {
 }
 
 type ActionResult struct {
-	Action  Action
-	Message string
-	Err     error
+	Action  Action `json:"action"`
+	Message string `json:"message,omitempty"`
+	// Error is the transport-safe form of Err for a future UI protocol.
+	Error string `json:"error,omitempty"`
+	Err   error  `json:"-"`
 }
 
 // ExtractActions pulls action blocks out of raw model output, returning
@@ -71,7 +79,7 @@ func ExtractActions(raw string) (cleaned string, found []Action) {
 		// Optional language tag whitespace / newline after the fence opener.
 		after = strings.TrimLeft(after, " \t\r\n")
 
-		payload, consumed, ok := takeJSONObject(after)
+		payload, consumed, ok := takeJSONValue(after)
 		if !ok {
 			// No parseable object — keep the fence text as-is so the user
 			// still sees what the model wrote.
@@ -79,10 +87,7 @@ func ExtractActions(raw string) (cleaned string, found []Action) {
 			break
 		}
 
-		var a Action
-		if err := json.Unmarshal([]byte(payload), &a); err == nil && a.Type != "" {
-			found = append(found, a)
-		}
+		found = append(found, decodeActions(payload)...)
 
 		// Skip trailing whitespace and an optional closing fence.
 		tail := after[consumed:]
@@ -96,16 +101,21 @@ func ExtractActions(raw string) (cleaned string, found []Action) {
 	return strings.TrimSpace(b.String()), found
 }
 
-// takeJSONObject finds the first '{' and returns the brace-balanced slice
-// that follows, respecting string escapes so "}" inside a string doesn't
-// end the object early. consumed is the byte offset in s past the object.
-func takeJSONObject(s string) (obj string, consumed int, ok bool) {
-	start := strings.IndexByte(s, '{')
+// takeJSONValue finds the first JSON object or array and returns the balanced
+// value. Small models commonly emit either one action object, an array of
+// actions, or an {"actions":[...]} envelope inside an action fence.
+func takeJSONValue(s string) (value string, consumed int, ok bool) {
+	objectStart := strings.IndexByte(s, '{')
+	arrayStart := strings.IndexByte(s, '[')
+	start := objectStart
+	if start < 0 || (arrayStart >= 0 && arrayStart < start) {
+		start = arrayStart
+	}
 	if start < 0 {
 		return "", 0, false
 	}
 
-	depth := 0
+	stack := make([]byte, 0, 4)
 	inString := false
 	escape := false
 
@@ -130,13 +140,59 @@ func takeJSONObject(s string) (obj string, consumed int, ok bool) {
 		case '"':
 			inString = true
 		case '{':
-			depth++
+			stack = append(stack, '}')
+		case '[':
+			stack = append(stack, ']')
 		case '}':
-			depth--
-			if depth == 0 {
-				return s[start : i+1], i + 1, true
+			if len(stack) == 0 || stack[len(stack)-1] != '}' {
+				return "", 0, false
 			}
+			stack = stack[:len(stack)-1]
+		case ']':
+			if len(stack) == 0 || stack[len(stack)-1] != ']' {
+				return "", 0, false
+			}
+			stack = stack[:len(stack)-1]
+		}
+		if len(stack) == 0 {
+			return s[start : i+1], i + 1, true
 		}
 	}
 	return "", 0, false
+}
+
+func decodeActions(payload string) []Action {
+	if strings.HasPrefix(strings.TrimSpace(payload), "[") {
+		var actions []Action
+		if err := json.Unmarshal([]byte(payload), &actions); err != nil {
+			return nil
+		}
+		return validActions(actions)
+	}
+
+	var action Action
+	if err := json.Unmarshal([]byte(payload), &action); err != nil {
+		return nil
+	}
+	if action.Type != "" {
+		return []Action{action}
+	}
+
+	var envelope struct {
+		Actions []Action `json:"actions"`
+	}
+	if err := json.Unmarshal([]byte(payload), &envelope); err != nil {
+		return nil
+	}
+	return validActions(envelope.Actions)
+}
+
+func validActions(actions []Action) []Action {
+	valid := actions[:0]
+	for _, action := range actions {
+		if action.Type != "" {
+			valid = append(valid, action)
+		}
+	}
+	return valid
 }

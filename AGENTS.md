@@ -363,3 +363,90 @@ Before making any significant change, answer these questions internally and summ
 - Could existing code be reused?
 
 If any answer is unclear, inspect the codebase further before implementing changes.
+
+# Code Quality
+
+Every implementation should prioritize long-term maintainability over speed of implementation.
+
+Write code that another engineer can understand six months from now without additional explanation.
+
+## General Principles
+
+Prefer:
+
+- simple solutions
+- readable code
+- explicit behavior
+- small, focused functions
+- reusable components
+- low coupling
+- high cohesion
+
+Avoid:
+
+- large files
+- long functions
+- unnecessary abstractions
+- duplicated logic
+- deeply nested control flow
+- clever one-liners
+- hidden side effects
+- magic values
+
+Code should be easy to modify, debug, and extend.
+
+# File Organization
+
+Keep files focused on a single responsibility.
+
+As a guideline:
+
+- avoid files larger than roughly 300 lines
+- consider refactoring once a file approaches 400 lines
+- files exceeding 500 lines should be treated as a design issue unless there is a strong justification
+
+When a file grows too large:
+
+- split by responsibility
+- extract reusable components
+- move business logic into dedicated packages
+- avoid creating "god files"
+
+The goal is discoverability, not minimizing the number of files.
+
+# Naming
+
+Names should communicate intent.
+
+Good names describe:
+
+- what something represents
+- why it exists
+- what responsibility it owns
+
+Avoid:
+
+- util
+- helper
+- misc
+- manager
+- data
+- thing
+- temp
+- obj
+
+Prefer domain language over technical language.
+
+Examples:
+
+OrderService
+InvoiceCalculator
+ProductRepository
+UserSession
+
+instead of
+
+Manager
+Utils
+ServiceImpl
+DataHandler

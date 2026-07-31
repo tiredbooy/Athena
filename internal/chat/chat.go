@@ -204,7 +204,7 @@ func (l *Loop) handleTurn(input string, historyPtr *[]models.Message) {
 	display := cleaned
 
 	if len(foundActions) > 0 && l.dispatcher != nil {
-		results := l.dispatcher.Run(ctx, foundActions)
+		results := l.dispatcher.RunBatch(ctx, foundActions, 4)
 
 		// Prefer cleaned prose in history once actions ran, plus a short
 		// machine summary of what actually happened so follow-ups work.
@@ -410,7 +410,7 @@ func (l *Loop) runActions(ctx context.Context, actions []ai.Action) string {
 	if l.dispatcher == nil {
 		return "I can't make changes because the action handler is unavailable."
 	}
-	results := l.dispatcher.Run(ctx, actions)
+	results := l.dispatcher.RunBatch(ctx, actions, 4)
 	var b strings.Builder
 	for _, result := range results {
 		if result.Err != nil {

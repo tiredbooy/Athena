@@ -73,6 +73,32 @@ func TestExtractActions_Multiple(t *testing.T) {
 	}
 }
 
+func TestExtractActions_BatchArray(t *testing.T) {
+	raw := "```action\n[" +
+		`{"id":"one","type":"create_folder","folder":"projects/a"},` +
+		`{"id":"two","type":"create_folder","folder":"projects/b"}` +
+		"]\n```"
+
+	cleaned, found := ExtractActions(raw)
+	if len(found) != 2 || found[0].ID != "one" || found[1].ID != "two" {
+		t.Fatalf("actions = %+v, want two batch actions", found)
+	}
+	if cleaned != "" {
+		t.Fatalf("cleaned = %q, want empty", cleaned)
+	}
+}
+
+func TestExtractActions_BatchEnvelope(t *testing.T) {
+	raw := "```action\n" +
+		`{"actions":[{"id":"one","type":"create_folder","folder":"projects/a"}]}` +
+		"\n```"
+
+	_, found := ExtractActions(raw)
+	if len(found) != 1 || found[0].ID != "one" {
+		t.Fatalf("actions = %+v, want envelope action", found)
+	}
+}
+
 func TestExtractActions_NoFence(t *testing.T) {
 	raw := "Just a normal reply with no tools."
 	cleaned, found := ExtractActions(raw)
