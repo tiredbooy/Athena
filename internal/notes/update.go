@@ -24,9 +24,7 @@ func (s *Service) UpdateNote(ctx context.Context, noteID int64, newBody string) 
 	if err != nil {
 		return fmt.Errorf("render markdown: %w", err)
 	}
-	if err := utils.WriteNoteFile(n.Path, content); err != nil {
-		// WriteNoteFile refuses if the file exists — for updates we WANT
-		// to overwrite, so update.go needs its own disk-write helper.
+	if err := utils.OverwriteNoteFile(n.Path, content); err != nil {
 		return fmt.Errorf("write note file: %w", err)
 	}
 

@@ -92,6 +92,11 @@ func (l *Loop) handleTurn(input string, historyPtr *[]models.Message) {
 	loader.Step("Vector search", retrievalTime)
 	loader.Step("Context assembled", 0)
 
+	if len(ctxResult.Catalog) > 0 {
+		fmt.Println()
+		fmt.Printf("Vault: %d note(s)\n", len(ctxResult.Catalog))
+	}
+
 	if len(ctxResult.Results) > 0 {
 		fmt.Println()
 		fmt.Println("Retrieved memories")
@@ -103,20 +108,29 @@ func (l *Loop) handleTurn(input string, historyPtr *[]models.Message) {
 				note.Similarity*100,
 			))
 		}
+	} else if len(ctxResult.Catalog) == 0 {
+		fmt.Println()
+		fmt.Println("Vault is empty — no notes yet.")
 	} else {
 		fmt.Println()
-		fmt.Println("No related memories found.")
+		fmt.Println("No related memories found for this query.")
 	}
 
-	turnMessage := input
-	if ctxResult.Context != "" {
-		turnMessage += "\n\n" + ctxResult.Context
-	}
-
+	// Keep chat history free of the injected vault context so follow-up
+	// turns don't accumulate stale catalogs. The model still sees the
+	// catalog for *this* turn via the messages we pass to StreamChat.
 	*historyPtr = append(*historyPtr, models.Message{
 		Role:    "user",
-		Content: turnMessage,
+		Content: input,
 	})
+
+	modelMessages := make([]models.Message, len(*historyPtr))
+	copy(modelMessages, *historyPtr)
+	if ctxResult.Context != "" {
+		// Attach retrieval context only to the latest user turn.
+		last := len(modelMessages) - 1
+		modelMessages[last].Content = input + "\n\n" + ctxResult.Context
+	}
 
 	// -------------------------------------------------------
 	// Model
@@ -128,12 +142,14 @@ func (l *Loop) handleTurn(input string, historyPtr *[]models.Message) {
 
 	reply, err := l.ai.StreamChat(
 		ctx,
-		*historyPtr,
+		modelMessages,
 		func(tok string) {
 			if firstToken {
 				loader.Stop()
 				firstToken = false
 			}
+			// Live stream shows raw tokens (including action fences).
+			// Dispatch below still parses unclosed fences from small models.
 			fmt.Print(tok)
 		},
 	)
@@ -160,7 +176,7 @@ func (l *Loop) handleTurn(input string, historyPtr *[]models.Message) {
 	// end of this function (not called early), so dispatch still has a
 	// live context as long as it finishes within the remaining timeout.
 
-	_, foundActions := ai.ExtractActions(reply)
+	cleaned, foundActions := ai.ExtractActions(reply)
 
 	if len(foundActions) > 0 && l.dispatcher != nil {
 		results := l.dispatcher.Run(ctx, foundActions)
@@ -173,11 +189,24 @@ func (l *Loop) handleTurn(input string, historyPtr *[]models.Message) {
 			}
 			fmt.Printf("✓ %s\n", r.Message)
 		}
+
+		// Prefer cleaned prose in history once actions ran, plus a short
+		// machine summary of what actually happened so follow-ups work.
+		var summary strings.Builder
+		if cleaned != "" {
+			summary.WriteString(cleaned)
+			summary.WriteString("\n\n")
+		}
+		for _, r := range results {
+			if r.Err != nil {
+				summary.WriteString(fmt.Sprintf("[action %s failed: %v]\n", r.Action.Type, r.Err))
+				continue
+			}
+			summary.WriteString(fmt.Sprintf("[action ok] %s\n", r.Message))
+		}
+		reply = strings.TrimSpace(summary.String())
 	}
 
-	// Keep the raw reply (including the fenced action block) in
-	// history so the model retains awareness of what it already
-	// did if the user follows up ("did that note get created?").
 	*historyPtr = append(*historyPtr, models.Message{
 		Role:    "assistant",
 		Content: reply,

@@ -2,7 +2,6 @@ package ai
 
 import (
 	"encoding/json"
-	"regexp"
 	"strings"
 )
 
@@ -27,30 +26,100 @@ type ActionResult struct {
 	Err     error
 }
 
-var fenceRe = regexp.MustCompile("(?s)```action\\s*(\\{.*?\\})\\s*```")
-
 // ExtractActions pulls action blocks out of raw model output, returning
 // the cleaned display text (fences stripped) plus the parsed actions.
+//
+// Tolerates the formats small local models actually produce:
+//   - properly closed ```action ... ``` fences
+//   - unclosed fences (model stops after the JSON object)
+//   - brace-balanced JSON (not non-greedy regex, which breaks on "}" in strings)
+//
 // Malformed JSON inside a fence is silently skipped rather than failing
 // the whole turn — a broken action shouldn't lose the model's reply.
 func ExtractActions(raw string) (cleaned string, found []Action) {
-	matches := fenceRe.FindAllStringSubmatchIndex(raw, -1)
-	if len(matches) == 0 {
-		return raw, nil
-	}
+	const open = "```action"
 
 	var b strings.Builder
-	last := 0
-	for _, m := range matches {
-		b.WriteString(raw[last:m[0]])
-		last = m[1]
+	rest := raw
+	for {
+		idx := strings.Index(rest, open)
+		if idx < 0 {
+			b.WriteString(rest)
+			break
+		}
 
-		payload := raw[m[2]:m[3]]
+		b.WriteString(rest[:idx])
+		after := rest[idx+len(open):]
+
+		// Optional language tag whitespace / newline after the fence opener.
+		after = strings.TrimLeft(after, " \t\r\n")
+
+		payload, consumed, ok := takeJSONObject(after)
+		if !ok {
+			// No parseable object — keep the fence text as-is so the user
+			// still sees what the model wrote.
+			b.WriteString(rest[idx:])
+			break
+		}
+
 		var a Action
 		if err := json.Unmarshal([]byte(payload), &a); err == nil && a.Type != "" {
 			found = append(found, a)
 		}
+
+		// Skip trailing whitespace and an optional closing fence.
+		tail := after[consumed:]
+		tail = strings.TrimLeft(tail, " \t\r\n")
+		if strings.HasPrefix(tail, "```") {
+			tail = tail[3:]
+		}
+		rest = tail
 	}
-	b.WriteString(raw[last:])
+
 	return strings.TrimSpace(b.String()), found
+}
+
+// takeJSONObject finds the first '{' and returns the brace-balanced slice
+// that follows, respecting string escapes so "}" inside a string doesn't
+// end the object early. consumed is the byte offset in s past the object.
+func takeJSONObject(s string) (obj string, consumed int, ok bool) {
+	start := strings.IndexByte(s, '{')
+	if start < 0 {
+		return "", 0, false
+	}
+
+	depth := 0
+	inString := false
+	escape := false
+
+	for i := start; i < len(s); i++ {
+		c := s[i]
+
+		if inString {
+			if escape {
+				escape = false
+				continue
+			}
+			switch c {
+			case '\\':
+				escape = true
+			case '"':
+				inString = false
+			}
+			continue
+		}
+
+		switch c {
+		case '"':
+			inString = true
+		case '{':
+			depth++
+		case '}':
+			depth--
+			if depth == 0 {
+				return s[start : i+1], i + 1, true
+			}
+		}
+	}
+	return "", 0, false
 }
