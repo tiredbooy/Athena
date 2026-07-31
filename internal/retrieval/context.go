@@ -40,6 +40,11 @@ type RetrievedNote struct {
 	Content    string
 }
 
+// ProgressFunc receives short descriptions of retrieval work. Keeping this
+// callback in the retrieval layer means callers can report progress without
+// coupling retrieval to a specific terminal or graphical UI.
+type ProgressFunc func(message string)
+
 // Inventory returns the complete note catalog without doing vector search.
 // It is used for exact listing requests, where embedding a query would only
 // add latency and cannot improve the answer.
@@ -52,9 +57,21 @@ func (s *Service) BuildContext(
 	query string,
 	topK int,
 ) (*ContextResult, error) {
+	return s.BuildContextWithProgress(ctx, query, topK, nil)
+}
+
+// BuildContextWithProgress builds the prompt context and reports the actual
+// vault steps it takes. A nil progress callback disables reporting.
+func (s *Service) BuildContextWithProgress(
+	ctx context.Context,
+	query string,
+	topK int,
+	progress ProgressFunc,
+) (*ContextResult, error) {
 
 	out := &ContextResult{}
 
+	reportProgress(progress, "Reading vault inventory")
 	catalog, err := s.buildCatalog()
 	if err != nil {
 		return nil, err
@@ -71,6 +88,7 @@ func (s *Service) BuildContext(
 		return out, nil
 	}
 
+	reportProgress(progress, "Searching note content")
 	results, err := s.Search(ctx, query, topK)
 	if err != nil {
 		return nil, err
@@ -88,6 +106,8 @@ func (s *Service) BuildContext(
 		if err != nil || note == nil {
 			continue
 		}
+		rel, _ := s.withRel(s.vaultPath, note.Path)
+		reportProgress(progress, fmt.Sprintf("Reading %s", rel))
 		// One hit per note — keep the highest-scoring chunk (results are
 		// already ranked descending).
 		if seen[note.ID] {
@@ -122,6 +142,12 @@ func (s *Service) BuildContext(
 
 	out.Context = strings.TrimSpace(builder.String())
 	return out, nil
+}
+
+func reportProgress(progress ProgressFunc, message string) {
+	if progress != nil {
+		progress(message)
+	}
 }
 
 func (s *Service) buildCatalog() ([]CatalogEntry, error) {

@@ -21,7 +21,8 @@ type Client struct {
 	embedModel string
 	http       *http.Client
 
-	mu sync.RWMutex
+	mu          sync.RWMutex
+	inferenceMu sync.Mutex
 }
 
 func NewClient(host, chatModel, embedModel string) *Client {
@@ -205,6 +206,12 @@ func (c *Client) StreamChat(ctx context.Context, messages []models.Message, onTo
 }
 
 func (c *Client) StreamChatWith(ctx context.Context, messages []models.Message, cb StreamCallbacks) (string, error) {
+	// Ollama serves both chat completion and embedding requests from the same
+	// local model runtime. Serializing inference prevents a batch of actions
+	// from competing for a small GPU after the single planning chat finishes.
+	c.inferenceMu.Lock()
+	defer c.inferenceMu.Unlock()
+
 	model := c.ChatModel()
 
 	body, err := json.Marshal(models.MessageReq{
@@ -258,6 +265,9 @@ func (c *Client) StreamChatWith(ctx context.Context, messages []models.Message, 
 }
 
 func (c *Client) Embed(ctx context.Context, text string) ([]float32, error) {
+	c.inferenceMu.Lock()
+	defer c.inferenceMu.Unlock()
+
 	body, err := json.Marshal(models.EmbeddingReq{Model: c.embedModel, Prompt: text})
 	if err != nil {
 		return nil, fmt.Errorf("marshal embed request: %w", err)

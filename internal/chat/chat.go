@@ -122,14 +122,13 @@ func (l *Loop) handleTurn(input string, historyPtr *[]models.Message) {
 		)
 		return
 	}
-
 	// -------------------------------------------------------
 	// Retrieval
 	// -------------------------------------------------------
 
 	retrievalStart := time.Now()
 
-	ctxResult, err := l.retrieval.BuildContext(ctx, input, 4)
+	ctxResult, err := l.retrieval.BuildContextWithProgress(ctx, input, 4, loader.Info)
 
 	retrievalTime := time.Since(retrievalStart)
 
@@ -163,6 +162,7 @@ func (l *Loop) handleTurn(input string, historyPtr *[]models.Message) {
 	// Model
 	// -------------------------------------------------------
 
+	loader.Info("Thinking about your question")
 	loader.Waiting()
 
 	firstToken := true
@@ -242,7 +242,7 @@ func (l *Loop) handleTurn(input string, historyPtr *[]models.Message) {
 	}
 
 	if display == "" {
-		display = "I couldn't produce a readable answer. Please try again."
+		display = "The model returned no visible answer. No vault changes were made; please try again."
 		if strings.TrimSpace(reply) == "" {
 			reply = display
 		}

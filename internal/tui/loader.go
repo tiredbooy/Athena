@@ -21,6 +21,7 @@ type Loader struct {
 	stop  chan struct{}
 	done  bool
 	phase string // "think" | "reason" | ""
+	info  string // current caller-supplied activity, if any
 
 	wg sync.WaitGroup
 }
@@ -57,7 +58,9 @@ func (l *Loader) Memory(name string) {
 func (l *Loader) Info(line string) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	_ = line
+	if !l.done {
+		l.info = line
+	}
 }
 
 // Waiting marks the single activity line as model work. Start already starts
@@ -87,6 +90,7 @@ func (l *Loader) spin() {
 		case <-ticker.C:
 			l.mu.Lock()
 			phase := l.phase
+			info := l.info
 			l.mu.Unlock()
 
 			if phase == "" {
@@ -103,14 +107,18 @@ func (l *Loader) spin() {
 			i++
 
 			var line string
-			switch phase {
-			case "reason":
-				line = fmt.Sprintf("%s Thinking… %.1fs", frame, elapsed)
-			case "stream":
-				line = fmt.Sprintf("%s Writing… %.1fs", frame, elapsed)
-			default:
-				tip := thinkingTips[tipIdx]
-				line = fmt.Sprintf("%s %s  %.1fs", frame, tip, elapsed)
+			if info != "" {
+				line = fmt.Sprintf("%s %s  %.1fs", frame, info, elapsed)
+			} else {
+				switch phase {
+				case "reason":
+					line = fmt.Sprintf("%s Thinking… %.1fs", frame, elapsed)
+				case "stream":
+					line = fmt.Sprintf("%s Writing… %.1fs", frame, elapsed)
+				default:
+					tip := thinkingTips[tipIdx]
+					line = fmt.Sprintf("%s %s  %.1fs", frame, tip, elapsed)
+				}
 			}
 			fmt.Printf("\r\033[2K%s", line)
 		}

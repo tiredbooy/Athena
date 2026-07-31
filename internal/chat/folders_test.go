@@ -1,6 +1,8 @@
 package chat
 
-import "testing"
+import (
+	"testing"
+)
 
 func TestFolderActions(t *testing.T) {
 	tests := []struct {
