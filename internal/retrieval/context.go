@@ -6,28 +6,63 @@ import (
 	"strings"
 )
 
-// BuildContext runs a search and formats the results into a plain-text
-// block suitable for injecting into the chat system prompt, so the model
-// can answer using the user's actual notes instead of guessing.
-func (s *Service) BuildContext(ctx context.Context, query string, topK int) (string, error) {
+type ContextResult struct {
+	Context string
+	Results []RetrievedNote
+}
+
+type RetrievedNote struct {
+	Title      string
+	Path       string
+	Similarity float32
+	Content    string
+}
+
+func (s *Service) BuildContext(
+	ctx context.Context,
+	query string,
+	topK int,
+) (*ContextResult, error) {
+
 	results, err := s.Search(ctx, query, topK)
 	if err != nil {
-		return "", err
-	}
-	if len(results) == 0 {
-		return "No related notes found.", nil
+		return nil, err
 	}
 
-	var b strings.Builder
-	b.WriteString("Relevant notes from the user's vault:\n\n")
+	out := &ContextResult{}
+
+	if len(results) == 0 {
+		out.Context = "No related notes found."
+		return out, nil
+	}
+
+	var builder strings.Builder
+
+	builder.WriteString("Relevant notes from the user's vault:\n\n")
 
 	for _, r := range results {
+
 		note, err := s.noteStore.GetByID(r.Chunk.NoteID)
 		if err != nil || note == nil {
-			continue // chunk's parent note vanished somehow; skip rather than fail the whole context
+			continue
 		}
-		b.WriteString(fmt.Sprintf("--- %s (similarity %.2f) ---\n%s\n\n", note.Title, r.Score, r.Chunk.Content))
+
+		out.Results = append(out.Results, RetrievedNote{
+			Title:      note.Title,
+			Path:       note.Path,
+			Similarity: r.Score,
+			Content:    r.Chunk.Content,
+		})
+
+		builder.WriteString(fmt.Sprintf(
+			"--- %s (similarity %.2f) ---\n%s\n\n",
+			note.Title,
+			r.Score,
+			r.Chunk.Content,
+		))
 	}
 
-	return b.String(), nil
+	out.Context = builder.String()
+
+	return out, nil
 }
