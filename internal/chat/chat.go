@@ -5,10 +5,12 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/tiredbooy/internal/ai"
+	"github.com/tiredbooy/internal/config"
 	"github.com/tiredbooy/internal/models"
 	"github.com/tiredbooy/internal/retrieval"
 	"github.com/tiredbooy/internal/tools"
@@ -19,10 +21,11 @@ type Loop struct {
 	ai         *ai.Client
 	retrieval  *retrieval.Service
 	dispatcher *tools.Dispatcher
+	config     *config.Config
 }
 
-func NewLoop(aiClient *ai.Client, retrievalSvc *retrieval.Service, dispatcher *tools.Dispatcher) *Loop {
-	return &Loop{ai: aiClient, retrieval: retrievalSvc, dispatcher: dispatcher}
+func NewLoop(aiClient *ai.Client, retrievalSvc *retrieval.Service, dispatcher *tools.Dispatcher, cfg *config.Config) *Loop {
+	return &Loop{ai: aiClient, retrieval: retrievalSvc, dispatcher: dispatcher, config: cfg}
 }
 
 func (l *Loop) Run() {
@@ -39,7 +42,7 @@ func (l *Loop) Run() {
 	fmt.Println("──────────────────────────────────────────────")
 	fmt.Println("🦉 Athena")
 	fmt.Println("──────────────────────────────────────────────")
-	fmt.Println("Type a message ('exit' to quit).")
+	fmt.Println("Ask anything. /models changes your model · exit quits.")
 
 	for {
 		fmt.Print("\n> ")
@@ -57,6 +60,10 @@ func (l *Loop) Run() {
 		if input == "exit" || input == "quit" {
 			break
 		}
+		if strings.HasPrefix(input, "/") {
+			l.handleCommand(input)
+			continue
+		}
 
 		l.handleTurn(input, &history)
 	}
@@ -70,6 +77,39 @@ func (l *Loop) handleTurn(input string, historyPtr *[]models.Message) {
 
 	loader := tui.NewLoader()
 	loader.Start()
+	if isBookMoveRequest(input) {
+		catalog, err := l.retrieval.Inventory()
+		if err != nil {
+			loader.Stop()
+			fmt.Printf("\nCould not inspect your vault: %v\n", err)
+			return
+		}
+		if actions, ok := bookMoveActions(input, catalog); ok {
+			loader.Stop()
+			reply := l.runActions(ctx, actions)
+			fmt.Println("\nAthena")
+			fmt.Println(reply)
+			*historyPtr = append(*historyPtr,
+				models.Message{Role: "user", Content: input},
+				models.Message{Role: "assistant", Content: reply},
+			)
+			return
+		}
+	}
+	if isListingRequest(input) {
+		catalog, err := l.retrieval.Inventory()
+		loader.Stop()
+		if err != nil {
+			fmt.Printf("\nCould not list your notes: %v\n", err)
+			return
+		}
+		reply := printCatalog(catalog)
+		*historyPtr = append(*historyPtr,
+			models.Message{Role: "user", Content: input},
+			models.Message{Role: "assistant", Content: reply},
+		)
+		return
+	}
 
 	// -------------------------------------------------------
 	// Retrieval
@@ -91,31 +131,6 @@ func (l *Loop) handleTurn(input string, historyPtr *[]models.Message) {
 
 	loader.Step("Vector search", retrievalTime)
 	loader.Step("Context assembled", 0)
-
-	if len(ctxResult.Catalog) > 0 {
-		fmt.Println()
-		fmt.Printf("Vault: %d note(s)\n", len(ctxResult.Catalog))
-	}
-
-	if len(ctxResult.Results) > 0 {
-		fmt.Println()
-		fmt.Println("Retrieved memories")
-
-		for _, note := range ctxResult.Results {
-			loader.Memory(fmt.Sprintf(
-				"%s (%.0f%%)",
-				note.Title,
-				note.Similarity*100,
-			))
-		}
-	} else if len(ctxResult.Catalog) == 0 {
-		fmt.Println()
-		fmt.Println("Vault is empty — no notes yet.")
-	} else {
-		fmt.Println()
-		fmt.Println("No related memories found for this query.")
-	}
-
 	// Keep chat history free of the injected vault context so follow-up
 	// turns don't accumulate stale catalogs. The model still sees the
 	// catalog for *this* turn via the messages we pass to StreamChat.
@@ -140,23 +155,22 @@ func (l *Loop) handleTurn(input string, historyPtr *[]models.Message) {
 
 	firstToken := true
 
-	reply, err := l.ai.StreamChat(
+	reply, err := l.ai.StreamChatWith(
 		ctx,
 		modelMessages,
-		func(tok string) {
-			if firstToken {
-				loader.Stop()
-				firstToken = false
-			}
-			// Live stream shows raw tokens (including action fences).
-			// Dispatch below still parses unclosed fences from small models.
-			fmt.Print(tok)
+		ai.StreamCallbacks{
+			OnThinking: func(delta string) { loader.NoteReasoning(len(delta)) },
+			OnToken: func(tok string) {
+				if firstToken {
+					loader.TransitionToReply()
+					firstToken = false
+				}
+				loader.NoteStream(len(tok))
+			},
 		},
 	)
 
-	if firstToken {
-		loader.Stop()
-	}
+	loader.Stop()
 
 	if err != nil {
 		fmt.Printf("\nError: %v\n", err)
@@ -167,8 +181,6 @@ func (l *Loop) handleTurn(input string, historyPtr *[]models.Message) {
 		return
 	}
 
-	fmt.Println()
-
 	// -------------------------------------------------------
 	// Tool / action dispatch
 	// -------------------------------------------------------
@@ -177,18 +189,10 @@ func (l *Loop) handleTurn(input string, historyPtr *[]models.Message) {
 	// live context as long as it finishes within the remaining timeout.
 
 	cleaned, foundActions := ai.ExtractActions(reply)
+	display := cleaned
 
 	if len(foundActions) > 0 && l.dispatcher != nil {
 		results := l.dispatcher.Run(ctx, foundActions)
-
-		fmt.Println()
-		for _, r := range results {
-			if r.Err != nil {
-				fmt.Printf("✗ %s failed: %v\n", r.Action.Type, r.Err)
-				continue
-			}
-			fmt.Printf("✓ %s\n", r.Message)
-		}
 
 		// Prefer cleaned prose in history once actions ran, plus a short
 		// machine summary of what actually happened so follow-ups work.
@@ -207,8 +211,204 @@ func (l *Loop) handleTurn(input string, historyPtr *[]models.Message) {
 		reply = strings.TrimSpace(summary.String())
 	}
 
+	if display != "" {
+		fmt.Println("\nAthena")
+		fmt.Println(tui.RenderMarkdown(display))
+	}
+
 	*historyPtr = append(*historyPtr, models.Message{
 		Role:    "assistant",
 		Content: reply,
 	})
+}
+
+func (l *Loop) handleCommand(input string) {
+	fields := strings.Fields(input)
+	if len(fields) == 0 {
+		return
+	}
+
+	switch fields[0] {
+	case "/help":
+		fmt.Println("Commands: /models, /model <number-or-name>, /help, exit")
+	case "/models":
+		l.printModels()
+	case "/model":
+		if len(fields) != 2 {
+			l.printModels()
+			return
+		}
+		l.selectModel(fields[1])
+	default:
+		fmt.Printf("Unknown command %q. Run /help.\n", fields[0])
+	}
+}
+
+func isListingRequest(input string) bool {
+	q := strings.ToLower(strings.TrimSpace(input))
+	return strings.Contains(q, "what notes do i have") ||
+		strings.Contains(q, "list my notes") ||
+		strings.Contains(q, "show my notes") ||
+		q == "list notes" || q == "show notes" || q == "my notes"
+}
+
+func printCatalog(catalog []retrieval.CatalogEntry) string {
+	var b strings.Builder
+	if len(catalog) == 0 {
+		b.WriteString("Your vault is empty.")
+	} else {
+		fmt.Fprintf(&b, "%d note", len(catalog))
+		if len(catalog) != 1 {
+			b.WriteByte('s')
+		}
+		b.WriteString(" in your vault:")
+		for _, note := range catalog {
+			folder := note.Folder
+			if folder == "" {
+				folder = "vault root"
+			}
+			fmt.Fprintf(&b, "\n• %s — %s", note.Title, folder)
+		}
+	}
+	reply := b.String()
+	fmt.Println("\nAthena")
+	fmt.Println(reply)
+	return reply
+}
+
+// isBookMoveRequest recognizes a high-confidence organization request that
+// should not rely on a small local model correctly producing tool JSON.
+func isBookMoveRequest(input string) bool {
+	q := strings.ToLower(input)
+	return strings.Contains(q, "book") && strings.Contains(q, "folder") &&
+		strings.Contains(q, "reading") && strings.Contains(q, "move")
+}
+
+func bookMoveActions(input string, catalog []retrieval.CatalogEntry) ([]ai.Action, bool) {
+	queryWords := significantWords(input)
+	bestID, bestScore, ties := int64(0), 0, 0
+	for _, note := range catalog {
+		score := 0
+		for word := range significantWords(note.Title) {
+			if queryWords[word] {
+				score++
+			}
+		}
+		if score > bestScore {
+			bestID, bestScore, ties = note.ID, score, 1
+		} else if score == bestScore && score > 0 {
+			ties++
+		}
+	}
+	// Two title words (or a distinctive short ID such as D3) avoids moving a
+	// random note when the wording is ambiguous.
+	if bestScore < 2 || ties != 1 {
+		return nil, false
+	}
+	return []ai.Action{
+		{Type: "ensure_folders", Paths: []string{"book/reading"}},
+		{Type: "move_note", NoteID: bestID, Folder: "book/reading"},
+	}, true
+}
+
+func significantWords(text string) map[string]bool {
+	stop := map[string]bool{
+		"a": true, "about": true, "and": true, "book": true, "folder": true,
+		"for": true, "have": true, "i": true, "in": true, "make": true,
+		"me": true, "move": true, "my": true, "note": true, "reading": true,
+		"subfolder": true, "that": true, "the": true, "to": true, "want": true,
+		"with": true,
+	}
+	words := strings.FieldsFunc(strings.ToLower(text), func(r rune) bool {
+		return (r < 'a' || r > 'z') && (r < '0' || r > '9')
+	})
+	out := make(map[string]bool, len(words))
+	for _, word := range words {
+		if !stop[word] && (len(word) >= 3 || (len(word) >= 2 && word[0] >= '0' && word[0] <= '9')) {
+			out[word] = true
+		}
+	}
+	return out
+}
+
+func (l *Loop) runActions(ctx context.Context, actions []ai.Action) string {
+	if l.dispatcher == nil {
+		return "I can't make changes because the action handler is unavailable."
+	}
+	results := l.dispatcher.Run(ctx, actions)
+	var b strings.Builder
+	for _, result := range results {
+		if result.Err != nil {
+			fmt.Fprintf(&b, "Could not %s: %v\n", result.Action.Type, result.Err)
+			continue
+		}
+		fmt.Fprintf(&b, "✓ %s\n", result.Message)
+	}
+	return strings.TrimSpace(b.String())
+}
+
+func (l *Loop) printModels() {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	models, err := l.ai.ChatModels(ctx)
+	if err != nil {
+		fmt.Printf("Could not list Ollama models: %v\n", err)
+		return
+	}
+	if len(models) == 0 {
+		fmt.Println("No chat-capable Ollama models found.")
+		return
+	}
+	current := l.ai.ChatModel()
+	fmt.Println("Available chat models:")
+	for i, model := range models {
+		marker := " "
+		if model.Name == current {
+			marker = "*"
+		}
+		details := model.ParameterSize
+		if details == "" {
+			details = "local"
+		}
+		fmt.Printf("  %s %d. %s (%s)\n", marker, i+1, model.Name, details)
+	}
+	fmt.Println("Use /model <number-or-name> to switch.")
+}
+
+func (l *Loop) selectModel(choice string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	models, err := l.ai.ChatModels(ctx)
+	if err != nil {
+		fmt.Printf("Could not list Ollama models: %v\n", err)
+		return
+	}
+
+	selected := ""
+	if n, err := strconv.Atoi(choice); err == nil {
+		if n >= 1 && n <= len(models) {
+			selected = models[n-1].Name
+		}
+	} else {
+		for _, model := range models {
+			if model.Name == choice {
+				selected = model.Name
+				break
+			}
+		}
+	}
+	if selected == "" {
+		fmt.Println("That model was not found. Run /models to see choices.")
+		return
+	}
+
+	l.ai.SetChatModel(selected)
+	if l.config != nil {
+		l.config.ChatModel = selected
+		if err := l.config.Save(); err != nil {
+			fmt.Printf("Using %s for this session, but could not save the choice: %v\n", selected, err)
+			return
+		}
+	}
+	fmt.Printf("Chat model switched to %s.\n", selected)
 }

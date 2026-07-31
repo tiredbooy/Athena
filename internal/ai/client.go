@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os/exec"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/tiredbooy/internal/models"
@@ -19,6 +20,8 @@ type Client struct {
 	chatModel  string
 	embedModel string
 	http       *http.Client
+
+	mu sync.RWMutex
 }
 
 func NewClient(host, chatModel, embedModel string) *Client {
@@ -28,6 +31,22 @@ func NewClient(host, chatModel, embedModel string) *Client {
 		embedModel: embedModel,
 		http:       &http.Client{},
 	}
+}
+
+func (c *Client) ChatModel() string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.chatModel
+}
+
+func (c *Client) SetChatModel(name string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.chatModel = strings.TrimSpace(name)
+}
+
+func (c *Client) EmbedModel() string {
+	return c.embedModel
 }
 
 func (c *Client) EnsureRunning(ctx context.Context) error {
@@ -68,15 +87,130 @@ func (c *Client) isUp(ctx context.Context) bool {
 	return resp.StatusCode == http.StatusOK
 }
 
+// ModelInfo is a locally available Ollama model.
+type ModelInfo struct {
+	Name          string
+	Size          int64
+	Capabilities  []string
+	ParameterSize string
+}
+
+// ListModels returns every model Ollama has pulled.
+func (c *Client) ListModels(ctx context.Context) ([]ModelInfo, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.host+"/api/tags", nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("list models: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("list models: status %d", resp.StatusCode)
+	}
+
+	var raw struct {
+		Models []struct {
+			Name    string `json:"name"`
+			Size    int64  `json:"size"`
+			Details struct {
+				ParameterSize string `json:"parameter_size"`
+			} `json:"details"`
+			// Newer Ollama builds put capabilities on the model object
+			// via /api/show; tags may omit them. We best-effort read both.
+			Capabilities []string `json:"capabilities"`
+		} `json:"models"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&raw); err != nil {
+		return nil, fmt.Errorf("decode models: %w", err)
+	}
+
+	out := make([]ModelInfo, 0, len(raw.Models))
+	for _, m := range raw.Models {
+		out = append(out, ModelInfo{
+			Name:          m.Name,
+			Size:          m.Size,
+			Capabilities:  m.Capabilities,
+			ParameterSize: m.Details.ParameterSize,
+		})
+	}
+	return out, nil
+}
+
+// ChatModels filters ListModels to ones that look usable for chat
+// (excludes known embedding-only names when capabilities are absent).
+func (c *Client) ChatModels(ctx context.Context) ([]ModelInfo, error) {
+	all, err := c.ListModels(ctx)
+	if err != nil {
+		return nil, err
+	}
+	var out []ModelInfo
+	for _, m := range all {
+		if isEmbeddingOnly(m) {
+			continue
+		}
+		out = append(out, m)
+	}
+	return out, nil
+}
+
+func isEmbeddingOnly(m ModelInfo) bool {
+	name := strings.ToLower(m.Name)
+	if strings.Contains(name, "embed") {
+		return true
+	}
+	if len(m.Capabilities) == 0 {
+		return false
+	}
+	hasCompletion := false
+	for _, cap := range m.Capabilities {
+		switch strings.ToLower(cap) {
+		case "embedding":
+			// keep scanning — some models advertise both
+		case "completion", "tools", "thinking", "vision", "insert":
+			hasCompletion = true
+		}
+	}
+	// If capabilities are present and none look chat-like, treat as embed-only.
+	if !hasCompletion {
+		for _, cap := range m.Capabilities {
+			if strings.EqualFold(cap, "embedding") {
+				return true
+			}
+		}
+	}
+	return !hasCompletion && len(m.Capabilities) > 0
+}
+
 type chatResponse struct {
-	Message models.Message `json:"message"`
+	Message struct {
+		Role     string `json:"role"`
+		Content  string `json:"content"`
+		Thinking string `json:"thinking,omitempty"`
+	} `json:"message"`
+	Done bool `json:"done"`
+}
+
+// StreamCallbacks let the UI show progress before the first visible token.
+type StreamCallbacks struct {
+	// OnThinking is called for reasoning/thinking deltas (may be empty).
+	OnThinking func(delta string)
+	// OnToken is called for visible reply tokens.
+	OnToken func(delta string)
 }
 
 func (c *Client) StreamChat(ctx context.Context, messages []models.Message, onToken func(string)) (string, error) {
+	return c.StreamChatWith(ctx, messages, StreamCallbacks{OnToken: onToken})
+}
+
+func (c *Client) StreamChatWith(ctx context.Context, messages []models.Message, cb StreamCallbacks) (string, error) {
+	model := c.ChatModel()
+
 	body, err := json.Marshal(models.MessageReq{
-		Model:    c.chatModel,
-		Messages: messages,
-		Stream:   true,
+		Model:     model,
+		Messages:  messages,
+		Stream:    true,
 		KeepAlive: "60s",
 	})
 	if err != nil {
@@ -91,15 +225,15 @@ func (c *Client) StreamChat(ctx context.Context, messages []models.Message, onTo
 
 	resp, err := c.http.Do(req)
 	if err != nil {
-		return "", fmt.Errorf("call ollama chat (model %q pulled?): %w", c.chatModel, err)
+		return "", fmt.Errorf("call ollama chat (model %q pulled?): %w", model, err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("ollama chat returned status %d", resp.StatusCode)
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		return "", fmt.Errorf("ollama chat returned status %d: %s", resp.StatusCode, strings.TrimSpace(string(b)))
 	}
 
-	// Stream mode sends one JSON object per line (NDJSON), not one big blob.
 	var full strings.Builder
 	decoder := json.NewDecoder(resp.Body)
 	for {
@@ -110,46 +244,18 @@ func (c *Client) StreamChat(ctx context.Context, messages []models.Message, onTo
 			}
 			return full.String(), fmt.Errorf("decode stream chunk: %w", err)
 		}
-		onToken(chunk.Message.Content)
-		full.WriteString(chunk.Message.Content)
+		if chunk.Message.Thinking != "" && cb.OnThinking != nil {
+			cb.OnThinking(chunk.Message.Thinking)
+		}
+		if chunk.Message.Content != "" {
+			if cb.OnToken != nil {
+				cb.OnToken(chunk.Message.Content)
+			}
+			full.WriteString(chunk.Message.Content)
+		}
 	}
 	return full.String(), nil
 }
-
-// func (c *Client) Chat(ctx context.Context, messages []models.Message) (string, error) {
-// 	body, err := json.Marshal(models.MessageReq{
-// 		Model:    c.chatModel,
-// 		Messages: messages,
-// 		Stream:   false,
-// 	})
-// 	if err != nil {
-// 		return "", fmt.Errorf("Marshal chat request: %w", err)
-// 	}
-
-// 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.host+"/api/chat", bytes.NewReader(body))
-// 	if err != nil {
-// 		return "", fmt.Errorf("Build chat request: %w", err)
-// 	}
-
-// 	req.Header.Set("Content-Type", "application/json")
-
-// 	resp, err := c.http.Do(req)
-// 	if err != nil {
-// 		return "", fmt.Errorf("call ollama chat (model %q pulled?): %w", c.chatModel, err)
-// 	}
-
-// 	defer resp.Body.Close()
-
-// 	if resp.StatusCode != http.StatusOK {
-// 		return "", fmt.Errorf("ollama chat (model %q) returned status code %d", c.chatModel, resp.StatusCode)
-// 	}
-
-// 	var out chatResponse
-// 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
-// 		return "", fmt.Errorf("Decode chat response: %w", err)
-// 	}
-// 	return out.Message.Content, nil
-// }
 
 func (c *Client) Embed(ctx context.Context, text string) ([]float32, error) {
 	body, err := json.Marshal(models.EmbeddingReq{Model: c.embedModel, Prompt: text})

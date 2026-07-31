@@ -3,9 +3,11 @@ package retrieval
 import (
 	"context"
 	"fmt"
+	"path/filepath"
 	"strings"
 
 	"github.com/tiredbooy/internal/models"
+	"github.com/tiredbooy/internal/utils"
 )
 
 // MinSimilarity drops vector hits below this score so unrelated notes
@@ -22,10 +24,12 @@ type ContextResult struct {
 }
 
 type CatalogEntry struct {
-	ID    int64
-	Title string
-	Type  models.NoteType
-	Done  bool
+	ID     int64
+	Title  string
+	Type   models.NoteType
+	Done   bool
+	Folder string // vault-relative dir, empty = vault root
+	Rel    string // vault-relative file path
 }
 
 type RetrievedNote struct {
@@ -34,6 +38,13 @@ type RetrievedNote struct {
 	Path       string
 	Similarity float32
 	Content    string
+}
+
+// Inventory returns the complete note catalog without doing vector search.
+// It is used for exact listing requests, where embedding a query would only
+// add latency and cannot improve the answer.
+func (s *Service) Inventory() ([]CatalogEntry, error) {
+	return s.buildCatalog()
 }
 
 func (s *Service) BuildContext(
@@ -120,23 +131,38 @@ func (s *Service) buildCatalog() ([]CatalogEntry, error) {
 	}
 	out := make([]CatalogEntry, 0, len(notes))
 	for _, n := range notes {
+		rel, folder := s.withRel(s.vaultPath, n.Path)
 		out = append(out, CatalogEntry{
-			ID:    n.ID,
-			Title: n.Title,
-			Type:  n.Type,
-			Done:  n.Done,
+			ID:     n.ID,
+			Title:  n.Title,
+			Type:   n.Type,
+			Done:   n.Done,
+			Folder: folder,
+			Rel:    rel,
 		})
 	}
 	return out, nil
 }
 
+// SetVaultPath lets the service render tidy relative paths in the catalog.
+// Optional — without it, absolute paths are shown.
+func (s *Service) withRel(vault, abs string) (rel, folder string) {
+	rel = utils.RelVault(vault, abs)
+	dir := filepath.ToSlash(filepath.Dir(rel))
+	if dir == "." || dir == "" {
+		return rel, ""
+	}
+	return rel, dir
+}
+
 func formatCatalog(catalog []CatalogEntry) string {
 	if len(catalog) == 0 {
-		return "Vault inventory: empty (0 notes). The user has not created any notes yet."
+		return "Vault inventory: empty (0 notes). The user has not created any notes yet.\nIMPORTANT: If the user is only asking what notes they have, answer that the vault is empty. Do NOT create a note."
 	}
 
 	var b strings.Builder
-	b.WriteString(fmt.Sprintf("Vault inventory (%d notes). Use note_id when updating:\n", len(catalog)))
+	b.WriteString(fmt.Sprintf("Vault inventory (%d notes). Use note_id when updating or moving.\n", len(catalog)))
+	b.WriteString("IMPORTANT: If the user is only listing or asking what notes they have, answer from this inventory. Do NOT create or modify notes.\n")
 	for _, e := range catalog {
 		kind := string(e.Type)
 		if kind == "" {
@@ -150,7 +176,15 @@ func formatCatalog(catalog []CatalogEntry) string {
 				extra = ", open"
 			}
 		}
-		b.WriteString(fmt.Sprintf("- note_id=%d | %s (%s%s)\n", e.ID, e.Title, kind, extra))
+		loc := "vault root"
+		if e.Folder != "" {
+			loc = e.Folder
+		} else if e.Rel != "" && !strings.HasPrefix(e.Rel, "/") {
+			if d := filepath.ToSlash(filepath.Dir(e.Rel)); d != "." {
+				loc = d
+			}
+		}
+		b.WriteString(fmt.Sprintf("- note_id=%d | %s | folder=%s (%s%s)\n", e.ID, e.Title, loc, kind, extra))
 	}
 	return b.String()
 }

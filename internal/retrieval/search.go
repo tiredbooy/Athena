@@ -10,13 +10,14 @@ import (
 )
 
 type Service struct {
+	vaultPath  string
 	noteStore  *storage.NoteStore
 	chunkStore *storage.ChunkStore
 	ai         *ai.Client
 }
 
-func NewService(noteStore *storage.NoteStore, chunkStore *storage.ChunkStore, aiClient *ai.Client) *Service {
-	return &Service{noteStore: noteStore, chunkStore: chunkStore, ai: aiClient}
+func NewService(vaultPath string, noteStore *storage.NoteStore, chunkStore *storage.ChunkStore, aiClient *ai.Client) *Service {
+	return &Service{vaultPath: vaultPath, noteStore: noteStore, chunkStore: chunkStore, ai: aiClient}
 }
 
 // Search embeds the query text and finds the topK most similar chunks

@@ -9,16 +9,19 @@ import (
 
 // CreateTask is CreateNote with the type flipped to task — same file/DB/
 // embedding pipeline, since a task is just a note that can be done/undone.
-func (s *Service) CreateTask(ctx context.Context, title, body string) (*models.Note, error) {
-	n, err := s.CreateNote(ctx, title, body, nil)
+func (s *Service) CreateTask(ctx context.Context, title, body, folder string) (*models.Note, bool, error) {
+	n, created, err := s.CreateNote(ctx, title, body, folder, nil)
 	if err != nil {
-		return n, err
+		return n, created, err
+	}
+	if !created {
+		return n, false, nil
 	}
 	n.Type = models.NoteTypeTask
 	if err := s.noteStore.Update(n); err != nil {
-		return n, fmt.Errorf("mark as task: %w", err)
+		return n, true, fmt.Errorf("mark as task: %w", err)
 	}
-	return n, nil
+	return n, true, nil
 }
 
 // MarkDone flips a task's Done flag. Doesn't touch chunks/embeddings —

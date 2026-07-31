@@ -7,17 +7,34 @@ import (
 
 // Action is the JSON payload the model emits inside a fenced ```action
 // block. Not every field applies to every Type:
-//   - create_note: Title, Content, Tags
-//   - create_task: Title, Content
-//   - update_note: NoteID, Content
-//   - mark_done:   NoteID, Done
+//   - create_note:      Title, Content, Tags, Folder
+//   - create_task:      Title, Content, Folder
+//   - ensure_folders:   Paths
+//   - move_note:        NoteID, Folder
+//   - update_note:      NoteID, Content
+//   - mark_done:        NoteID, Done
+//   - create_folder:    Folder
+//   - list_folders:     (none)
+//   - folder_exists:    Folder
+//   - delete_folder:    Folder
+//   - rename_folder:    Folder (old), NewFolder (new name, single segment)
+//   - move_folder:      Folder (old), NewFolder (new parent)
+//   - rename_note:      NoteID, Title (new title)
+//   - duplicate_note:   NoteID, Title (optional new title), Folder (optional target)
+//   - trash_note:       NoteID
+//   - restore_note:     NoteID
+//   - archive_note:      NoteID
+//   - unarchive_note:   NoteID
 type Action struct {
-	Type    string   `json:"type"`
-	NoteID  int64    `json:"note_id,omitempty"`
-	Title   string   `json:"title,omitempty"`
-	Content string   `json:"content,omitempty"`
-	Tags    []string `json:"tags,omitempty"`
-	Done    bool     `json:"done,omitempty"`
+	Type      string   `json:"type"`
+	NoteID    int64    `json:"note_id,omitempty"`
+	Title     string   `json:"title,omitempty"`
+	Content   string   `json:"content,omitempty"`
+	Tags      []string `json:"tags,omitempty"`
+	Folder    string   `json:"folder,omitempty"`
+	NewFolder string   `json:"new_folder,omitempty"`
+	Paths     []string `json:"paths,omitempty"`
+	Done      bool     `json:"done,omitempty"`
 }
 
 type ActionResult struct {

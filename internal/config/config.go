@@ -80,6 +80,16 @@ func save(path string, cfg *Config) error {
 	return os.WriteFile(path, out, 0o644)
 }
 
+// Save writes the config back to the standard config path (e.g. after
+// the user switches chat models with /model).
+func (c *Config) Save() error {
+	path, err := configFilePath()
+	if err != nil {
+		return err
+	}
+	return save(path, c)
+}
+
 func (c *Config) EnsureDirs() error {
 	if err := os.MkdirAll(c.VaultPath, 0o755); err != nil {
 		return fmt.Errorf("create vault dir: %w", err)

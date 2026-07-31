@@ -1,6 +1,5 @@
 package storage
 
-
 import (
 	"database/sql"
 	"fmt"
@@ -52,5 +51,50 @@ func Open(dbPath string) (*sql.DB, error) {
 		return nil, fmt.Errorf("apply schema: %w", err)
 	}
 
+	if err := migrateNotesColumns(db); err != nil {
+		return nil, fmt.Errorf("migrate notes table: %w", err)
+	}
+
 	return db, nil
+}
+
+// migrateNotesColumns adds columns introduced after the initial schema.
+// CREATE TABLE IF NOT EXISTS only helps on a fresh DB; an existing notes
+// table from a prior run needs ALTER TABLE, guarded by checking which
+// columns are already there so re-running this is always safe.
+func migrateNotesColumns(db *sql.DB) error {
+	existing := map[string]bool{}
+	rows, err := db.Query(`PRAGMA table_info(notes)`)
+	if err != nil {
+		return fmt.Errorf("inspect notes columns: %w", err)
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var cid, notnull, pk int
+		var name, ctype string
+		var dflt sql.NullString
+		if err := rows.Scan(&cid, &name, &ctype, &notnull, &dflt, &pk); err != nil {
+			return fmt.Errorf("scan column info: %w", err)
+		}
+		existing[name] = true
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+
+	wanted := []struct{ name, ddl string }{
+		{"archived", "ALTER TABLE notes ADD COLUMN archived INTEGER NOT NULL DEFAULT 0"},
+		{"archived_from", "ALTER TABLE notes ADD COLUMN archived_from TEXT NOT NULL DEFAULT ''"},
+		{"trashed_from", "ALTER TABLE notes ADD COLUMN trashed_from TEXT NOT NULL DEFAULT ''"},
+	}
+	for _, w := range wanted {
+		if existing[w.name] {
+			continue
+		}
+		if _, err := db.Exec(w.ddl); err != nil {
+			return fmt.Errorf("add column %s: %w", w.name, err)
+		}
+	}
+	return nil
 }
