@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -77,6 +78,17 @@ func (l *Loop) handleTurn(input string, historyPtr *[]models.Message) {
 
 	loader := tui.NewLoader()
 	loader.Start()
+	if actions, ok := folderActions(input); ok {
+		loader.Stop()
+		reply := l.runActions(ctx, actions)
+		fmt.Println("\nAthena")
+		fmt.Println(reply)
+		*historyPtr = append(*historyPtr,
+			models.Message{Role: "user", Content: input},
+			models.Message{Role: "assistant", Content: reply},
+		)
+		return
+	}
 	if isBookMoveRequest(input) {
 		catalog, err := l.retrieval.Inventory()
 		if err != nil {
@@ -209,12 +221,34 @@ func (l *Loop) handleTurn(input string, historyPtr *[]models.Message) {
 			summary.WriteString(fmt.Sprintf("[action ok] %s\n", r.Message))
 		}
 		reply = strings.TrimSpace(summary.String())
+
+		// The model's confirmation is only an intention. Show what the
+		// dispatcher actually did so a rejected action (for example, deleting
+		// a non-empty folder) is visible instead of looking like a no-op.
+		var execution strings.Builder
+		for _, r := range results {
+			if r.Err != nil {
+				fmt.Fprintf(&execution, "Could not %s: %v\n", r.Action.Type, r.Err)
+				continue
+			}
+			fmt.Fprintf(&execution, "✓ %s\n", r.Message)
+		}
+		if execution.Len() > 0 {
+			if display != "" {
+				display += "\n\n"
+			}
+			display += strings.TrimSpace(execution.String())
+		}
 	}
 
-	if display != "" {
-		fmt.Println("\nAthena")
-		fmt.Println(tui.RenderMarkdown(display))
+	if display == "" {
+		display = "I couldn't produce a readable answer. Please try again."
+		if strings.TrimSpace(reply) == "" {
+			reply = display
+		}
 	}
+	fmt.Println("\nAthena")
+	fmt.Println(tui.RenderMarkdown(display))
 
 	*historyPtr = append(*historyPtr, models.Message{
 		Role:    "assistant",
@@ -245,11 +279,52 @@ func (l *Loop) handleCommand(input string) {
 }
 
 func isListingRequest(input string) bool {
-	q := strings.ToLower(strings.TrimSpace(input))
-	return strings.Contains(q, "what notes do i have") ||
-		strings.Contains(q, "list my notes") ||
-		strings.Contains(q, "show my notes") ||
+	q := strings.Trim(strings.ToLower(strings.TrimSpace(input)), ".?!")
+	return q == "what notes do i have" ||
+		q == "list my notes" ||
+		q == "show my notes" ||
 		q == "list notes" || q == "show notes" || q == "my notes"
+}
+
+var (
+	createFolderRequest = regexp.MustCompile(`(?i)^\s*(?:please\s+)?(?:create|make|add)\s+(?:a\s+|the\s+)?folder(?:\s+(?:called|named))?\s+(.+?)\s*[.!?]?\s*$`)
+	deleteFolderRequest = regexp.MustCompile(`(?i)^\s*(?:please\s+)?(?:delete|remove)\s+(?:the\s+)?folder(?:\s+(?:called|named))?\s+(.+?)\s*[.!?]?\s*$`)
+)
+
+// folderActions handles only complete, explicit folder requests. This keeps
+// the common filesystem commands dependable even when a small local model
+// forgets to emit its action JSON; broader organizational requests still go
+// through the model, where their intent can be interpreted with vault context.
+func folderActions(input string) ([]ai.Action, bool) {
+	for _, request := range []struct {
+		re     *regexp.Regexp
+		action string
+	}{
+		{createFolderRequest, "create_folder"},
+		{deleteFolderRequest, "delete_folder"},
+	} {
+		match := request.re.FindStringSubmatch(input)
+		if len(match) != 2 {
+			continue
+		}
+		folder := strings.Trim(strings.TrimSpace(match[1]), "`\"'")
+		if folder == "" || hasAdditionalFolderWork(folder) {
+			return nil, false
+		}
+		return []ai.Action{{Type: request.action, Folder: folder}}, true
+	}
+	return nil, false
+}
+
+// hasAdditionalFolderWork keeps this fast path from taking a compound request
+// such as "create a folder for work and move notes into it" away from the
+// model, which has the context needed to handle all requested operations.
+func hasAdditionalFolderWork(folder string) bool {
+	folder = strings.ToLower(folder)
+	return strings.HasPrefix(folder, "for ") ||
+		strings.Contains(folder, " and ") ||
+		strings.Contains(folder, " then ") ||
+		strings.Contains(folder, " with ")
 }
 
 func printCatalog(catalog []retrieval.CatalogEntry) string {

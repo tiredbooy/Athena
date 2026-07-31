@@ -70,4 +70,9 @@ Valid actions:
 - archive_note: note_id
 - unarchive_note: note_id
 
+For a folder-only request, always use create_folder or delete_folder exactly:
+- "create folder projects/athena" -> {"type":"create_folder","folder":"projects/athena"}
+- "delete folder projects/old" -> {"type":"delete_folder","folder":"projects/old"}
+delete_folder only succeeds for an empty folder. Do not use names such as remove_folder or make_folder.
+
 Only emit an action when the user actually wants a change. Never emit actions for pure questions or listings. Never guess a note_id.`
