@@ -53,6 +53,11 @@ var (
 	panel            = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(lipgloss.Color("239")).Padding(0, 1)
 	userMessage      = lipgloss.NewStyle().Foreground(lipgloss.Color("255"))
 	assistantMessage = lipgloss.NewStyle().Foreground(lipgloss.Color("252"))
+	errorMessage     = lipgloss.NewStyle().Foreground(lipgloss.Color("203"))
+	inputPrompt      = lipgloss.NewStyle().Foreground(lipgloss.Color("63")).Bold(true)
+	inputText        = lipgloss.NewStyle().Foreground(lipgloss.Color("255"))
+	inputPlaceholder = lipgloss.NewStyle().Foreground(lipgloss.Color("245"))
+	inputCursor      = lipgloss.Color("63")
 )
 
 var loadingHints = []string{
@@ -79,6 +84,11 @@ func setTheme(name string) string {
 		panel = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(lipgloss.Color("239")).Padding(0, 1)
 		userMessage = lipgloss.NewStyle().Foreground(lipgloss.Color("255"))
 		assistantMessage = lipgloss.NewStyle().Foreground(lipgloss.Color("252"))
+		errorMessage = lipgloss.NewStyle().Foreground(lipgloss.Color("203"))
+		inputPrompt = lipgloss.NewStyle().Foreground(lipgloss.Color("63")).Bold(true)
+		inputText = lipgloss.NewStyle().Foreground(lipgloss.Color("255"))
+		inputPlaceholder = lipgloss.NewStyle().Foreground(lipgloss.Color("245"))
+		inputCursor = lipgloss.Color("63")
 		return "midnight"
 	case "ocean":
 		accent = lipgloss.NewStyle().Foreground(lipgloss.Color("43")).Bold(true)
@@ -86,50 +96,58 @@ func setTheme(name string) string {
 		panel = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(lipgloss.Color("31")).Padding(0, 1)
 		userMessage = lipgloss.NewStyle().Foreground(lipgloss.Color("159"))
 		assistantMessage = lipgloss.NewStyle().Foreground(lipgloss.Color("231"))
+		errorMessage = lipgloss.NewStyle().Foreground(lipgloss.Color("203"))
+		inputPrompt = lipgloss.NewStyle().Foreground(lipgloss.Color("43")).Bold(true)
+		inputText = lipgloss.NewStyle().Foreground(lipgloss.Color("159"))
+		inputPlaceholder = lipgloss.NewStyle().Foreground(lipgloss.Color("109"))
+		inputCursor = lipgloss.Color("43")
 		return "ocean"
 	case "system":
-		// No foreground/background override: the terminal supplies its own theme.
-		accent = lipgloss.NewStyle().Bold(true)
-		muted = lipgloss.NewStyle()
-		panel = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).Padding(0, 1)
-		userMessage = lipgloss.NewStyle()
-		assistantMessage = lipgloss.NewStyle()
+		// ANSI slots are palette-relative, so these colors follow the user's
+		// terminal theme while still giving the interface visual hierarchy.
+		accent = lipgloss.NewStyle().Foreground(lipgloss.Color("6")).Bold(true)
+		muted = lipgloss.NewStyle().Foreground(lipgloss.Color("8"))
+		panel = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(lipgloss.Color("4")).Padding(0, 1)
+		userMessage = lipgloss.NewStyle().Foreground(lipgloss.Color("7"))
+		assistantMessage = lipgloss.NewStyle().Foreground(lipgloss.Color("15"))
+		errorMessage = lipgloss.NewStyle().Foreground(lipgloss.Color("1"))
+		inputPrompt = lipgloss.NewStyle().Foreground(lipgloss.Color("6")).Bold(true)
+		inputText = lipgloss.NewStyle().Foreground(lipgloss.Color("7"))
+		inputPlaceholder = lipgloss.NewStyle().Foreground(lipgloss.Color("8"))
+		inputCursor = lipgloss.Color("6")
 		return "system"
 	default:
 		return ""
 	}
 }
 
-func applyInputTheme(input *textarea.Model, theme string) {
+func applyInputTheme(input *textarea.Model) {
 	styles := textarea.DefaultDarkStyles()
-	switch theme {
-	case "midnight":
-		styles.Focused.Prompt = lipgloss.NewStyle().Foreground(lipgloss.Color("63"))
-		styles.Focused.Text = lipgloss.NewStyle().Foreground(lipgloss.Color("255"))
-		styles.Focused.Placeholder = lipgloss.NewStyle().Foreground(lipgloss.Color("245"))
-		styles.Cursor.Color = lipgloss.Color("63")
-	case "ocean":
-		styles.Focused.Prompt = lipgloss.NewStyle().Foreground(lipgloss.Color("43"))
-		styles.Focused.Text = lipgloss.NewStyle().Foreground(lipgloss.Color("159"))
-		styles.Focused.Placeholder = lipgloss.NewStyle().Foreground(lipgloss.Color("109"))
-		styles.Cursor.Color = lipgloss.Color("43")
-	case "system":
-		styles.Focused.Prompt = lipgloss.NewStyle()
-		styles.Focused.Text = lipgloss.NewStyle()
-		styles.Focused.Placeholder = lipgloss.NewStyle()
-		styles.Cursor.Color = nil
-	}
+	// The default dark preset paints the empty rows black. That is useful for a
+	// standalone editor, but looks like a broken block inside Athena's composer.
+	// Keep the textarea transparent and let the composer panel provide its frame.
+	styles.Focused.CursorLine = lipgloss.NewStyle()
+	styles.Focused.EndOfBuffer = lipgloss.NewStyle()
+	styles.Focused.Prompt = inputPrompt
+	styles.Focused.Text = inputText
+	styles.Focused.Placeholder = inputPlaceholder
+	styles.Blurred.CursorLine = lipgloss.NewStyle()
+	styles.Blurred.EndOfBuffer = lipgloss.NewStyle()
+	styles.Blurred.Prompt = inputPrompt
+	styles.Blurred.Text = inputText
+	styles.Blurred.Placeholder = inputPlaceholder
+	styles.Cursor.Color = inputCursor
 	input.SetStyles(styles)
 }
 
 func RunBubble(submit SubmitFunc, reset ResetFunc) error {
 	input := textarea.New()
-	input.Placeholder = "Message Athena… (Enter sends, Shift+Enter adds a line)"
+	input.Placeholder = "Ask Athena…"
 	input.ShowLineNumbers = false
-	input.Prompt = "› "
+	input.Prompt = "❯ "
 	input.CharLimit = 10_000
-	input.SetHeight(3)
-	applyInputTheme(&input, "midnight")
+	input.SetHeight(1)
+	applyInputTheme(&input)
 	input.Focus()
 	spin := spinner.New()
 	spin.Style = accent
@@ -146,7 +164,7 @@ func (m bubbleModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		m.width, m.height = msg.Width, msg.Height
-		m.input.SetWidth(max(20, msg.Width-6))
+		m.input.SetWidth(max(14, m.composerWidth()-4))
 		m.output.SetWidth(max(20, msg.Width-6))
 		m.output.SetHeight(max(4, msg.Height-12))
 		m.refreshOutput()
@@ -234,13 +252,13 @@ func (m bubbleModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.refreshOutput()
 				return m, nil
 			case "/help":
-				m.lines = append(m.lines, accent.Render("Commands")+"\n/clear — clear the visible pane\n/reset — clear pane and model history\n/help — show this help\n\nKeys: Enter send · Shift+Enter newline · Esc cancel · Ctrl+C quit")
+				m.lines = append(m.lines, renderAssistantMessage("Commands\n/clear — clear the visible pane\n/reset — clear pane and model history\n/help — show this help\n\nKeys: Enter send · Shift+Enter newline · Esc cancel · Ctrl+C quit"))
 				m.input.SetValue("")
 				m.refreshOutput()
 				return m, nil
 			case "/theme midnight", "/theme ocean", "/theme system":
 				theme := setTheme(strings.TrimPrefix(input, "/theme "))
-				applyInputTheme(&m.input, theme)
+				applyInputTheme(&m.input)
 				m.spinner.Style = accent
 				m.status = "Theme: " + theme
 				m.input.SetValue("")
@@ -253,7 +271,7 @@ func (m bubbleModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.input.SetValue("")
 			m.busy = true
 			m.status = "Working…"
-			m.lines = append(m.lines, accent.Render("You")+"\n"+userMessage.Render(input))
+			m.lines = append(m.lines, renderUserMessage(input))
 			m.refreshOutput()
 			ctx, cancel := context.WithCancel(context.Background())
 			m.cancel = cancel
@@ -273,12 +291,12 @@ func (m bubbleModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		if !msg.done {
 			if !m.streaming {
-				m.lines = append(m.lines, accent.Render("Athena")+"\n")
+				m.lines = append(m.lines, renderAssistantMessage(""))
 				m.streaming = true
 				m.streamText = ""
 			}
 			m.streamText += msg.text
-			m.lines[len(m.lines)-1] = accent.Render("Athena") + "\n" + assistantMessage.Render(RenderMarkdown(m.streamText))
+			m.lines[len(m.lines)-1] = renderAssistantMessage(RenderMarkdown(m.streamText))
 			m.refreshOutput()
 			return m, waitForWorker(m.events)
 		}
@@ -286,9 +304,9 @@ func (m bubbleModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.cancel = nil
 		m.status = "Ready"
 		if msg.err != nil {
-			m.lines = append(m.lines, lipgloss.NewStyle().Foreground(lipgloss.Color("203")).Render("Error: "+msg.err.Error()))
+			m.lines = append(m.lines, renderErrorMessage(msg.err.Error()))
 		} else {
-			entry := accent.Render("Athena") + "\n" + assistantMessage.Render(RenderMarkdown(msg.text))
+			entry := renderAssistantMessage(RenderMarkdown(msg.text))
 			if m.streaming {
 				m.lines[len(m.lines)-1] = entry
 			} else {
@@ -364,23 +382,55 @@ func (m *bubbleModel) refreshOutput() {
 	m.output.GotoBottom()
 }
 
+// Chat entries use a restrained rail instead of full boxes. It gives each
+// streamed response a stable visual boundary without consuming much terminal
+// space or making long answers feel like a stack of UI panels.
+func renderUserMessage(text string) string {
+	return renderChatMessage(accent.Render("❯")+muted.Render(" You"), text, userMessage, accent)
+}
+
+func renderAssistantMessage(text string) string {
+	return renderChatMessage(accent.Render("✦ Athena"), text, assistantMessage, accent)
+}
+
+func renderErrorMessage(text string) string {
+	return renderChatMessage(errorMessage.Render("! Request failed"), text, errorMessage, errorMessage)
+}
+
+func renderChatMessage(header, text string, contentStyle, railStyle lipgloss.Style) string {
+	lines := strings.Split(text, "\n")
+	for i, line := range lines {
+		lines[i] = railStyle.Render("│ ") + contentStyle.Render(line)
+	}
+	return header + "\n" + strings.Join(lines, "\n")
+}
+
+func (m bubbleModel) composerWidth() int {
+	return max(18, m.width-4)
+}
+
+func (m bubbleModel) composerView() string {
+	width := m.composerWidth()
+	return panel.Width(width).Render(m.input.View())
+}
+
 func (m bubbleModel) View() tea.View {
 	body := m.output.View()
 	if len(m.lines) == 0 {
-		body = muted.Render("Ask anything. Athena keeps your vault local.")
+		body = accent.Render("✦ Athena") + "\n" + muted.Render("Ask about your local vault. Type /help to see commands.")
 	}
 	header := accent.Render("✦ ATHENA") + muted.Render("  local knowledge workspace")
 	status := muted.Render(m.status)
 	if m.busy {
 		status = m.spinner.View() + " " + status + muted.Render("  ·  "+loadingHints[m.hintIndex])
 	}
-	width := max(18, m.width-4)
+	width := m.composerWidth()
 	var suggestions string
 	if matches := m.commandMatches(); m.commandMenu && len(matches) > 0 {
 		selected := matches[m.commandIndex%len(matches)]
 		suggestions = panel.Width(width).Render(accent.Render("› "+selected.name)+muted.Render("  "+selected.description)+muted.Render("   ↑↓ choose · Tab complete · Esc dismiss")) + "\n"
 	}
-	composer := panel.Width(width).Render(m.input.View())
+	composer := m.composerView()
 	content := header + "\n" + muted.Render(strings.Repeat("─", width)) + "\n\n" + body + "\n\n" + suggestions + composer + "\n" + status + "\n" + muted.Render("Enter send · Shift+Enter newline · ↑↓ select command · Tab complete · Esc cancel")
 	v := tea.NewView(content)
 	v.AltScreen = true
