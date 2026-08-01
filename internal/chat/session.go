@@ -23,6 +23,9 @@ func NewSession(loop *Loop) *Session {
 }
 
 func (s *Session) Submit(ctx context.Context, input string, status func(string), onToken func(string)) (string, error) {
+	ctx, cancel := context.WithTimeout(ctx, TurnTimeout)
+	defer cancel()
+
 	input = strings.TrimSpace(input)
 	if input == "" {
 		return "", nil
@@ -56,30 +59,16 @@ func (s *Session) Submit(ctx context.Context, input string, status func(string),
 	if result.Context != "" {
 		messages[len(messages)-1].Content = input + "\n\n" + result.Context
 	}
-	if status != nil {
-		status(fmt.Sprintf("Planning with %s", s.loop.ai.ChatModel()))
-	}
-	thinking, writing := false, false
-	raw, err := s.loop.ai.StreamChatWith(ctx, messages, ai.StreamCallbacks{
-		OnThinking: func(string) {
-			if !thinking && status != nil {
-				thinking = true
-				status("Reviewing the model's reasoning")
-			}
-		},
-		OnToken: func(token string) {
-			if !writing && status != nil {
-				writing = true
-				status("Writing a response")
-			}
-			if onToken != nil {
-				onToken(token)
-			}
-		},
-	})
+	raw, err := s.runReadToolLoop(ctx, messages, status)
 	if err != nil {
 		s.history = s.history[:len(s.history)-1]
 		return "", err
+	}
+	if status != nil {
+		status("Writing a response")
+	}
+	if onToken != nil {
+		onToken(raw)
 	}
 	cleaned, actions := ai.ExtractActions(raw)
 	var report strings.Builder

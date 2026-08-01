@@ -28,6 +28,18 @@ CREATE TABLE IF NOT EXISTS chunks (
 );
 
 CREATE INDEX IF NOT EXISTS idx_chunks_note_id ON chunks(note_id);
+
+CREATE TABLE IF NOT EXISTS action_audit (
+	id          INTEGER PRIMARY KEY AUTOINCREMENT,
+	action_type TEXT NOT NULL,
+	action_json TEXT NOT NULL,
+	outcome     TEXT NOT NULL,
+	message     TEXT NOT NULL DEFAULT '',
+	error       TEXT NOT NULL DEFAULT '',
+	created_at  DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_action_audit_created_at ON action_audit(created_at DESC);
 `
 
 func Open(dbPath string) (*sql.DB, error) {

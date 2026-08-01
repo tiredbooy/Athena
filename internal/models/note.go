@@ -2,6 +2,18 @@ package models
 
 import "time"
 
+// ActionAudit records one attempted model-requested vault operation. ActionJSON
+// is stored locally so an unexpected result can be inspected without guessing
+// which arguments the model sent to the dispatcher.
+type ActionAudit struct {
+	ActionType string
+	ActionJSON string
+	Outcome    string
+	Message    string
+	Error      string
+	CreatedAt  time.Time
+}
+
 type NoteType string
 
 const (

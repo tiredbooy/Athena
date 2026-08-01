@@ -73,7 +73,7 @@ func (l *Loop) Run() {
 // handleTurn runs one full retrieval -> model -> action-dispatch cycle.
 // historyPtr lets this append/rollback without the caller juggling slices.
 func (l *Loop) handleTurn(input string, historyPtr *[]models.Message) {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	ctx, cancel := context.WithTimeout(context.Background(), TurnTimeout)
 	defer cancel()
 
 	loader := tui.NewLoader()

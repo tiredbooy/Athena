@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/tiredbooy/internal/ai"
+	"github.com/tiredbooy/internal/models"
 )
 
 func TestRunBatchContinuesIndependentWorkAndSkipsDependents(t *testing.T) {
@@ -59,4 +60,69 @@ func TestRunBatchFallsBackToSequentialActionsWithoutIDs(t *testing.T) {
 	if len(calls) != 2 || calls[0] != "first" || calls[1] != "second" {
 		t.Fatalf("calls = %v, want sequential order", calls)
 	}
+}
+
+func TestRunRejectsInvalidActionBeforeHandler(t *testing.T) {
+	d := NewDispatcher()
+	called := false
+	d.Register("create_note", func(_ context.Context, _ ai.Action) (string, error) {
+		called = true
+		return "created", nil
+	})
+
+	result := d.Run(context.Background(), []ai.Action{{Type: "create_note"}})[0]
+	if result.Err == nil || result.Error != "create_note requires title" {
+		t.Fatalf("result = %+v, want title validation error", result)
+	}
+	if called {
+		t.Fatal("handler ran despite failed preflight validation")
+	}
+}
+
+func TestRunRetriesReadOnlyActionAndRecordsOutcome(t *testing.T) {
+	d := NewDispatcher()
+	audit := &recordingAudit{}
+	d.SetAuditLogger(audit)
+	var attempts atomic.Int32
+	d.Register("folder_exists", func(_ context.Context, _ ai.Action) (string, error) {
+		if attempts.Add(1) == 1 {
+			return "", errors.New("temporary read failure")
+		}
+		return "folder exists", nil
+	})
+
+	result := d.Run(context.Background(), []ai.Action{{Type: "folder_exists", Folder: "projects"}})[0]
+	if result.Err != nil || result.Message != "folder exists" {
+		t.Fatalf("result = %+v, want successful retry", result)
+	}
+	if attempts.Load() != 2 {
+		t.Fatalf("attempts = %d, want 2", attempts.Load())
+	}
+	if len(audit.entries) != 1 || audit.entries[0].Outcome != "succeeded" {
+		t.Fatalf("audit entries = %+v, want one successful record", audit.entries)
+	}
+}
+
+func TestRunFailsWhenWriteCannotBeVerified(t *testing.T) {
+	d := NewDispatcher()
+	d.Register("create_note", func(_ context.Context, _ ai.Action) (string, error) {
+		return "created", nil
+	})
+	d.RegisterVerifier("create_note", func(_ context.Context, _ ai.Action) error {
+		return errors.New("record not found after write")
+	})
+
+	result := d.Run(context.Background(), []ai.Action{{Type: "create_note", Title: "Plan"}})[0]
+	if result.Err == nil || result.Error != "record not found after write" {
+		t.Fatalf("result = %+v, want verification failure", result)
+	}
+}
+
+type recordingAudit struct {
+	entries []models.ActionAudit
+}
+
+func (a *recordingAudit) Record(_ context.Context, entry models.ActionAudit) error {
+	a.entries = append(a.entries, entry)
+	return nil
 }

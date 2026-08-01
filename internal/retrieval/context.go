@@ -100,47 +100,24 @@ func (s *Service) BuildContextWithProgress(
 	}
 
 	reportProgress(progress, fmt.Sprintf("Embedding your question with %s", s.ai.EmbedModel()))
-	results, err := s.Search(ctx, query, topK)
+	results, err := s.SearchNotes(ctx, query, topK)
 	if err != nil {
 		return nil, err
 	}
 
 	var relevant []string
-	seen := map[int64]bool{}
-
 	for _, r := range results {
-		if r.Score < MinSimilarity {
-			continue
-		}
-
-		if rel := pathsByID[r.Chunk.NoteID]; rel != "" {
+		if rel := pathsByID[r.ID]; rel != "" {
 			reportProgress(progress, fmt.Sprintf("Reading %s", rel))
 		}
-		note, err := s.noteStore.GetByID(r.Chunk.NoteID)
-		if err != nil || note == nil {
-			continue
-		}
-		// One hit per note — keep the highest-scoring chunk (results are
-		// already ranked descending).
-		if seen[note.ID] {
-			continue
-		}
-		seen[note.ID] = true
-
-		out.Results = append(out.Results, RetrievedNote{
-			ID:         note.ID,
-			Title:      note.Title,
-			Path:       note.Path,
-			Similarity: r.Score,
-			Content:    r.Chunk.Content,
-		})
+		out.Results = append(out.Results, r)
 
 		relevant = append(relevant, fmt.Sprintf(
 			"--- note_id=%d | %s (similarity %.2f) ---\n%s",
-			note.ID,
-			note.Title,
-			r.Score,
-			r.Chunk.Content,
+			r.ID,
+			r.Title,
+			r.Similarity,
+			r.Content,
 		))
 	}
 

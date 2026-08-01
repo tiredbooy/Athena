@@ -26,6 +26,17 @@ func NewService(vaultPath string, noteStore *storage.NoteStore, chunkStore *stor
 
 func (s *Service) VaultPath() string { return s.vaultPath }
 
+// GetNote and GetNoteByPath are narrow read APIs for post-write verification.
+// Callers receive the persisted record rather than relying on a write method's
+// in-memory value as proof that the database update completed.
+func (s *Service) GetNote(noteID int64) (*models.Note, error) {
+	return s.noteStore.GetByID(noteID)
+}
+
+func (s *Service) GetNoteByPath(path string) (*models.Note, error) {
+	return s.noteStore.GetByPath(path)
+}
+
 // CreateNote writes a new .md file into the vault (optionally under folder),
 // saves it to SQLite, and embeds it so it is searchable immediately.
 //

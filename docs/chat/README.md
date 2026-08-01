@@ -12,7 +12,8 @@ and sends user input.
 user input
   → exact safe shortcut when applicable
   → vault catalog + semantic context
-  → one streamed model plan/reply
+  → bounded read-only model tool loop when more vault context is needed
+  → final model plan/reply
   → extract and execute actions
   → answer + per-action outcome
   → save concise history
@@ -21,6 +22,9 @@ user input
 An empty visible reply is explicit: the UI says that the model returned no
 visible answer and that no vault changes were made. Action outcomes are always
 shown, because a model confirmation does not prove execution succeeded.
+
+Every turn is bounded to two minutes. The parent UI context can still cancel it
+earlier, for example when the user presses Escape.
 
 ## Current shortcuts
 

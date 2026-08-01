@@ -185,12 +185,48 @@ func isEmbeddingOnly(m ModelInfo) bool {
 }
 
 type chatResponse struct {
-	Message struct {
-		Role     string `json:"role"`
-		Content  string `json:"content"`
-		Thinking string `json:"thinking,omitempty"`
-	} `json:"message"`
-	Done bool `json:"done"`
+	Message models.Message `json:"message"`
+	Done    bool           `json:"done"`
+}
+
+// ChatWithTools performs one non-streaming model step. The application owns
+// the tool loop so it can validate and execute only the capabilities it has
+// explicitly exposed.
+func (c *Client) ChatWithTools(ctx context.Context, messages []models.Message, tools []models.ToolDefinition) (models.Message, error) {
+	c.inferenceMu.Lock()
+	defer c.inferenceMu.Unlock()
+
+	model := c.ChatModel()
+	body, err := json.Marshal(models.MessageReq{
+		Model:     model,
+		Messages:  messages,
+		Tools:     tools,
+		Stream:    false,
+		Think:     false,
+		KeepAlive: "60s",
+	})
+	if err != nil {
+		return models.Message{}, fmt.Errorf("marshal tool chat request: %w", err)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.host+"/api/chat", bytes.NewReader(body))
+	if err != nil {
+		return models.Message{}, fmt.Errorf("build tool chat request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return models.Message{}, fmt.Errorf("call ollama tools (model %q pulled?): %w", model, err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		return models.Message{}, fmt.Errorf("ollama tool chat returned status %d: %s", resp.StatusCode, strings.TrimSpace(string(b)))
+	}
+	var out chatResponse
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return models.Message{}, fmt.Errorf("decode tool chat response: %w", err)
+	}
+	return out.Message, nil
 }
 
 // StreamCallbacks let the UI show progress before the first visible token.

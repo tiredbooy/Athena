@@ -10,11 +10,13 @@ import (
 	"github.com/tiredbooy/internal/ai"
 	"github.com/tiredbooy/internal/chat"
 	"github.com/tiredbooy/internal/config"
+	"github.com/tiredbooy/internal/models"
 	"github.com/tiredbooy/internal/notes"
 	"github.com/tiredbooy/internal/retrieval"
 	"github.com/tiredbooy/internal/storage"
 	"github.com/tiredbooy/internal/tools"
 	"github.com/tiredbooy/internal/tui"
+	"github.com/tiredbooy/internal/utils"
 )
 
 func main() {
@@ -47,6 +49,7 @@ func main() {
 	notesSvc := notes.NewService(cfg.VaultPath, noteStore, chunkStore, client)
 
 	dispatcher := buildDispatcher(notesSvc)
+	dispatcher.SetAuditLogger(storage.NewActionAuditStore(db))
 
 	fmt.Println("second-brain ready.")
 	fmt.Printf("  vault: %s\n  db:    %s\n  model: %s\n\n", cfg.VaultPath, cfg.DBPath, cfg.ChatModel)
@@ -251,7 +254,121 @@ func buildDispatcher(notesSvc *notes.Service) *tools.Dispatcher {
 		return fmt.Sprintf("Unarchived %q", n.Title), nil
 	})
 
+	registerWriteVerifiers(d, notesSvc)
+
 	return d
+}
+
+func registerWriteVerifiers(d *tools.Dispatcher, notesSvc *notes.Service) {
+	for _, actionType := range []string{
+		"create_note", "create_task", "move_note", "update_note", "mark_done",
+		"rename_note", "trash_note", "restore_note", "archive_note", "unarchive_note",
+		"create_folder", "ensure_folders", "delete_folder",
+	} {
+		d.RegisterVerifier(actionType, func(ctx context.Context, action ai.Action) error {
+			return verifyWrite(ctx, notesSvc, action)
+		})
+	}
+}
+
+func verifyWrite(_ context.Context, notesSvc *notes.Service, action ai.Action) error {
+	switch action.Type {
+	case "create_folder":
+		exists, err := notesSvc.FolderExists(action.Folder)
+		if err != nil {
+			return fmt.Errorf("verify create_folder: %w", err)
+		}
+		if !exists {
+			return fmt.Errorf("verify create_folder: folder not found")
+		}
+		return nil
+	case "ensure_folders":
+		for _, folder := range action.Paths {
+			exists, err := notesSvc.FolderExists(folder)
+			if err != nil {
+				return fmt.Errorf("verify ensure_folders: %w", err)
+			}
+			if !exists {
+				return fmt.Errorf("verify ensure_folders: %q not found", folder)
+			}
+		}
+		return nil
+	case "delete_folder":
+		exists, err := notesSvc.FolderExists(action.Folder)
+		if err != nil {
+			return fmt.Errorf("verify delete_folder: %w", err)
+		}
+		if exists {
+			return fmt.Errorf("verify delete_folder: folder remains")
+		}
+		return nil
+	}
+
+	if action.Type == "create_note" || action.Type == "create_task" {
+		path, err := utils.NotePath(notesSvc.VaultPath(), action.Folder, action.Title)
+		if err != nil {
+			return fmt.Errorf("build expected note path: %w", err)
+		}
+		note, err := notesSvc.GetNoteByPath(path)
+		if err != nil {
+			return fmt.Errorf("verify created note: %w", err)
+		}
+		if note == nil {
+			return fmt.Errorf("verify created note: record not found")
+		}
+		if action.Type == "create_task" && note.Type != models.NoteTypeTask {
+			return fmt.Errorf("verify created task: note type is %q", note.Type)
+		}
+		return nil
+	}
+
+	note, err := notesSvc.GetNote(action.NoteID)
+	if err != nil {
+		return fmt.Errorf("verify %s: %w", action.Type, err)
+	}
+	if note == nil {
+		return fmt.Errorf("verify %s: note %d not found", action.Type, action.NoteID)
+	}
+
+	switch action.Type {
+	case "move_note":
+		expected, err := utils.NotePath(notesSvc.VaultPath(), action.Folder, note.Title)
+		if err != nil {
+			return fmt.Errorf("build expected note path: %w", err)
+		}
+		if note.Path != expected {
+			return fmt.Errorf("verify move_note: expected %s, got %s", expected, note.Path)
+		}
+	case "update_note":
+		if note.Content != action.Content {
+			return fmt.Errorf("verify update_note: saved content differs")
+		}
+	case "mark_done":
+		if note.Done != action.Done {
+			return fmt.Errorf("verify mark_done: expected done=%t", action.Done)
+		}
+	case "rename_note":
+		if note.Title != action.Title {
+			return fmt.Errorf("verify rename_note: expected title %q", action.Title)
+		}
+	case "trash_note":
+		if note.TrashedFrom == "" {
+			return fmt.Errorf("verify trash_note: note is not marked as trashed")
+		}
+	case "restore_note":
+		if note.TrashedFrom != "" {
+			return fmt.Errorf("verify restore_note: note remains marked as trashed")
+		}
+	case "archive_note":
+		if !note.Archived {
+			return fmt.Errorf("verify archive_note: note is not marked as archived")
+		}
+	case "unarchive_note":
+		if note.Archived {
+			return fmt.Errorf("verify unarchive_note: note remains archived")
+		}
+	}
+	return nil
 }
 
 func fatal(step string, err error) {
