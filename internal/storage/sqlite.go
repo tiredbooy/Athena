@@ -40,6 +40,33 @@ CREATE TABLE IF NOT EXISTS action_audit (
 );
 
 CREATE INDEX IF NOT EXISTS idx_action_audit_created_at ON action_audit(created_at DESC);
+
+CREATE TABLE IF NOT EXISTS jobs (
+ id INTEGER PRIMARY KEY AUTOINCREMENT,
+ type TEXT NOT NULL,
+ payload TEXT NOT NULL DEFAULT '{}',
+ status TEXT NOT NULL DEFAULT 'queued',
+ progress_current INTEGER NOT NULL DEFAULT 0,
+ progress_total INTEGER NOT NULL DEFAULT 0,
+ message TEXT NOT NULL DEFAULT '',
+ error TEXT NOT NULL DEFAULT '',
+ created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+ updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_jobs_status_created ON jobs(status, created_at);
+
+-- A small, personal cache. It is deliberately separate from notes: metadata
+-- can be reused even when a book note is moved or deleted.
+CREATE TABLE IF NOT EXISTS book_metadata (
+	title_key TEXT PRIMARY KEY,
+	title TEXT NOT NULL,
+	authors_json TEXT NOT NULL DEFAULT '[]',
+	genres_json TEXT NOT NULL DEFAULT '[]',
+	published_year INTEGER NOT NULL DEFAULT 0,
+	isbn TEXT NOT NULL DEFAULT '',
+	source TEXT NOT NULL,
+	verified_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
 `
 
 func Open(dbPath string) (*sql.DB, error) {

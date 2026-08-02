@@ -17,10 +17,10 @@ type Service struct {
 	vaultPath  string
 	noteStore  *storage.NoteStore
 	chunkStore *storage.ChunkStore
-	ai         *ai.Client
+	ai         ai.EmbeddingProvider
 }
 
-func NewService(vaultPath string, noteStore *storage.NoteStore, chunkStore *storage.ChunkStore, aiClient *ai.Client) *Service {
+func NewService(vaultPath string, noteStore *storage.NoteStore, chunkStore *storage.ChunkStore, aiClient ai.EmbeddingProvider) *Service {
 	return &Service{vaultPath: vaultPath, noteStore: noteStore, chunkStore: chunkStore, ai: aiClient}
 }
 
@@ -44,6 +44,10 @@ func (s *Service) GetNoteByPath(path string) (*models.Note, error) {
 // created=false instead of erroring — small models often re-emit create_note
 // when the user only asks to list notes.
 func (s *Service) CreateNote(ctx context.Context, title, body, folder string, tags []string) (note *models.Note, created bool, err error) {
+	return s.createNote(ctx, title, body, folder, parser.Frontmatter{Title: title, Tags: tags}, models.NoteTypeNote)
+}
+
+func (s *Service) createNote(ctx context.Context, title, body, folder string, frontmatter parser.Frontmatter, noteType models.NoteType) (note *models.Note, created bool, err error) {
 	if title == "" {
 		return nil, false, fmt.Errorf("title is required")
 	}
@@ -68,7 +72,8 @@ func (s *Service) CreateNote(ctx context.Context, title, body, folder string, ta
 		return nil, false, fmt.Errorf("create folder: %w", err)
 	}
 
-	content, err := parser.RenderMarkdown(parser.Frontmatter{Title: title, Tags: tags}, body)
+	frontmatter.Title = title
+	content, err := parser.RenderMarkdown(frontmatter, body)
 	if err != nil {
 		return nil, false, fmt.Errorf("render markdown: %w", err)
 	}
@@ -77,7 +82,7 @@ func (s *Service) CreateNote(ctx context.Context, title, body, folder string, ta
 		return nil, false, fmt.Errorf("write note file: %w", err)
 	}
 
-	n := &models.Note{Title: title, Path: path, Content: body, Type: models.NoteTypeNote}
+	n := &models.Note{Title: title, Path: path, Content: body, Type: noteType}
 	id, err := s.noteStore.Create(n)
 	if err != nil {
 		return nil, false, fmt.Errorf("save note record: %w", err)
@@ -180,6 +185,36 @@ func (s *Service) embedNote(ctx context.Context, n *models.Note) error {
 		if err != nil {
 			return fmt.Errorf("store chunk %d: %w", i, err)
 		}
+	}
+	return nil
+}
+
+// Reindex prepares all vectors before replacing the index in one transaction.
+// This prevents mixed embedding dimensions when a provider/model changes.
+func (s *Service) Reindex(ctx context.Context, progress func(int, int)) error {
+	notes, err := s.noteStore.All()
+	if err != nil {
+		return fmt.Errorf("list notes: %w", err)
+	}
+	prepared := make([]*models.Chunk, 0)
+	for i, note := range notes {
+		texts := parser.ChunkText(note.Content, 200, 40)
+		if len(texts) == 0 {
+			texts = []string{note.Title}
+		}
+		for index, text := range texts {
+			vector, err := s.ai.Embed(ctx, text)
+			if err != nil {
+				return fmt.Errorf("embed %q: %w", note.Title, err)
+			}
+			prepared = append(prepared, &models.Chunk{NoteID: note.ID, Content: text, ChunkIdx: index, Embedding: vector})
+		}
+		if progress != nil {
+			progress(i+1, len(notes))
+		}
+	}
+	if err := s.chunkStore.ReplaceAll(prepared); err != nil {
+		return err
 	}
 	return nil
 }

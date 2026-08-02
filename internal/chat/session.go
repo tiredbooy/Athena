@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/tiredbooy/internal/ai"
 	"github.com/tiredbooy/internal/models"
@@ -21,7 +22,7 @@ type Session struct {
 }
 
 func NewSession(loop *Loop) *Session {
-	return &Session{loop: loop, history: []models.Message{{Role: "system", Content: ai.SystemPrompt}}}
+	return &Session{loop: loop, history: []models.Message{{Role: "system", Content: ai.SystemPromptAt(time.Now())}}}
 }
 
 func (s *Session) Submit(ctx context.Context, input string, status func(string), onToken func(string)) (string, error) {
@@ -185,6 +186,8 @@ func (s *Session) command(ctx context.Context, input string) (string, error) {
 			return "Conversation compacted. Athena retained a short memory plus recent turns.", nil
 		}
 		return "Conversation is already compact.", nil
+	case "/doctor":
+		return s.loop.Doctor(ctx), nil
 	case "/models":
 		available, err := s.Models(ctx)
 		if err != nil {

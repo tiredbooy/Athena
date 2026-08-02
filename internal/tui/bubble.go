@@ -105,6 +105,7 @@ var commands = []commandSpec{
 	{"/reset", "clear conversation and model history"},
 	{"/help", "show commands and keyboard shortcuts"},
 	{"/compact", "compact older conversation context"},
+	{"/doctor", "diagnose vault, providers, and embeddings"},
 	{"/models", "show available chat models"},
 	{"/connect", "connect or add a chat provider"},
 	{"/confirm", "apply the reviewed change plan"},
@@ -300,6 +301,10 @@ func (m bubbleModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					if preset.kind == "openai_subscription" {
 						m.status = "Preparing ChatGPT sign-in…"
 						return m, subscriptionCmd(m.subscription)
+					}
+					if preset.kind == "ollama" {
+						m.closeOverlay()
+						return m, connectCmd(m.connect, ConnectionInput{Type: "ollama"})
 					}
 					m.connectType, m.connectValues = preset.kind, append([]string(nil), preset.values...)
 					m.connectStep = 1
@@ -725,7 +730,7 @@ func connectChoices() []connectChoice {
 		{label: "Anthropic", detail: "API key", kind: "anthropic", values: []string{"Anthropic", "https://api.anthropic.com/v1", "ANTHROPIC_API_KEY", "claude-sonnet-4-5"}},
 		{label: "xAI / Grok", detail: "API key", kind: "openai_compatible", values: []string{"xAI", "https://api.x.ai/v1", "XAI_API_KEY", "grok-4"}},
 		{label: "OpenRouter", detail: "API key", kind: "openai_compatible", values: []string{"OpenRouter", "https://openrouter.ai/api/v1", "OPENROUTER_API_KEY", "openai/gpt-5.2"}},
-		{label: "Ollama server", detail: "local", kind: "openai_compatible", values: []string{"Ollama server", "http://localhost:11434/v1", "", ""}},
+		{label: "Restore built-in Ollama", detail: "local defaults", kind: "ollama"},
 		{label: "Custom local server", detail: "OpenAI-compatible", kind: "openai_compatible", values: []string{"", "http://localhost:1234/v1", "", ""}},
 	}
 }

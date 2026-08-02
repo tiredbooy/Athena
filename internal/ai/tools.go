@@ -27,6 +27,8 @@ import (
 //   - restore_note:     NoteID
 //   - archive_note:      NoteID
 //   - unarchive_note:   NoteID
+//   - create_book:      Title, Folder (optional), ISBN (optional)
+//   - finish_book:      NoteID
 type Action struct {
 	// ID identifies an action within a batch plan. It is optional for
 	// single/legacy actions; a batch runs concurrently only when every action
@@ -51,6 +53,7 @@ type Action struct {
 	NewFolder string   `json:"new_folder,omitempty"`
 	Paths     []string `json:"paths,omitempty"`
 	Done      bool     `json:"done,omitempty"`
+	ISBN      string   `json:"isbn,omitempty"`
 }
 
 type ActionResult struct {

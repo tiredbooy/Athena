@@ -19,6 +19,7 @@ type NoteType string
 const (
 	NoteTypeNote NoteType = "note"
 	NoteTypeTask NoteType = "task"
+	NoteTypeBook NoteType = "book"
 )
 
 type Note struct {

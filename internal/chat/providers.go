@@ -116,6 +116,9 @@ func (l *Loop) Connect(input ConnectionInput) (string, error) {
 		return "", fmt.Errorf("provider configuration is unavailable")
 	}
 	input.Name, input.Type, input.BaseURL, input.APIKeyEnv, input.ChatModel = strings.TrimSpace(input.Name), strings.TrimSpace(input.Type), strings.TrimRight(strings.TrimSpace(input.BaseURL), "/"), strings.TrimSpace(input.APIKeyEnv), strings.TrimSpace(input.ChatModel)
+	if input.Type == "ollama" {
+		return l.restoreOllama()
+	}
 	if input.Name == "" || input.BaseURL == "" || input.ChatModel == "" {
 		return "", fmt.Errorf("provider name, base URL, and chat model are required")
 	}
@@ -148,6 +151,24 @@ func (l *Loop) Connect(input ConnectionInput) (string, error) {
 		return "", err
 	}
 	return fmt.Sprintf("Connected %s. Using %s.", entry.Name, entry.ChatModel), nil
+}
+
+func (l *Loop) restoreOllama() (string, error) {
+	if l.config == nil {
+		return "", fmt.Errorf("provider configuration is unavailable")
+	}
+	client, ok := l.providers["ollama"].(*ai.Client)
+	if !ok {
+		return "", fmt.Errorf("built-in Ollama provider is unavailable")
+	}
+	l.config.RestoreOllamaDefaults()
+	client.SetHost(l.config.OllamaHost)
+	client.SetChatModel(l.config.ChatModel)
+	l.ai = client
+	if err := l.config.Save(); err != nil {
+		return "", fmt.Errorf("save restored Ollama settings: %w", err)
+	}
+	return fmt.Sprintf("Restored built-in Ollama (%s). Using %s.", l.config.OllamaHost, l.config.ChatModel), nil
 }
 
 func (l *Loop) activeProviderID() string {

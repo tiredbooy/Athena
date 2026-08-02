@@ -45,6 +45,8 @@ var actionPolicies = map[string]Policy{
 	"restore_note":    {Kind: ToolWrite, Timeout: time.Minute},
 	"archive_note":    {Kind: ToolWrite, Timeout: time.Minute},
 	"unarchive_note":  {Kind: ToolWrite, Timeout: time.Minute},
+	"create_book":     {Kind: ToolWrite, Timeout: time.Minute},
+	"finish_book":     {Kind: ToolWrite, Timeout: time.Minute},
 
 	"update_note":   {Kind: ToolDestructive, Timeout: time.Minute, RequiresConfirmation: true},
 	"trash_note":    {Kind: ToolDestructive, Timeout: time.Minute, RequiresConfirmation: true},
@@ -100,7 +102,7 @@ func validateAction(action ai.Action, known bool) error {
 	}
 
 	switch action.Type {
-	case "create_note", "create_task":
+	case "create_note", "create_task", "create_book":
 		if strings.TrimSpace(action.Title) == "" {
 			return fmt.Errorf("%s requires title", action.Type)
 		}
@@ -108,7 +110,7 @@ func validateAction(action ai.Action, known bool) error {
 		if len(action.Paths) == 0 {
 			return fmt.Errorf("ensure_folders requires paths")
 		}
-	case "move_note", "update_note", "append_note", "replace_section", "mark_done", "rename_note", "duplicate_note", "trash_note", "restore_note", "archive_note", "unarchive_note":
+	case "move_note", "update_note", "append_note", "replace_section", "mark_done", "rename_note", "duplicate_note", "trash_note", "restore_note", "archive_note", "unarchive_note", "finish_book":
 		if action.NoteID <= 0 {
 			return fmt.Errorf("%s requires note_id", action.Type)
 		}

@@ -78,3 +78,25 @@ func (s *ChunkStore) DeleteByNoteID(noteID int64) error {
 	}
 	return nil
 }
+
+// ReplaceAll atomically swaps the whole vector index only after callers have
+// prepared every new vector. A failed reindex therefore leaves the old index usable.
+func (s *ChunkStore) ReplaceAll(chunks []*models.Chunk) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec(`DELETE FROM chunks`); err != nil {
+		return fmt.Errorf("clear vector index: %w", err)
+	}
+	for _, chunk := range chunks {
+		if _, err := tx.Exec(`INSERT INTO chunks (note_id, content, chunk_index, embedding) VALUES (?, ?, ?, ?)`, chunk.NoteID, chunk.Content, chunk.ChunkIdx, encodeEmbedding(chunk.Embedding)); err != nil {
+			return fmt.Errorf("store reindexed chunk: %w", err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit vector index: %w", err)
+	}
+	return nil
+}

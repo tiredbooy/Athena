@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/tiredbooy/internal/ai"
+	"github.com/tiredbooy/internal/books"
 	"github.com/tiredbooy/internal/chat"
 	"github.com/tiredbooy/internal/config"
 	"github.com/tiredbooy/internal/models"
@@ -47,13 +48,18 @@ func main() {
 		}
 	}
 
-	retrievalSvc := retrieval.NewService(cfg.VaultPath, noteStore, chunkStore, client)
-	notesSvc := notes.NewService(cfg.VaultPath, noteStore, chunkStore, client)
+	embeddings := ai.EmbeddingProvider(client)
+	if cfg.EmbeddingProvider.Type == "openai_compatible" {
+		embeddings = ai.NewOpenAIEmbeddingProvider(cfg.EmbeddingProvider.Name, cfg.EmbeddingProvider.BaseURL, cfg.EmbeddingProvider.APIKeyEnv, cfg.EmbeddingProvider.Model)
+	}
+	retrievalSvc := retrieval.NewService(cfg.VaultPath, noteStore, chunkStore, embeddings)
+	notesSvc := notes.NewService(cfg.VaultPath, noteStore, chunkStore, embeddings)
 	if err := notesSvc.SyncFolderGraph(); err != nil {
 		fmt.Fprintf(os.Stderr, "warning: Obsidian folder graph is unavailable: %v\n", err)
 	}
 
-	dispatcher := buildDispatcher(notesSvc)
+	bookResolver := books.NewResolver(storage.NewBookMetadataStore(db), nil)
+	dispatcher := buildDispatcher(notesSvc, bookResolver)
 	dispatcher.SetAuditLogger(storage.NewActionAuditStore(db))
 
 	fmt.Println("second-brain ready.")
@@ -116,7 +122,7 @@ func providerID(name string) string {
 // buildDispatcher registers every action type the model is allowed to
 // invoke (see ai/prompt.go for the schema advertised to the model).
 // Add a handler here whenever a new action type is added to that prompt.
-func buildDispatcher(notesSvc *notes.Service) *tools.Dispatcher {
+func buildDispatcher(notesSvc *notes.Service, bookResolver *books.Resolver) *tools.Dispatcher {
 	d := tools.NewDispatcher()
 
 	d.Register("create_note", func(ctx context.Context, a ai.Action) (string, error) {
@@ -139,6 +145,31 @@ func buildDispatcher(notesSvc *notes.Service) *tools.Dispatcher {
 			return fmt.Sprintf("Task %q already exists at %s (left unchanged)", n.Title, n.Path), nil
 		}
 		return fmt.Sprintf("Created task %q at %s", n.Title, n.Path), nil
+	})
+
+	d.Register("create_book", func(ctx context.Context, a ai.Action) (string, error) {
+		metadata, err := bookResolver.Resolve(ctx, a.Title, a.ISBN)
+		if err != nil {
+			return "", err
+		}
+		n, created, err := notesSvc.CreateBook(ctx, metadata, a.Folder, time.Now())
+		if err != nil {
+			return "", err
+		}
+		if !created {
+			return fmt.Sprintf("Book %q already exists at %s (left unchanged)", n.Title, n.Path), nil
+		}
+		if metadata.Source == "unresolved" {
+			return fmt.Sprintf("Created book %q. Its metadata is unknown; Athena did not guess.", n.Title), nil
+		}
+		return fmt.Sprintf("Created book %q with metadata from %s", n.Title, metadata.Source), nil
+	})
+
+	d.Register("finish_book", func(ctx context.Context, a ai.Action) (string, error) {
+		if err := notesSvc.FinishBook(ctx, a.NoteID, time.Now()); err != nil {
+			return "", err
+		}
+		return fmt.Sprintf("Recorded that book %d was finished at the local time", a.NoteID), nil
 	})
 
 	d.Register("ensure_folders", func(_ context.Context, a ai.Action) (string, error) {

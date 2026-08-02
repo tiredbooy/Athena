@@ -2,6 +2,7 @@ package parser
 
 import (
 	"strings"
+	"time"
 
 	"gopkg.in/yaml.v3"
 )
@@ -15,9 +16,17 @@ import (
 //	---
 //	body content here...
 type Frontmatter struct {
-	Title       string   `yaml:"title"`
-	Tags        []string `yaml:"tags"`
-	AthenaIndex bool     `yaml:"athena_index,omitempty"`
+	Title          string     `yaml:"title"`
+	Tags           []string   `yaml:"tags"`
+	AthenaIndex    bool       `yaml:"athena_index,omitempty"`
+	Kind           string     `yaml:"kind,omitempty"`
+	Authors        []string   `yaml:"authors,omitempty"`
+	Genres         []string   `yaml:"genres,omitempty"`
+	PublishedYear  int        `yaml:"published_year,omitempty"`
+	ISBN           string     `yaml:"isbn,omitempty"`
+	MetadataSource string     `yaml:"metadata_source,omitempty"`
+	StartedAt      time.Time  `yaml:"started_at,omitempty"`
+	FinishedAt     *time.Time `yaml:"finished_at,omitempty"`
 }
 
 // ParseMarkdown splits raw file content into its Frontmatter and body.

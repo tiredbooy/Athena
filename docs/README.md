@@ -7,6 +7,7 @@ and `README.md`. Future proposals live outside this folder in `/plans`.
 | --- | --- | --- |
 | Application startup | Composition root and YAML configuration. | [configuration](configuration/README.md) |
 | Model providers | Provider connections, adapter boundaries, and extension guide. | [providers](providers/README.md) |
+| Books | Local metadata cache and book note lifecycle. | [books](books/README.md) |
 | Notes and vault files | Markdown notes, folders, tasks, archive, and trash. | [notes](notes/README.md) |
 | Data and search | SQLite records, embeddings, and retrieval context. | [retrieval](retrieval/README.md) |
 | AI planning and execution | Ollama client, action extraction, batches, and dispatching. | [ai](ai/README.md) |

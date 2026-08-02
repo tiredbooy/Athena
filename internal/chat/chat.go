@@ -35,7 +35,7 @@ func (l *Loop) Run() {
 	history := []models.Message{
 		{
 			Role:    "system",
-			Content: ai.SystemPrompt,
+			Content: ai.SystemPromptAt(time.Now()),
 		},
 	}
 

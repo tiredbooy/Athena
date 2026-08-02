@@ -13,10 +13,10 @@ type Service struct {
 	vaultPath  string
 	noteStore  *storage.NoteStore
 	chunkStore *storage.ChunkStore
-	ai         *ai.Client
+	ai         ai.EmbeddingProvider
 }
 
-func NewService(vaultPath string, noteStore *storage.NoteStore, chunkStore *storage.ChunkStore, aiClient *ai.Client) *Service {
+func NewService(vaultPath string, noteStore *storage.NoteStore, chunkStore *storage.ChunkStore, aiClient ai.EmbeddingProvider) *Service {
 	return &Service{vaultPath: vaultPath, noteStore: noteStore, chunkStore: chunkStore, ai: aiClient}
 }
 

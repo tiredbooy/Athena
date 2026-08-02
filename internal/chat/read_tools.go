@@ -32,6 +32,12 @@ func readToolDefinitions() []models.ToolDefinition {
 		toolDefinition("list_folders", "List the current vault folder tree.", objectSchema(nil, nil)),
 		toolDefinition("find_notes_by_title", "Find notes by a case-insensitive title fragment. Use this before guessing a note ID.", objectSchema(
 			map[string]any{"query": stringSchema("Title words to match"), "limit": integerSchema("Maximum results, 1-8")}, []string{"query"})),
+		toolDefinition("get_notes", "Read up to eight notes by ID in one call.", objectSchema(map[string]any{"note_ids": map[string]any{"type": "array", "items": integerSchema("Note ID")}}, []string{"note_ids"})),
+		toolDefinition("get_note_by_path", "Read a note by its vault-relative Markdown path.", objectSchema(map[string]any{"path": stringSchema("For example books/foundation.md")}, []string{"path"})),
+		toolDefinition("list_tags", "List tags and their note counts.", objectSchema(nil, nil)),
+		toolDefinition("get_note_links", "Get a note's direct outgoing links and backlinks.", objectSchema(map[string]any{"note_id": integerSchema("Note ID")}, []string{"note_id"})),
+		toolDefinition("find_duplicate_titles", "Find potentially duplicate notes by normalized title.", objectSchema(nil, nil)),
+		toolDefinition("get_daily_note", "Read a daily note at daily/YYYY-MM-DD.md; omit date for today.", objectSchema(map[string]any{"date": stringSchema("Optional ISO date YYYY-MM-DD")}, nil)),
 	}
 }
 
@@ -133,7 +139,7 @@ func isIncompleteDoneReason(reason string) bool {
 }
 
 func compactContinuationMessages(messages []models.Message, partial models.Message) []models.Message {
-	system := models.Message{Role: "system", Content: ai.SystemPrompt}
+	system := models.Message{Role: "system", Content: ai.SystemPromptAt(time.Now())}
 	goal := ""
 	for i := len(messages) - 1; i >= 0; i-- {
 		if messages[i].Role == "user" {
@@ -184,6 +190,43 @@ func (s *Session) executeReadTool(ctx context.Context, call models.ToolCall) str
 			return toolError(parseErr.Error())
 		}
 		result, err = s.loop.retrieval.FindNotesByTitle(query, limit)
+	case "get_notes":
+		ids, parseErr := requiredIDs(arguments, "note_ids")
+		if parseErr != nil {
+			return toolError(parseErr.Error())
+		}
+		result, err = s.loop.retrieval.NotesByID(ids)
+	case "get_note_by_path":
+		path, parseErr := requiredString(arguments, "path")
+		if parseErr != nil {
+			return toolError(parseErr.Error())
+		}
+		result, err = s.loop.retrieval.NoteByRelativePath(path)
+		if err == nil && result == nil {
+			return toolError(fmt.Sprintf("note %q was not found", path))
+		}
+	case "list_tags":
+		result, err = s.loop.retrieval.Tags()
+	case "get_note_links":
+		noteID, parseErr := requiredInt64(arguments, "note_id")
+		if parseErr != nil {
+			return toolError(parseErr.Error())
+		}
+		result, err = s.loop.retrieval.Links(noteID)
+	case "find_duplicate_titles":
+		result, err = s.loop.retrieval.DuplicateTitles()
+	case "get_daily_note":
+		date := optionalString(arguments, "date")
+		if date == "" {
+			date = time.Now().Format("2006-01-02")
+		}
+		if _, parseErr := time.Parse("2006-01-02", date); parseErr != nil {
+			return toolError("date must use YYYY-MM-DD")
+		}
+		result, err = s.loop.retrieval.NoteByRelativePath("daily/" + date + ".md")
+		if err == nil && result == nil {
+			return toolError(fmt.Sprintf("daily note for %s was not found", date))
+		}
 	default:
 		return toolError(fmt.Sprintf("unknown read tool %q", name))
 	}
@@ -246,6 +289,19 @@ func requiredInt64(arguments map[string]json.RawMessage, name string) (int64, er
 		return 0, fmt.Errorf("%s must be a positive integer", name)
 	}
 	return value, nil
+}
+
+func requiredIDs(arguments map[string]json.RawMessage, name string) ([]int64, error) {
+	var ids []int64
+	if err := json.Unmarshal(arguments[name], &ids); err != nil || len(ids) == 0 || len(ids) > 8 {
+		return nil, fmt.Errorf("%s must contain 1 to 8 note IDs", name)
+	}
+	for _, id := range ids {
+		if id <= 0 {
+			return nil, fmt.Errorf("%s must contain positive note IDs", name)
+		}
+	}
+	return ids, nil
 }
 
 func toolLimit(arguments map[string]json.RawMessage) int {

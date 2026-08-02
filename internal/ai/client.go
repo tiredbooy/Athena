@@ -48,6 +48,13 @@ func (c *Client) SetChatModel(name string) {
 	c.chatModel = strings.TrimSpace(name)
 }
 
+// SetHost is used only when restoring the built-in Ollama connection.
+func (c *Client) SetHost(host string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.host = strings.TrimRight(strings.TrimSpace(host), "/")
+}
+
 func (c *Client) EmbedModel() string {
 	return c.embedModel
 }
