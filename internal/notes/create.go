@@ -132,6 +132,12 @@ func (s *Service) MoveNote(ctx context.Context, noteID int64, folder string) (*m
 	if newPath == n.Path {
 		return n, nil
 	}
+	if _, err := os.Stat(n.Path); err != nil {
+		if os.IsNotExist(err) {
+			return nil, fmt.Errorf("source file is missing at %s; Athena's index is stale (the note may have been moved outside Athena)", utils.RelVault(s.vaultPath, n.Path))
+		}
+		return nil, fmt.Errorf("inspect source file: %w", err)
+	}
 
 	if existing, err := s.noteStore.GetByPath(newPath); err != nil {
 		return nil, err

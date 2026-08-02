@@ -33,6 +33,9 @@ func (s *Session) Submit(ctx context.Context, input string, status func(string),
 	if input == "" {
 		return "", nil
 	}
+	if status != nil {
+		status(fmt.Sprintf("Using %s · %s", s.loop.ai.Name(), shortModel(s.loop.ai.ChatModel())))
+	}
 	if input == "/confirm" {
 		return s.confirmPending(ctx)
 	}
@@ -91,6 +94,20 @@ func (s *Session) Submit(ctx context.Context, input string, status func(string),
 		s.history = s.history[:len(s.history)-1]
 		return "", err
 	}
+	if result != nil && result.Context != "" && asksUserForVaultInventory(raw) {
+		if status != nil {
+			status("Model ignored the supplied vault inventory — correcting the plan")
+		}
+		messages = append(messages,
+			models.Message{Role: "assistant", Content: raw},
+			models.Message{Role: "user", Content: "Athena already supplied the complete vault inventory and relevant notes above. Do not ask the user to provide them again. Use that data now: give the requested organization plan with valid actions, or state exactly which single classification decision remains ambiguous."},
+		)
+		raw, err = s.runReadToolLoop(ctx, messages, status)
+		if err != nil {
+			s.history = s.history[:len(s.history)-1]
+			return "", err
+		}
+	}
 	if status != nil {
 		status("Writing a response")
 	}
@@ -131,6 +148,24 @@ func (s *Session) Submit(ctx context.Context, input string, status func(string),
 	}
 	s.history = append(s.history, models.Message{Role: "assistant", Content: reply})
 	return reply, nil
+}
+
+func shortModel(model string) string {
+	model = strings.TrimSpace(model)
+	if index := strings.LastIndex(model, "/"); index >= 0 {
+		model = model[index+1:]
+	}
+	if len(model) > 44 {
+		return model[:43] + "…"
+	}
+	return model
+}
+
+func asksUserForVaultInventory(reply string) bool {
+	reply = strings.ToLower(reply)
+	return (strings.Contains(reply, "provide") || strings.Contains(reply, "send")) &&
+		(strings.Contains(reply, "full list") || strings.Contains(reply, "list of all")) &&
+		(strings.Contains(reply, "book") || strings.Contains(reply, "folder") || strings.Contains(reply, "vault"))
 }
 
 func (s *Session) previewActions(actions []ai.Action) string {

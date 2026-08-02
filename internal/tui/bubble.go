@@ -27,6 +27,7 @@ type answerMsg struct {
 	err  error
 }
 type workerMsg struct {
+	requestID    uint64
 	status, text string
 	err          error
 	done         bool
@@ -74,6 +75,8 @@ type bubbleModel struct {
 	connectType   string
 	connectStep   int
 	connectValues []string
+	reviewing     bool
+	requestID     uint64
 }
 
 type commandSpec struct {
@@ -183,7 +186,7 @@ func RunBubble(submit SubmitFunc, reset ResetFunc, models ModelsFunc, selectMode
 	input.ShowLineNumbers = false
 	input.Prompt = "❯ "
 	input.CharLimit = 10_000
-	input.SetHeight(1)
+	input.SetHeight(2)
 	applyInputTheme(&input)
 	input.Focus()
 	spin := spinner.New()
@@ -206,14 +209,31 @@ func (m bubbleModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.output.SetHeight(max(4, msg.Height-12))
 		m.refreshOutput()
 		return m, nil
+	case tea.MouseWheelMsg:
+		var cmd tea.Cmd
+		m.output, cmd = m.output.Update(msg)
+		return m, cmd
 	case tea.KeyPressMsg:
+		if m.reviewing && (msg.String() == "y" || msg.String() == "Y") {
+			m.reviewing = false
+			return m, m.startSubmit("/confirm")
+		}
+		if m.reviewing && (msg.String() == "n" || msg.String() == "N") {
+			m.reviewing = false
+			return m, m.startSubmit("/cancel")
+		}
 		switch msg.String() {
 		case "ctrl+c", "q":
 			return m, tea.Quit
 		case "esc":
-			if m.busy && m.cancel != nil {
+			if m.reviewing {
+				m.reviewing = false
+				return m, m.startSubmit("/cancel")
+			} else if m.busy && m.cancel != nil {
 				m.cancel()
-				m.status = "Cancelling…"
+				m.requestID++ // Late results from this request must not alter the UI.
+				m.busy, m.cancel, m.streaming = false, nil, false
+				m.status = "Cancelled"
 			} else if m.picker || m.connecting {
 				m.closeOverlay()
 			} else if m.commandMenu {
@@ -280,6 +300,16 @@ func (m bubbleModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 		case "enter":
+			if m.reviewing {
+				m.reviewing = false
+				return m, m.startSubmit("/confirm")
+			}
+			if m.busy {
+				if strings.TrimSpace(m.input.Value()) != "" {
+					m.status = "Athena is still working — your draft is kept below. Press Esc to cancel the current request."
+				}
+				return m, nil
+			}
 			if m.picker {
 				if m.pickerLoading {
 					return m, nil
@@ -327,7 +357,7 @@ func (m bubbleModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					return m, connectCmd(m.connect, ConnectionInput{Name: m.connectValues[0], Type: m.connectType, BaseURL: m.connectValues[1], APIKeyEnv: m.connectValues[2], ChatModel: m.connectValues[3]})
 				}
 			}
-			if m.busy || strings.TrimSpace(m.input.Value()) == "" {
+			if strings.TrimSpace(m.input.Value()) == "" {
 				return m, nil
 			}
 			input := strings.TrimSpace(m.input.Value())
@@ -376,23 +406,12 @@ func (m bubbleModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.commandMenu = true
 				return m, nil
 			}
-			m.input.SetValue("")
-			m.busy = true
-			m.status = "Working…"
-			m.lines = append(m.lines, renderUserMessage(input))
-			m.refreshOutput()
-			ctx, cancel := context.WithCancel(context.Background())
-			m.cancel = cancel
-			events := make(chan workerMsg, 16)
-			m.events = events
-			go func() {
-				text, err := m.submit(ctx, input, func(status string) { events <- workerMsg{status: status} }, func(token string) { events <- workerMsg{text: token} })
-				events <- workerMsg{text: text, err: err, done: true}
-				close(events)
-			}()
-			return m, tea.Batch(waitForWorker(events), m.spinner.Tick)
+			return m, m.startSubmit(input)
 		}
 	case workerMsg:
+		if msg.requestID != m.requestID {
+			return m, nil
+		}
 		if !msg.done && msg.text == "" {
 			m.status = msg.status
 			return m, waitForWorker(m.events)
@@ -420,6 +439,10 @@ func (m bubbleModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			} else {
 				m.lines = append(m.lines, entry)
 			}
+		}
+		m.reviewing = msg.err == nil && strings.Contains(msg.text, "Review required — no changes have been made.")
+		if m.reviewing {
+			m.status = "Apply this plan? Press Y or Enter to approve · N or Esc to cancel"
 		}
 		m.streaming = false
 		m.streamText = ""
@@ -484,9 +507,40 @@ func (m bubbleModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, cmd
 	}
+	if _, ok := msg.(tea.KeyPressMsg); ok {
+		var cmd tea.Cmd
+		m.input, cmd = m.input.Update(msg)
+		return m, cmd
+	}
 	var cmd tea.Cmd
 	m.output, cmd = m.output.Update(msg)
 	return m, cmd
+}
+
+func (m *bubbleModel) startSubmit(input string) tea.Cmd {
+	m.input.SetValue("")
+	m.busy = true
+	m.status = "Starting request…"
+	m.lines = append(m.lines, renderUserMessage(input))
+	m.refreshOutput()
+	ctx, cancel := context.WithCancel(context.Background())
+	m.cancel = cancel
+	m.requestID++
+	id := m.requestID
+	events := make(chan workerMsg, 64)
+	m.events = events
+	go func() {
+		emit := func(message workerMsg) {
+			select {
+			case events <- message:
+			default:
+			}
+		}
+		text, err := m.submit(ctx, input, func(status string) { emit(workerMsg{requestID: id, status: status}) }, func(token string) { emit(workerMsg{requestID: id, text: token}) })
+		emit(workerMsg{requestID: id, text: text, err: err, done: true})
+		close(events)
+	}()
+	return tea.Batch(waitForWorker(events), m.spinner.Tick)
 }
 
 func (m bubbleModel) commandMatches() []commandSpec {
@@ -618,6 +672,13 @@ func (m bubbleModel) composerView() string {
 	return panel.Width(width).Render(m.input.View())
 }
 
+func (m bubbleModel) approvalView(width int) string {
+	if !m.reviewing {
+		return ""
+	}
+	return panel.Width(width).Render(accent.Render("Apply planned changes?") + muted.Render("  [Y] Yes · [N] No"))
+}
+
 func (m bubbleModel) View() tea.View {
 	body := m.output.View()
 	if len(m.lines) == 0 {
@@ -638,13 +699,16 @@ func (m bubbleModel) View() tea.View {
 		composer = m.overlayView(width)
 		suggestions = ""
 	}
-	content := header + "\n" + muted.Render(strings.Repeat("─", width)) + "\n\n" + body + "\n\n" + suggestions + composer + "\n" + status + "\n" + muted.Render("Enter send · Shift+Enter newline · ↑↓ select command · Tab complete · Esc cancel")
+	approval := m.approvalView(width)
+	if approval != "" {
+		approval += "\n"
+	}
+	content := header + "\n" + muted.Render(strings.Repeat("─", width)) + "\n\n" + body + "\n\n" + suggestions + approval + composer + "\n" + status + "\n" + muted.Render("Enter send · Shift+Enter newline · ↑↓ select command · Tab complete · Esc cancel")
 	v := tea.NewView(content)
 	v.AltScreen = true
 	v.WindowTitle = "Athena"
-	// Do not capture drag events: users must be able to select and copy text
-	// with their terminal's normal mouse behavior. Keyboard scrolling remains
-	// available through Home/PgUp/PgDn and their Ctrl alternatives.
+	// Leave the mouse to the terminal so users can select and copy any message
+	// normally. Keyboard viewport scrolling remains available (PgUp/PgDn).
 	v.MouseMode = tea.MouseModeNone
 	return v
 }

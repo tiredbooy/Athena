@@ -68,6 +68,21 @@ func (s *Session) runReadToolLoop(ctx context.Context, messages []models.Message
 	for round := 0; round < maxReadToolRounds; round++ {
 		response, err := s.chatWithRetry(ctx, messages, tools, status)
 		if err != nil {
+			// Some local models can emit Athena action blocks but reject Ollama's
+			// native tools schema. Keep the turn useful without bypassing dispatch.
+			if round == 0 && s.loop.ai.Name() == "Ollama" {
+				if status != nil {
+					status("Tool mode was rejected — retrying normal chat with the same model")
+				}
+				fallback, fallbackErr := s.loop.ai.ChatWithToolsResult(ctx, messages, nil)
+				if fallbackErr == nil && strings.TrimSpace(fallback.Message.Content) != "" {
+					return fallback.Message.Content, nil
+				}
+				if fallbackErr == nil {
+					fallbackErr = fmt.Errorf("model returned no visible response")
+				}
+				return "", fmt.Errorf("Ollama rejected native tools, then normal chat failed: %w", fallbackErr)
+			}
 			return "", err
 		}
 		if len(response.Message.ToolCalls) == 0 {
@@ -101,17 +116,58 @@ func (s *Session) runReadToolLoop(ctx context.Context, messages []models.Message
 			// The queue is application-owned: every accepted call is completed
 			// before Athena asks the model to plan another turn.
 			for _, call := range calls[start:end] {
+				if status != nil {
+					status(readToolActivity(call))
+				}
 				content := s.executeReadTool(ctx, call)
 				messages = append(messages, models.Message{Role: "tool", ToolName: call.Function.Name, ToolCallID: call.ID, Content: content})
 			}
 		}
 	}
-	return "", fmt.Errorf("model exceeded the %d-round read-tool limit", maxReadToolRounds)
+	// A weak model can keep requesting the same read tools forever. Do not make
+	// the user retry from scratch: stop granting tools and ask for an answer
+	// based on the facts Athena already supplied.
+	if status != nil {
+		status("Read limit reached — asking the model to finish with collected results")
+	}
+	messages = append(messages, models.Message{Role: "user", Content: "You have enough vault results. Answer the user now using the tool results already provided. Do not request more tools."})
+	final, err := s.loop.ai.ChatWithToolsResult(ctx, messages, nil)
+	if err != nil {
+		return "", fmt.Errorf("finish after read limit: %w", err)
+	}
+	if strings.TrimSpace(final.Message.Content) == "" {
+		return "", fmt.Errorf("model exceeded the %d-round read-tool limit without a final answer", maxReadToolRounds)
+	}
+	return final.Message.Content, nil
+}
+
+func readToolActivity(call models.ToolCall) string {
+	name := strings.TrimSpace(call.Function.Name)
+	var args map[string]json.RawMessage
+	_ = json.Unmarshal(call.Function.Arguments, &args)
+	switch name {
+	case "get_note_by_path":
+		return "Reading " + optionalString(args, "path")
+	case "get_note":
+		return fmt.Sprintf("Reading note %d", toolID(args, "note_id"))
+	case "get_daily_note":
+		return "Reading daily note " + optionalString(args, "date")
+	case "search_notes":
+		return "Searching notes for “" + optionalString(args, "query") + "”"
+	default:
+		return "Running vault tool: " + name
+	}
+}
+
+func toolID(args map[string]json.RawMessage, key string) int64 {
+	var id int64
+	_ = json.Unmarshal(args[key], &id)
+	return id
 }
 
 func (s *Session) chatWithRetry(ctx context.Context, messages []models.Message, tools []models.ToolDefinition, status func(string)) (ai.ToolChatResult, error) {
 	if status != nil {
-		status(fmt.Sprintf("Planning with %s", s.loop.ai.ChatModel()))
+		status(fmt.Sprintf("%s · %s is generating a plan", s.loop.ai.Name(), shortModel(s.loop.ai.ChatModel())))
 	}
 	response, err := s.loop.ai.ChatWithToolsResult(ctx, messages, tools)
 	if err == nil || !retryableModelError(err) || ctx.Err() != nil {
