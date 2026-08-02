@@ -15,8 +15,9 @@ import (
 //	---
 //	body content here...
 type Frontmatter struct {
-	Title string   `yaml:"title"`
-	Tags  []string `yaml:"tags"`
+	Title       string   `yaml:"title"`
+	Tags        []string `yaml:"tags"`
+	AthenaIndex bool     `yaml:"athena_index,omitempty"`
 }
 
 // ParseMarkdown splits raw file content into its Frontmatter and body.

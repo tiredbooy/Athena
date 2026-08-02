@@ -30,6 +30,18 @@ after the note is saved so user content is not lost.
 - `.trash` is system-managed and cannot be deleted through folder actions.
 - Moving/renaming folders repoints affected SQLite note paths.
 
+## Obsidian folder graph
+
+Folders are not graph nodes in Obsidian; Markdown files are. Athena therefore
+maintains one generated index note per visible folder. A folder index links to
+its immediate child folders and notes, creating a clean hierarchy such as
+area → category → item without linking every item to every ancestor.
+
+Index notes are marked `athena_index: true` in frontmatter, are not added to
+Athena's SQLite catalog or retrieval context, and are refreshed after folder or
+note structure changes. Athena refuses to overwrite a user note that occupies
+the reserved index path (`folder/path.md` for the folder `folder/path`).
+
 ## Note states
 
 - Normal notes are listed and searchable.

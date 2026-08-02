@@ -47,6 +47,9 @@ func main() {
 
 	retrievalSvc := retrieval.NewService(cfg.VaultPath, noteStore, chunkStore, client)
 	notesSvc := notes.NewService(cfg.VaultPath, noteStore, chunkStore, client)
+	if err := notesSvc.SyncFolderGraph(); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: Obsidian folder graph is unavailable: %v\n", err)
+	}
 
 	dispatcher := buildDispatcher(notesSvc)
 	dispatcher.SetAuditLogger(storage.NewActionAuditStore(db))
@@ -277,8 +280,8 @@ func registerWriteVerifiers(d *tools.Dispatcher, notesSvc *notes.Service) {
 	for _, actionType := range []string{
 		"create_note", "create_task", "move_note", "update_note", "mark_done",
 		"append_note", "replace_section",
-		"rename_note", "trash_note", "restore_note", "archive_note", "unarchive_note",
-		"create_folder", "ensure_folders", "delete_folder",
+		"rename_note", "duplicate_note", "trash_note", "restore_note", "archive_note", "unarchive_note",
+		"create_folder", "ensure_folders", "delete_folder", "rename_folder", "move_folder",
 	} {
 		d.RegisterVerifier(actionType, func(ctx context.Context, action ai.Action) error {
 			return verifyWrite(ctx, notesSvc, action)
@@ -287,6 +290,12 @@ func registerWriteVerifiers(d *tools.Dispatcher, notesSvc *notes.Service) {
 }
 
 func verifyWrite(_ context.Context, notesSvc *notes.Service, action ai.Action) error {
+	// Index notes are a derived Obsidian view of the vault. Refresh them after
+	// every structural write, never by asking the model to construct wikilinks.
+	if err := notesSvc.SyncFolderGraph(); err != nil {
+		return fmt.Errorf("refresh Obsidian folder graph: %w", err)
+	}
+
 	switch action.Type {
 	case "create_folder":
 		exists, err := notesSvc.FolderExists(action.Folder)
