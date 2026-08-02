@@ -26,6 +26,18 @@ Tool execution is owned by `internal/chat`, while `internal/retrieval` owns
 the vault reads. The model never receives direct storage or filesystem access.
 Write actions remain on the existing validated dispatcher path.
 
+## Safer writes and review
+
+`append_note` adds a paragraph without replacing prior content.
+`replace_section` changes one Markdown section only when its
+`expected_content` matches the current section body; this prevents a stale
+model plan from overwriting a later user edit. Full `update_note` remains
+available only for an explicit whole-note replacement.
+
+Bulk plans and destructive/broad changes are previewed instead of executed.
+The user must enter `/confirm` to apply the pending plan or `/cancel` to
+discard it. No action is dispatched before confirmation.
+
 ## Accepted action plan formats
 
 The extractor accepts one action per fenced `action` block, an array of
@@ -53,6 +65,14 @@ Each attempt is written to SQLite's local `action_audit` table with the JSON
 arguments, outcome, and error. Successful note and simple folder writes are
 re-read and verified before Athena reports success. Batches remain partially
 successful by design, so each action has an independent audit outcome.
+
+## Action policy
+
+`internal/tools` is the single source of action policy. Each built-in action
+declares its kind (`read`, `write`, or `destructive`), timeout, retry safety,
+review requirement, and whether it may run concurrently. Only read-only
+actions retry automatically or run in parallel. Any batch containing a write
+requires review; destructive and whole-note actions require review even alone.
 
 ## Adding an action
 

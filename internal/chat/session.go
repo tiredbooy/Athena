@@ -8,14 +8,16 @@ import (
 
 	"github.com/tiredbooy/internal/ai"
 	"github.com/tiredbooy/internal/models"
+	"github.com/tiredbooy/internal/tools"
 )
 
 // Session is the UI-independent owner of one conversation. Callers provide a
 // status callback; they decide whether to render it in a CLI, Bubble Tea, or a
 // future frontend.
 type Session struct {
-	loop    *Loop
-	history []models.Message
+	loop           *Loop
+	history        []models.Message
+	pendingActions []ai.Action
 }
 
 func NewSession(loop *Loop) *Session {
@@ -30,10 +32,24 @@ func (s *Session) Submit(ctx context.Context, input string, status func(string),
 	if input == "" {
 		return "", nil
 	}
+	if input == "/confirm" {
+		return s.confirmPending(ctx)
+	}
+	if input == "/cancel" {
+		return s.cancelPending()
+	}
+	if len(s.pendingActions) > 0 {
+		return "A change plan is awaiting review. Type /confirm to apply it or /cancel to discard it.", nil
+	}
 	if strings.HasPrefix(input, "/") {
 		return s.command(ctx, input)
 	}
 	if actions, ok := folderActions(input); ok {
+		if tools.RequiresConfirmation(actions) {
+			reply := s.previewActions(actions)
+			s.append(input, reply)
+			return reply, nil
+		}
 		reply := s.loop.runActions(ctx, actions)
 		s.append(input, reply)
 		return reply, nil
@@ -55,6 +71,7 @@ func (s *Session) Submit(ctx context.Context, input string, status func(string),
 		return "", fmt.Errorf("retrieve context: %w", err)
 	}
 	s.history = append(s.history, models.Message{Role: "user", Content: input})
+	s.compactHistory(false)
 	messages := append([]models.Message(nil), s.history...)
 	if result.Context != "" {
 		messages[len(messages)-1].Content = input + "\n\n" + result.Context
@@ -71,6 +88,14 @@ func (s *Session) Submit(ctx context.Context, input string, status func(string),
 		onToken(raw)
 	}
 	cleaned, actions := ai.ExtractActions(raw)
+	if len(actions) > 0 && tools.RequiresConfirmation(actions) {
+		reply := s.previewActions(actions)
+		if cleaned != "" {
+			reply = cleaned + "\n\n" + reply
+		}
+		s.history = append(s.history, models.Message{Role: "assistant", Content: reply})
+		return reply, nil
+	}
 	var report strings.Builder
 	if cleaned != "" {
 		report.WriteString(cleaned)
@@ -98,12 +123,59 @@ func (s *Session) Submit(ctx context.Context, input string, status func(string),
 	return reply, nil
 }
 
+func (s *Session) previewActions(actions []ai.Action) string {
+	s.pendingActions = append([]ai.Action(nil), actions...)
+	var out strings.Builder
+	out.WriteString("Review required — no changes have been made.\n")
+	for _, action := range actions {
+		fmt.Fprintf(&out, "• %s", action.Type)
+		if action.NoteID != 0 {
+			fmt.Fprintf(&out, " (note %d)", action.NoteID)
+		}
+		if action.Folder != "" {
+			fmt.Fprintf(&out, " → %s", action.Folder)
+		}
+		if action.Section != "" {
+			fmt.Fprintf(&out, " section %q", action.Section)
+		}
+		out.WriteByte('\n')
+	}
+	out.WriteString("Type /confirm to apply this plan, or /cancel to discard it.")
+	return out.String()
+}
+
+func (s *Session) confirmPending(ctx context.Context) (string, error) {
+	if len(s.pendingActions) == 0 {
+		return "There is no pending change to confirm.", nil
+	}
+	actions := s.pendingActions
+	s.pendingActions = nil
+	reply := s.loop.runActions(ctx, actions)
+	s.append("/confirm", reply)
+	return reply, nil
+}
+
+func (s *Session) cancelPending() (string, error) {
+	if len(s.pendingActions) == 0 {
+		return "There is no pending change to cancel.", nil
+	}
+	s.pendingActions = nil
+	reply := "Pending changes discarded."
+	s.append("/cancel", reply)
+	return reply, nil
+}
+
 func (s *Session) command(ctx context.Context, input string) (string, error) {
 	fields := strings.Fields(input)
 	if len(fields) == 0 {
 		return "", nil
 	}
 	switch fields[0] {
+	case "/compact":
+		if s.compactHistory(true) {
+			return "Conversation compacted. Athena retained a short memory plus recent turns.", nil
+		}
+		return "Conversation is already compact.", nil
 	case "/models":
 		available, err := s.loop.ai.ChatModels(ctx)
 		if err != nil {
@@ -153,7 +225,10 @@ func (s *Session) command(ctx context.Context, input string) (string, error) {
 	}
 }
 
-func (s *Session) Clear() { s.history = s.history[:1] }
+func (s *Session) Clear() {
+	s.history = s.history[:1]
+	s.pendingActions = nil
+}
 func (s *Session) append(input, reply string) {
 	s.history = append(s.history, models.Message{Role: "user", Content: input}, models.Message{Role: "assistant", Content: reply})
 }

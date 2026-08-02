@@ -118,6 +118,47 @@ func TestRunFailsWhenWriteCannotBeVerified(t *testing.T) {
 	}
 }
 
+func TestRunRejectsUnsafeSectionReplacementWithoutGuard(t *testing.T) {
+	d := NewDispatcher()
+	called := false
+	d.Register("replace_section", func(_ context.Context, _ ai.Action) (string, error) {
+		called = true
+		return "updated", nil
+	})
+
+	result := d.Run(context.Background(), []ai.Action{{Type: "replace_section", NoteID: 1, Section: "Summary", Content: "New"}})[0]
+	if result.Err == nil || result.Error != "replace_section requires section and expected_content" {
+		t.Fatalf("result = %+v", result)
+	}
+	if called {
+		t.Fatal("section replacement handler ran without its stale-write guard")
+	}
+}
+
+func TestPolicyDeclaresReadRetryAndDestructiveConfirmation(t *testing.T) {
+	read, ok := PolicyFor("folder_exists")
+	if !ok || read.Kind != ToolRead || !read.RetrySafe || !read.ParallelSafe {
+		t.Fatalf("read policy = %+v", read)
+	}
+	destructive, ok := PolicyFor("trash_note")
+	if !ok || destructive.Kind != ToolDestructive || !destructive.RequiresConfirmation || destructive.RetrySafe {
+		t.Fatalf("destructive policy = %+v", destructive)
+	}
+	if !RequiresConfirmation([]ai.Action{{Type: "append_note"}, {Type: "create_note"}}) {
+		t.Fatal("write batch should require confirmation")
+	}
+	if RequiresConfirmation([]ai.Action{{Type: "list_folders"}, {Type: "folder_exists"}}) {
+		t.Fatal("read-only batch should not require confirmation")
+	}
+}
+
+func TestSerialReadyKeepsWritesOutOfParallelBatch(t *testing.T) {
+	ready := serialReady([]int{0, 1}, []ai.Action{{Type: "list_folders"}, {Type: "create_note"}})
+	if len(ready) != 1 || ready[0] != 1 {
+		t.Fatalf("ready = %v, want only write action", ready)
+	}
+}
+
 type recordingAudit struct {
 	entries []models.ActionAudit
 }

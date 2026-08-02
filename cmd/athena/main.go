@@ -121,6 +121,20 @@ func buildDispatcher(notesSvc *notes.Service) *tools.Dispatcher {
 		return fmt.Sprintf("Updated note %d", a.NoteID), nil
 	})
 
+	d.Register("append_note", func(ctx context.Context, a ai.Action) (string, error) {
+		if err := notesSvc.AppendNote(ctx, a.NoteID, a.Content); err != nil {
+			return "", err
+		}
+		return fmt.Sprintf("Appended to note %d", a.NoteID), nil
+	})
+
+	d.Register("replace_section", func(ctx context.Context, a ai.Action) (string, error) {
+		if err := notesSvc.ReplaceSection(ctx, a.NoteID, a.Section, a.ExpectedContent, a.Content); err != nil {
+			return "", err
+		}
+		return fmt.Sprintf("Updated section %q in note %d", a.Section, a.NoteID), nil
+	})
+
 	d.Register("mark_done", func(ctx context.Context, a ai.Action) (string, error) {
 		if a.NoteID == 0 {
 			return "", fmt.Errorf("mark_done requires note_id")
@@ -262,6 +276,7 @@ func buildDispatcher(notesSvc *notes.Service) *tools.Dispatcher {
 func registerWriteVerifiers(d *tools.Dispatcher, notesSvc *notes.Service) {
 	for _, actionType := range []string{
 		"create_note", "create_task", "move_note", "update_note", "mark_done",
+		"append_note", "replace_section",
 		"rename_note", "trash_note", "restore_note", "archive_note", "unarchive_note",
 		"create_folder", "ensure_folders", "delete_folder",
 	} {
@@ -342,6 +357,14 @@ func verifyWrite(_ context.Context, notesSvc *notes.Service, action ai.Action) e
 	case "update_note":
 		if note.Content != action.Content {
 			return fmt.Errorf("verify update_note: saved content differs")
+		}
+	case "append_note":
+		if !strings.HasSuffix(strings.TrimSpace(note.Content), strings.TrimSpace(action.Content)) {
+			return fmt.Errorf("verify append_note: appended content is missing")
+		}
+	case "replace_section":
+		if !strings.Contains(note.Content, strings.TrimSpace(action.Content)) {
+			return fmt.Errorf("verify replace_section: replacement content is missing")
 		}
 	case "mark_done":
 		if note.Done != action.Done {

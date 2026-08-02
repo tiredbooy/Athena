@@ -26,6 +26,21 @@ shown, because a model confirmation does not prove execution succeeded.
 Every turn is bounded to two minutes. The parent UI context can still cancel it
 earlier, for example when the user presses Escape.
 
+Bulk, destructive, and whole-note replacement plans enter a pending state.
+`/confirm` executes that exact plan; `/cancel` drops it. Clearing the session
+also drops a pending plan.
+
+## Recovery and compaction
+
+Transient model transport failures retry once. If Ollama reports that a reply
+stopped due to a length/context limit, Athena compacts the active state and
+continues once with the original goal and partial answer. Both paths inherit
+the UI request context, so `Esc` cancels them immediately.
+
+Older history compacts automatically after a bounded size; `/compact` performs
+the same deterministic compaction on demand. It keeps the system prompt and
+recent turns verbatim, while retaining a short factual memory of older turns.
+
 ## Current shortcuts
 
 Exact single-purpose folder creation/deletion can bypass model JSON. Compound

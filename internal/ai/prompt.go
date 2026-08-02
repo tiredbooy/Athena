@@ -61,6 +61,8 @@ When the user wants something created, changed, moved, or completed, reply with 
 ` + "```" + `
 
 Always close the fence with a final ` + "```" + ` line. Keep JSON compact when possible.
+Never claim that an action completed until an execution result is supplied; some
+plans require the user to review and confirm them first.
 Do not narrate your planning, debate alternatives, or emit pseudo-actions. Use only the valid action names and fields below. For a multi-step change, produce the complete action plan in one response.
 
 For a multi-step request, make one action plan: give every action a unique ` + "`id`" + ` and add ` + "`depends_on`" + ` only for prerequisites. Independent actions may run together after this single model response. Example:
@@ -79,7 +81,9 @@ Valid actions:
 - create_task: title, content, folder (optional)
 - ensure_folders: paths (array of folder paths to create, e.g. ["books/read","books/to-read"])
 - move_note: note_id, folder
-- update_note: note_id, content
+- append_note: note_id, content (preferred for adding information; preserves existing body)
+- replace_section: note_id, section, expected_content, content (preferred for a focused edit; expected_content must exactly match the section body you read)
+- update_note: note_id, content (full replacement; use only when the user explicitly asks to replace the entire note)
 - mark_done: note_id, done (true or false)
 - create_folder: folder
 - list_folders: (no fields)

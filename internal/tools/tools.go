@@ -117,6 +117,7 @@ func (d *Dispatcher) RunBatch(ctx context.Context, actions []ai.Action, maxWorke
 			}
 			continue
 		}
+		ready = serialReady(ready, actions)
 
 		runBatchWorkers(ctx, d, actions, results, state, ready, maxWorkers)
 		remaining -= len(ready)
@@ -140,10 +141,14 @@ func (d *Dispatcher) runAction(ctx context.Context, action ai.Action) ai.ActionR
 	}
 
 	policy := policyFor(action.Type)
+	attempts := 1
+	if policy.RetrySafe {
+		attempts = 2
+	}
 	var message string
 	var err error
-	for attempt := 1; attempt <= policy.attempts; attempt++ {
-		attemptCtx, cancel := context.WithTimeout(ctx, policy.timeout)
+	for attempt := 1; attempt <= attempts; attempt++ {
+		attemptCtx, cancel := context.WithTimeout(ctx, policy.Timeout)
 		message, err = handler(attemptCtx, action)
 		if err == nil {
 			if verifier := d.verifiers[action.Type]; verifier != nil {
@@ -154,7 +159,7 @@ func (d *Dispatcher) runAction(ctx context.Context, action ai.Action) ai.ActionR
 			err = attemptCtx.Err()
 		}
 		cancel()
-		if err == nil || attempt == policy.attempts || ctx.Err() != nil {
+		if err == nil || attempt == attempts || ctx.Err() != nil {
 			break
 		}
 		select {
@@ -164,6 +169,17 @@ func (d *Dispatcher) runAction(ctx context.Context, action ai.Action) ai.ActionR
 		}
 	}
 	return d.finish(ctx, action, message, err)
+}
+
+// serialReady prevents two file/database writes from racing merely because a
+// model declared them independent. Read-only actions can still share a batch.
+func serialReady(ready []int, actions []ai.Action) []int {
+	for _, index := range ready {
+		if !policyFor(actions[index].Type).ParallelSafe {
+			return []int{index}
+		}
+	}
+	return ready
 }
 
 func (d *Dispatcher) finish(ctx context.Context, action ai.Action, message string, err error) ai.ActionResult {

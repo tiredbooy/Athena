@@ -71,8 +71,11 @@ var commands = []commandSpec{
 	{"/clear", "clear the visible conversation"},
 	{"/reset", "clear conversation and model history"},
 	{"/help", "show commands and keyboard shortcuts"},
+	{"/compact", "compact older conversation context"},
 	{"/models", "show available chat models"},
 	{"/model", "switch the chat model"},
+	{"/confirm", "apply the reviewed change plan"},
+	{"/cancel", "discard the reviewed change plan"},
 	{"/theme", "choose midnight, ocean, or system"},
 }
 
@@ -252,7 +255,7 @@ func (m bubbleModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.refreshOutput()
 				return m, nil
 			case "/help":
-				m.lines = append(m.lines, renderAssistantMessage("Commands\n/clear — clear the visible pane\n/reset — clear pane and model history\n/help — show this help\n\nKeys: Enter send · Shift+Enter newline · Esc cancel · Ctrl+C quit"))
+				m.lines = append(m.lines, renderAssistantMessage("Commands\n/clear — clear the visible pane\n/reset — clear pane and model history\n/compact — shrink older conversation context\n/help — show this help\n/confirm — apply a reviewed change plan\n/cancel — discard a reviewed change plan\n\nKeys: Enter send · Shift+Enter newline · Esc cancel · Ctrl+C quit"))
 				m.input.SetValue("")
 				m.refreshOutput()
 				return m, nil

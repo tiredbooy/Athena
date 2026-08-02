@@ -12,6 +12,8 @@ import (
 //   - ensure_folders:   Paths
 //   - move_note:        NoteID, Folder
 //   - update_note:      NoteID, Content
+//   - append_note:      NoteID, Content
+//   - replace_section:  NoteID, Section, Content, ExpectedContent
 //   - mark_done:        NoteID, Done
 //   - create_folder:    Folder
 //   - list_folders:     (none)
@@ -36,8 +38,13 @@ type Action struct {
 	NoteID    int64    `json:"note_id,omitempty"`
 	Title     string   `json:"title,omitempty"`
 	Content   string   `json:"content,omitempty"`
-	Tags      []string `json:"tags,omitempty"`
-	Folder    string   `json:"folder,omitempty"`
+	// Section and ExpectedContent make a targeted edit conditional on the text
+	// the model actually read, preventing stale plans from overwriting a newer
+	// manual edit.
+	Section         string   `json:"section,omitempty"`
+	ExpectedContent string   `json:"expected_content,omitempty"`
+	Tags            []string `json:"tags,omitempty"`
+	Folder          string   `json:"folder,omitempty"`
 	// Path is accepted from weaker models that use a generic path field for a
 	// folder action. normalizeAction maps it into Folder before dispatch.
 	Path      string   `json:"path,omitempty"`
