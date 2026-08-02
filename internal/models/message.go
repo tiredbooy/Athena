@@ -3,11 +3,12 @@ package models
 import "encoding/json"
 
 type Message struct {
-	Role      string     `json:"role"`
-	Content   string     `json:"content"`
-	Thinking  string     `json:"thinking,omitempty"`
-	ToolCalls []ToolCall `json:"tool_calls,omitempty"`
-	ToolName  string     `json:"tool_name,omitempty"`
+	Role       string     `json:"role"`
+	Content    string     `json:"content"`
+	Thinking   string     `json:"thinking,omitempty"`
+	ToolCalls  []ToolCall `json:"tool_calls,omitempty"`
+	ToolName   string     `json:"tool_name,omitempty"`
+	ToolCallID string     `json:"tool_call_id,omitempty"`
 }
 
 type ToolDefinition struct {
@@ -22,6 +23,7 @@ type ToolFunction struct {
 }
 
 type ToolCall struct {
+	ID       string           `json:"id,omitempty"`
 	Type     string           `json:"type"`
 	Function ToolCallFunction `json:"function"`
 }

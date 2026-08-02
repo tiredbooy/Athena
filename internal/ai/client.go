@@ -40,6 +40,8 @@ func (c *Client) ChatModel() string {
 	return c.chatModel
 }
 
+func (c *Client) Name() string { return "Ollama" }
+
 func (c *Client) SetChatModel(name string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()

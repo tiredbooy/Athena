@@ -68,12 +68,21 @@ func (s *Session) Submit(ctx context.Context, input string, status func(string),
 	}
 	result, err := s.loop.retrieval.BuildContextWithProgress(ctx, input, 4, status)
 	if err != nil {
-		return "", fmt.Errorf("retrieve context: %w", err)
+		if s.loop.ai.Name() == "Ollama" {
+			return "", fmt.Errorf("retrieve context: %w", err)
+		}
+		// Remote chat remains useful when the optional local embedding service
+		// is offline. The user sees the status instead of a misleading answer
+		// that claims their vault was searched.
+		if status != nil {
+			status("Vault search is unavailable — answering without vault context")
+		}
+		result = nil
 	}
 	s.history = append(s.history, models.Message{Role: "user", Content: input})
 	s.compactHistory(false)
 	messages := append([]models.Message(nil), s.history...)
-	if result.Context != "" {
+	if result != nil && result.Context != "" {
 		messages[len(messages)-1].Content = input + "\n\n" + result.Context
 	}
 	raw, err := s.runReadToolLoop(ctx, messages, status)
@@ -177,7 +186,7 @@ func (s *Session) command(ctx context.Context, input string) (string, error) {
 		}
 		return "Conversation is already compact.", nil
 	case "/models":
-		available, err := s.loop.ai.ChatModels(ctx)
+		available, err := s.Models(ctx)
 		if err != nil {
 			return "", fmt.Errorf("list models: %w", err)
 		}
@@ -188,17 +197,17 @@ func (s *Session) command(ctx context.Context, input string) (string, error) {
 		out.WriteString("Available chat models:")
 		for i, model := range available {
 			marker := " "
-			if model.Name == s.loop.ai.ChatModel() {
+			if model.Current {
 				marker = "*"
 			}
-			fmt.Fprintf(&out, "\n%s %d. %s", marker, i+1, model.Name)
+			fmt.Fprintf(&out, "\n%s %d. %s", marker, i+1, model.Model)
 		}
 		return out.String(), nil
 	case "/model":
 		if len(fields) != 2 {
 			return "Usage: /model <number-or-name>", nil
 		}
-		available, err := s.loop.ai.ChatModels(ctx)
+		available, err := s.Models(ctx)
 		if err != nil {
 			return "", fmt.Errorf("list models: %w", err)
 		}
@@ -207,16 +216,11 @@ func (s *Session) command(ctx context.Context, input string) (string, error) {
 			if index < 1 || index > len(available) {
 				return "Model number is out of range. Run /models first.", nil
 			}
-			selected = available[index-1].Name
+			selected = available[index-1].Model
 		}
 		for _, model := range available {
-			if model.Name == selected {
-				s.loop.ai.SetChatModel(selected)
-				s.loop.config.ChatModel = selected
-				if err := s.loop.config.Save(); err != nil {
-					return "", fmt.Errorf("save selected model: %w", err)
-				}
-				return fmt.Sprintf("Using chat model %s", selected), nil
+			if model.Model == selected {
+				return s.SelectModel(ctx, model)
 			}
 		}
 		return fmt.Sprintf("Model %q is not available. Run /models first.", selected), nil

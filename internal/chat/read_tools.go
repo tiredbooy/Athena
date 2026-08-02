@@ -15,8 +15,8 @@ import (
 const (
 	maxReadToolRounds = 4
 	maxAutoContinues  = 1
-	maxReadToolCalls  = 4
-	maxReadToolLimit  = 8
+	readToolBatchSize = 4
+	maxReadToolLimit  = 24
 	maxToolContent    = 6_000
 	readToolTimeout   = 10 * time.Second
 )
@@ -81,17 +81,23 @@ func (s *Session) runReadToolLoop(ctx context.Context, messages []models.Message
 			partialResponses = append(partialResponses, response.Message.Content)
 			return strings.TrimSpace(strings.Join(partialResponses, "\n\n")), nil
 		}
-		if len(response.Message.ToolCalls) > maxReadToolCalls {
-			return "", fmt.Errorf("model requested %d read tools at once; limit is %d", len(response.Message.ToolCalls), maxReadToolCalls)
+		if len(response.Message.ToolCalls) > maxReadToolLimit {
+			return "", fmt.Errorf("model requested %d read tools at once; safety limit is %d", len(response.Message.ToolCalls), maxReadToolLimit)
 		}
 
 		messages = append(messages, response.Message)
-		if status != nil {
-			status(fmt.Sprintf("Reading vault with %d tool request(s)", len(response.Message.ToolCalls)))
-		}
-		for _, call := range response.Message.ToolCalls {
-			content := s.executeReadTool(ctx, call)
-			messages = append(messages, models.Message{Role: "tool", ToolName: call.Function.Name, Content: content})
+		calls := response.Message.ToolCalls
+		for start := 0; start < len(calls); start += readToolBatchSize {
+			end := min(start+readToolBatchSize, len(calls))
+			if status != nil {
+				status(fmt.Sprintf("Reading vault tools %d-%d of %d", start+1, end, len(calls)))
+			}
+			// The queue is application-owned: every accepted call is completed
+			// before Athena asks the model to plan another turn.
+			for _, call := range calls[start:end] {
+				content := s.executeReadTool(ctx, call)
+				messages = append(messages, models.Message{Role: "tool", ToolName: call.Function.Name, ToolCallID: call.ID, Content: content})
+			}
 		}
 	}
 	return "", fmt.Errorf("model exceeded the %d-round read-tool limit", maxReadToolRounds)

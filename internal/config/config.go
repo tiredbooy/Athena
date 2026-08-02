@@ -14,6 +14,21 @@ type Config struct {
 	OllamaHost string `yaml:"ollama_host"`
 	ChatModel  string `yaml:"chat_model"`
 	EmbedModel string `yaml:"embed_model"`
+	// Providers contains chat-only connections. Embeddings intentionally remain
+	// on the local Ollama configuration above until a separate embedding
+	// migration is implemented.
+	Providers      []ProviderConfig `yaml:"providers,omitempty"`
+	ActiveProvider string           `yaml:"active_provider,omitempty"`
+}
+
+// ProviderConfig is safe to keep in the regular config file: it contains an
+// environment-variable name, never the credential itself.
+type ProviderConfig struct {
+	Name      string `yaml:"name"`
+	Type      string `yaml:"type"` // "openai" or "openai_compatible"
+	BaseURL   string `yaml:"base_url"`
+	APIKeyEnv string `yaml:"api_key_env,omitempty"`
+	ChatModel string `yaml:"chat_model"`
 }
 
 func configFilePath() (string, error) {
@@ -77,7 +92,7 @@ func save(path string, cfg *Config) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(path, out, 0o644)
+	return os.WriteFile(path, out, 0o600)
 }
 
 // Save writes the config back to the standard config path (e.g. after

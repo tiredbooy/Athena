@@ -41,8 +41,10 @@ func main() {
 	chunkStore := storage.NewChunkStore(db)
 
 	client := ai.NewClient(cfg.OllamaHost, cfg.ChatModel, cfg.EmbedModel)
-	if err := client.EnsureRunning(ctx); err != nil {
-		fatal("start ollama", err)
+	if cfg.ActiveProvider == "" || cfg.ActiveProvider == "ollama" {
+		if err := client.EnsureRunning(ctx); err != nil {
+			fatal("start ollama", err)
+		}
 	}
 
 	retrievalSvc := retrieval.NewService(cfg.VaultPath, noteStore, chunkStore, client)
@@ -57,11 +59,58 @@ func main() {
 	fmt.Println("second-brain ready.")
 	fmt.Printf("  vault: %s\n  db:    %s\n  model: %s\n\n", cfg.VaultPath, cfg.DBPath, cfg.ChatModel)
 
-	loop := chat.NewLoop(client, retrievalSvc, dispatcher, cfg)
+	oauth, err := ai.LoadCodexOAuth()
+	if err != nil {
+		fatal("load OpenAI subscription credentials", err)
+	}
+	providers := map[string]ai.ChatProvider{"ollama": client}
+	for _, provider := range cfg.Providers {
+		if provider.Type == "openai_codex" {
+			providers[providerID(provider.Name)] = ai.NewCodexProvider(oauth, provider.ChatModel)
+		} else if provider.Type == "anthropic" {
+			providers[providerID(provider.Name)] = ai.NewAnthropicProvider(provider.Name, provider.BaseURL, provider.APIKeyEnv, provider.ChatModel)
+		} else {
+			providers[providerID(provider.Name)] = ai.NewOpenAICompatibleProvider(provider.Name, provider.BaseURL, provider.APIKeyEnv, provider.ChatModel)
+		}
+	}
+	activeProvider := providers[cfg.ActiveProvider]
+	if activeProvider == nil {
+		activeProvider = client
+	}
+	loop := chat.NewLoop(activeProvider, providers, oauth, retrievalSvc, dispatcher, cfg)
 	session := chat.NewSession(loop)
-	if err := tui.RunBubble(session.Submit, session.Clear); err != nil {
+	if err := tui.RunBubble(session.Submit, session.Clear,
+		func(ctx context.Context) ([]tui.ModelOption, error) {
+			options, err := session.Models(ctx)
+			out := make([]tui.ModelOption, len(options))
+			for i, option := range options {
+				out[i] = tui.ModelOption{ProviderID: option.ProviderID, ProviderName: option.ProviderName, Model: option.Model, Current: option.Current}
+			}
+			return out, err
+		},
+		func(ctx context.Context, option tui.ModelOption) (string, error) {
+			return session.SelectModel(ctx, chat.ModelOption{ProviderID: option.ProviderID, ProviderName: option.ProviderName, Model: option.Model, Current: option.Current})
+		},
+		func(input tui.ConnectionInput) (string, error) {
+			return session.Connect(chat.ConnectionInput{Name: input.Name, Type: input.Type, BaseURL: input.BaseURL, APIKeyEnv: input.APIKeyEnv, ChatModel: input.ChatModel})
+		},
+		session.StartOpenAISubscription,
+	); err != nil {
 		fatal("run terminal UI", err)
 	}
+}
+
+func providerID(name string) string {
+	name = strings.ToLower(strings.TrimSpace(name))
+	var out strings.Builder
+	for _, r := range name {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') {
+			out.WriteRune(r)
+		} else {
+			out.WriteByte('-')
+		}
+	}
+	return strings.Trim(out.String(), "-")
 }
 
 // buildDispatcher registers every action type the model is allowed to

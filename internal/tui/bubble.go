@@ -13,6 +13,15 @@ import (
 
 type SubmitFunc func(context.Context, string, func(string), func(string)) (string, error)
 type ResetFunc func()
+type ModelOption struct {
+	ProviderID, ProviderName, Model string
+	Current                         bool
+}
+type ModelsFunc func(context.Context) ([]ModelOption, error)
+type SelectModelFunc func(context.Context, ModelOption) (string, error)
+type ConnectionInput struct{ Name, Type, BaseURL, APIKeyEnv, ChatModel string }
+type ConnectFunc func(ConnectionInput) (string, error)
+type SubscriptionFunc func(context.Context) (string, error)
 type answerMsg struct {
 	text string
 	err  error
@@ -22,10 +31,26 @@ type workerMsg struct {
 	err          error
 	done         bool
 }
+type modelPickerMsg struct {
+	options []ModelOption
+	err     error
+}
+type modelSelectedMsg struct {
+	text string
+	err  error
+}
+type providerConnectedMsg struct {
+	text string
+	err  error
+}
 
 type bubbleModel struct {
 	submit        SubmitFunc
 	reset         ResetFunc
+	models        ModelsFunc
+	selectModel   SelectModelFunc
+	connect       ConnectFunc
+	subscription  SubscriptionFunc
 	input         textarea.Model
 	output        viewport.Model
 	lines         []string
@@ -41,6 +66,14 @@ type bubbleModel struct {
 	commandMenu   bool
 	streaming     bool
 	streamText    string
+	picker        bool
+	pickerLoading bool
+	pickerOptions []ModelOption
+	pickerIndex   int
+	connecting    bool
+	connectType   string
+	connectStep   int
+	connectValues []string
 }
 
 type commandSpec struct {
@@ -73,7 +106,7 @@ var commands = []commandSpec{
 	{"/help", "show commands and keyboard shortcuts"},
 	{"/compact", "compact older conversation context"},
 	{"/models", "show available chat models"},
-	{"/model", "switch the chat model"},
+	{"/connect", "connect or add a chat provider"},
 	{"/confirm", "apply the reviewed change plan"},
 	{"/cancel", "discard the reviewed change plan"},
 	{"/theme", "choose midnight, ocean, or system"},
@@ -143,7 +176,7 @@ func applyInputTheme(input *textarea.Model) {
 	input.SetStyles(styles)
 }
 
-func RunBubble(submit SubmitFunc, reset ResetFunc) error {
+func RunBubble(submit SubmitFunc, reset ResetFunc, models ModelsFunc, selectModel SelectModelFunc, connect ConnectFunc, subscription SubscriptionFunc) error {
 	input := textarea.New()
 	input.Placeholder = "Ask Athena…"
 	input.ShowLineNumbers = false
@@ -156,7 +189,7 @@ func RunBubble(submit SubmitFunc, reset ResetFunc) error {
 	spin.Style = accent
 	output := viewport.New()
 	output.MouseWheelEnabled = true
-	model := bubbleModel{submit: submit, reset: reset, input: input, output: output, status: "Ready", spinner: spin}
+	model := bubbleModel{submit: submit, reset: reset, models: models, selectModel: selectModel, connect: connect, subscription: subscription, input: input, output: output, status: "Ready", spinner: spin}
 	_, err := tea.NewProgram(model, tea.WithContext(context.Background())).Run()
 	return err
 }
@@ -180,6 +213,8 @@ func (m bubbleModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.busy && m.cancel != nil {
 				m.cancel()
 				m.status = "Cancelling…"
+			} else if m.picker || m.connecting {
+				m.closeOverlay()
 			} else if m.commandMenu {
 				m.commandMenu = false
 				m.status = "Command menu dismissed"
@@ -210,11 +245,29 @@ func (m bubbleModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, cmd
 			}
 		case "up":
+			if m.picker && len(m.pickerOptions) > 0 {
+				count := len(m.filteredModels()) + 1
+				m.pickerIndex = (m.pickerIndex - 1 + count) % count
+				return m, nil
+			}
+			if m.connecting && m.connectStep == 0 {
+				m.pickerIndex = (m.pickerIndex + 1) % len(connectChoices())
+				return m, nil
+			}
 			if matches := m.commandMatches(); len(matches) > 0 {
 				m.commandIndex = (m.commandIndex - 1 + len(matches)) % len(matches)
 				return m, nil
 			}
 		case "down":
+			if m.picker && len(m.pickerOptions) > 0 {
+				count := len(m.filteredModels()) + 1
+				m.pickerIndex = (m.pickerIndex + 1) % count
+				return m, nil
+			}
+			if m.connecting && m.connectStep == 0 {
+				m.pickerIndex = (m.pickerIndex + 1) % len(connectChoices())
+				return m, nil
+			}
 			if matches := m.commandMatches(); len(matches) > 0 {
 				m.commandIndex = (m.commandIndex + 1) % len(matches)
 				return m, nil
@@ -226,6 +279,49 @@ func (m bubbleModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 		case "enter":
+			if m.picker {
+				if m.pickerLoading {
+					return m, nil
+				}
+				matches := m.filteredModels()
+				if m.pickerIndex > len(matches) {
+					m.pickerIndex = len(matches)
+				}
+				if m.pickerIndex == len(matches) {
+					return m.beginConnect(), nil
+				}
+				selected := matches[m.pickerIndex]
+				m.status = "Selecting " + selected.Model
+				return m, selectModelCmd(m.selectModel, selected)
+			}
+			if m.connecting {
+				if m.connectStep == 0 {
+					preset := connectChoices()[m.pickerIndex]
+					if preset.kind == "openai_subscription" {
+						m.status = "Preparing ChatGPT sign-in…"
+						return m, subscriptionCmd(m.subscription)
+					}
+					m.connectType, m.connectValues = preset.kind, append([]string(nil), preset.values...)
+					m.connectStep = 1
+					m.input.SetValue("")
+					m.setConnectPrompt()
+					return m, nil
+				}
+				if m.connectStep <= 4 {
+					value := strings.TrimSpace(m.input.Value())
+					if value != "" {
+						m.connectValues[m.connectStep-1] = value
+					}
+					m.connectStep++
+					m.input.SetValue("")
+					if m.connectStep <= 4 {
+						m.setConnectPrompt()
+						return m, nil
+					}
+					m.status = "Saving provider…"
+					return m, connectCmd(m.connect, ConnectionInput{Name: m.connectValues[0], Type: m.connectType, BaseURL: m.connectValues[1], APIKeyEnv: m.connectValues[2], ChatModel: m.connectValues[3]})
+				}
+			}
 			if m.busy || strings.TrimSpace(m.input.Value()) == "" {
 				return m, nil
 			}
@@ -241,6 +337,10 @@ func (m bubbleModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 			}
 			switch input {
+			case "/models":
+				return m.openModels()
+			case "/connect":
+				return m.beginConnect(), nil
 			case "/clear":
 				m.lines = nil
 				m.status = "Conversation pane cleared"
@@ -320,6 +420,44 @@ func (m bubbleModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.streamText = ""
 		m.refreshOutput()
 		return m, nil
+	case modelPickerMsg:
+		m.pickerLoading = false
+		if msg.err != nil {
+			m.closeOverlay()
+			m.lines = append(m.lines, renderErrorMessage(msg.err.Error()))
+			m.refreshOutput()
+			return m, nil
+		}
+		m.pickerOptions, m.pickerIndex, m.status = msg.options, 0, "Choose a model"
+		return m, nil
+	case modelSelectedMsg:
+		m.closeOverlay()
+		if msg.err != nil {
+			m.lines = append(m.lines, renderErrorMessage(msg.err.Error()))
+		} else {
+			m.status = msg.text
+		}
+		m.refreshOutput()
+		return m, nil
+	case providerConnectedMsg:
+		m.closeOverlay()
+		if msg.err != nil {
+			m.lines = append(m.lines, renderErrorMessage(msg.err.Error()))
+		} else {
+			m.status = msg.text
+		}
+		m.refreshOutput()
+		return m, nil
+	case subscriptionMsg:
+		m.closeOverlay()
+		if msg.err != nil {
+			m.lines = append(m.lines, renderErrorMessage(msg.err.Error()))
+		} else {
+			m.lines = append(m.lines, renderAssistantMessage("Open this URL in any browser, sign in, then approve Athena:\n\n"+msg.url+"\n\nAthena will switch to your ChatGPT subscription after approval."))
+			m.status = "Waiting for browser approval"
+		}
+		m.refreshOutput()
+		return m, nil
 	case spinner.TickMsg:
 		var cmd tea.Cmd
 		m.spinner, cmd = m.spinner.Update(msg)
@@ -380,6 +518,64 @@ func waitForWorker(events <-chan workerMsg) tea.Cmd {
 	}
 }
 
+func (m bubbleModel) openModels() (bubbleModel, tea.Cmd) {
+	m.picker, m.pickerLoading, m.pickerIndex = true, true, 0
+	m.commandMenu = false
+	m.input.SetValue("")
+	m.input.Placeholder = "Filter by provider or model…"
+	m.status = "Loading models…"
+	return m, func() tea.Msg {
+		options, err := m.models(context.Background())
+		return modelPickerMsg{options: options, err: err}
+	}
+}
+
+func (m bubbleModel) beginConnect() bubbleModel {
+	m.picker, m.pickerLoading, m.connecting, m.connectStep, m.pickerIndex = false, false, true, 0, 0
+	m.commandMenu = false
+	m.input.SetValue("")
+	m.status = "Choose provider type"
+	return m
+}
+
+func (m *bubbleModel) closeOverlay() {
+	m.picker, m.pickerLoading, m.connecting, m.connectStep, m.pickerIndex = false, false, false, 0, 0
+	m.input.SetValue("")
+	m.input.Placeholder = "Ask Athena…"
+	if !m.busy {
+		m.status = "Ready"
+	}
+}
+
+func (m *bubbleModel) setConnectPrompt() {
+	labels := []string{"Provider name", "Base URL (include /v1)", "API-key environment variable", "Default chat model"}
+	m.input.Placeholder = labels[m.connectStep-1]
+	m.status = "Connect provider — " + labels[m.connectStep-1]
+}
+
+func selectModelCmd(selectModel SelectModelFunc, option ModelOption) tea.Cmd {
+	return func() tea.Msg {
+		text, err := selectModel(context.Background(), option)
+		return modelSelectedMsg{text: text, err: err}
+	}
+}
+
+func connectCmd(connect ConnectFunc, input ConnectionInput) tea.Cmd {
+	return func() tea.Msg { text, err := connect(input); return providerConnectedMsg{text: text, err: err} }
+}
+
+type subscriptionMsg struct {
+	url string
+	err error
+}
+
+func subscriptionCmd(subscription SubscriptionFunc) tea.Cmd {
+	return func() tea.Msg {
+		url, err := subscription(context.Background())
+		return subscriptionMsg{url: url, err: err}
+	}
+}
+
 func (m *bubbleModel) refreshOutput() {
 	m.output.SetContent(strings.Join(m.lines, "\n\n"))
 	m.output.GotoBottom()
@@ -430,10 +626,13 @@ func (m bubbleModel) View() tea.View {
 	width := m.composerWidth()
 	var suggestions string
 	if matches := m.commandMatches(); m.commandMenu && len(matches) > 0 {
-		selected := matches[m.commandIndex%len(matches)]
-		suggestions = panel.Width(width).Render(accent.Render("› "+selected.name)+muted.Render("  "+selected.description)+muted.Render("   ↑↓ choose · Tab complete · Esc dismiss")) + "\n"
+		suggestions = m.commandPaletteView(width, matches) + "\n"
 	}
 	composer := m.composerView()
+	if m.picker || m.connecting {
+		composer = m.overlayView(width)
+		suggestions = ""
+	}
 	content := header + "\n" + muted.Render(strings.Repeat("─", width)) + "\n\n" + body + "\n\n" + suggestions + composer + "\n" + status + "\n" + muted.Render("Enter send · Shift+Enter newline · ↑↓ select command · Tab complete · Esc cancel")
 	v := tea.NewView(content)
 	v.AltScreen = true
@@ -443,4 +642,104 @@ func (m bubbleModel) View() tea.View {
 	// available through Home/PgUp/PgDn and their Ctrl alternatives.
 	v.MouseMode = tea.MouseModeNone
 	return v
+}
+
+func (m bubbleModel) commandPaletteView(width int, matches []commandSpec) string {
+	limit := min(6, len(matches))
+	start := 0
+	selected := m.commandIndex % len(matches)
+	if selected >= limit {
+		start = selected - limit + 1
+	}
+	var lines []string
+	for i := start; i < start+limit && i < len(matches); i++ {
+		item := matches[i]
+		prefix := "  "
+		if i == selected {
+			prefix = accent.Render("› ")
+		}
+		lines = append(lines, prefix+accent.Render(item.name)+muted.Render("  "+item.description))
+	}
+	footer := muted.Render("↑↓ move · Tab complete · Enter choose · Esc close")
+	return panel.Width(width).Render(accent.Render("Commands") + muted.Render("  type to filter") + "\n" + strings.Join(lines, "\n") + "\n" + footer)
+}
+
+func (m bubbleModel) overlayView(width int) string {
+	if m.picker {
+		if m.pickerLoading {
+			return panel.Width(width).Render(accent.Render("Models") + "\n" + muted.Render("Loading available models…"))
+		}
+		matches := m.filteredModels()
+		selectedIndex := min(m.pickerIndex, len(matches))
+		var lines []string
+		for i, option := range matches {
+			prefix := "  "
+			if i == selectedIndex {
+				prefix = accent.Render("› ")
+			}
+			badge := muted.Render("  " + option.ProviderName)
+			if option.Current {
+				badge += accent.Render("  ACTIVE")
+			}
+			lines = append(lines, prefix+assistantMessage.Render(option.Model)+badge)
+		}
+		if len(matches) == 0 {
+			lines = append(lines, muted.Render("  No matching models"))
+		}
+		marker := "  "
+		if selectedIndex == len(matches) {
+			marker = accent.Render("› ")
+		}
+		lines = append(lines, marker+accent.Render("+ Connect a provider"))
+		lines = append(lines, muted.Render("↑↓ move · Enter select · type to filter · Esc close"))
+		return panel.Width(width).Render(accent.Render("Models") + muted.Render("  /models") + "\n" + m.input.View() + "\n" + muted.Render(strings.Repeat("─", max(12, width-4))) + "\n" + strings.Join(lines, "\n"))
+	}
+	if m.connectStep == 0 {
+		choices := connectChoices()
+		var lines []string
+		for i, choice := range choices {
+			marker := "  "
+			if i == m.pickerIndex {
+				marker = accent.Render("› ")
+			}
+			lines = append(lines, marker+choice.label+muted.Render("  "+choice.detail))
+		}
+		lines = append(lines, muted.Render("↑↓ move · Enter select · Esc close"))
+		return panel.Width(width).Render(accent.Render("Connect a provider") + "\n" + strings.Join(lines, "\n"))
+	}
+	labels := []string{"Provider name", "Base URL", "API-key environment variable", "Default chat model"}
+	defaultValue := m.connectValues[m.connectStep-1]
+	return panel.Width(width).Render(accent.Render("Connect a provider") + muted.Render("  "+labels[m.connectStep-1]) + "\n" + m.input.View() + "\n" + muted.Render("Enter to continue · leave blank to use: "+defaultValue+" · Esc close"))
+	return ""
+}
+
+type connectChoice struct {
+	label, detail, kind string
+	values              []string
+}
+
+func connectChoices() []connectChoice {
+	return []connectChoice{
+		{label: "ChatGPT Plus/Pro", detail: "browser sign-in", kind: "openai_subscription"},
+		{label: "OpenAI", detail: "API key", kind: "openai", values: []string{"OpenAI", "https://api.openai.com/v1", "OPENAI_API_KEY", "gpt-5.2"}},
+		{label: "Anthropic", detail: "API key", kind: "anthropic", values: []string{"Anthropic", "https://api.anthropic.com/v1", "ANTHROPIC_API_KEY", "claude-sonnet-4-5"}},
+		{label: "xAI / Grok", detail: "API key", kind: "openai_compatible", values: []string{"xAI", "https://api.x.ai/v1", "XAI_API_KEY", "grok-4"}},
+		{label: "OpenRouter", detail: "API key", kind: "openai_compatible", values: []string{"OpenRouter", "https://openrouter.ai/api/v1", "OPENROUTER_API_KEY", "openai/gpt-5.2"}},
+		{label: "Ollama server", detail: "local", kind: "openai_compatible", values: []string{"Ollama server", "http://localhost:11434/v1", "", ""}},
+		{label: "Custom local server", detail: "OpenAI-compatible", kind: "openai_compatible", values: []string{"", "http://localhost:1234/v1", "", ""}},
+	}
+}
+
+func (m bubbleModel) filteredModels() []ModelOption {
+	query := strings.ToLower(strings.TrimSpace(m.input.Value()))
+	if query == "" {
+		return m.pickerOptions
+	}
+	filtered := make([]ModelOption, 0, len(m.pickerOptions))
+	for _, option := range m.pickerOptions {
+		if strings.Contains(strings.ToLower(option.Model), query) || strings.Contains(strings.ToLower(option.ProviderName), query) {
+			filtered = append(filtered, option)
+		}
+	}
+	return filtered
 }

@@ -19,14 +19,16 @@ import (
 )
 
 type Loop struct {
-	ai         *ai.Client
+	ai         ai.ChatProvider
+	providers  map[string]ai.ChatProvider
+	oauth      *ai.CodexOAuth
 	retrieval  *retrieval.Service
 	dispatcher *tools.Dispatcher
 	config     *config.Config
 }
 
-func NewLoop(aiClient *ai.Client, retrievalSvc *retrieval.Service, dispatcher *tools.Dispatcher, cfg *config.Config) *Loop {
-	return &Loop{ai: aiClient, retrieval: retrievalSvc, dispatcher: dispatcher, config: cfg}
+func NewLoop(chatProvider ai.ChatProvider, providers map[string]ai.ChatProvider, oauth *ai.CodexOAuth, retrievalSvc *retrieval.Service, dispatcher *tools.Dispatcher, cfg *config.Config) *Loop {
+	return &Loop{ai: chatProvider, providers: providers, oauth: oauth, retrieval: retrievalSvc, dispatcher: dispatcher, config: cfg}
 }
 
 func (l *Loop) Run() {
