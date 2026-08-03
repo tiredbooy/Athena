@@ -235,12 +235,20 @@ func (c *Client) ChatWithToolsResult(ctx context.Context, messages []models.Mess
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := c.http.Do(req)
 	if err != nil {
-		return ToolChatResult{}, fmt.Errorf("call ollama tools (model %q pulled?): %w", model, err)
+		operation := "chat"
+		if len(tools) > 0 {
+			operation = "tool chat"
+		}
+		return ToolChatResult{}, fmt.Errorf("call ollama %s (model %q pulled?): %w", operation, model, err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		b, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
-		return ToolChatResult{}, fmt.Errorf("ollama tool chat returned status %d: %s", resp.StatusCode, strings.TrimSpace(string(b)))
+		operation := "chat"
+		if len(tools) > 0 {
+			operation = "tool chat"
+		}
+		return ToolChatResult{}, fmt.Errorf("ollama %s returned status %d: %s", operation, resp.StatusCode, strings.TrimSpace(string(b)))
 	}
 	var out chatResponse
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {

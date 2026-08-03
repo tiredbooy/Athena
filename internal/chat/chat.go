@@ -289,8 +289,13 @@ func isListingRequest(input string) bool {
 }
 
 var (
-	createFolderRequest = regexp.MustCompile(`(?i)^\s*(?:please\s+)?(?:create|make|add)\s+(?:a\s+|the\s+)?folder(?:\s+(?:called|named))?\s+(.+?)\s*[.!?]?\s*$`)
+	createFolderRequest = regexp.MustCompile(`(?i)^\s*(?:i\s+want\s+you\s+to\s+)?(?:please\s+)?(?:create|make|add)\s+(?:me\s+)?(?:a\s+|the\s+)?folder(?:\s+(?:for|called|named))?\s+(.+?)\s*[.!?]?\s*$`)
 	deleteFolderRequest = regexp.MustCompile(`(?i)^\s*(?:please\s+)?(?:delete|remove)\s+(?:the\s+)?folder(?:\s+(?:called|named))?\s+(.+?)\s*[.!?]?\s*$`)
+	firstFolderClause   = regexp.MustCompile(`(?i)^\s*(?:i\s+want\s+you\s+to\s+)?(?:please\s+)?(?:create|make|add)\s+(?:me\s+)?(?:a\s+|the\s+)?folder\s+(?:(?:for|called|named)\s+)?(.+?)\s*$`)
+	nestedFolderClause  = regexp.MustCompile(`(?i)^\s*(?:a\s+|another\s+|the\s+)?folder\s+(?:inside\s+it|in\s+([^\s]+))\s+(?:(?:called|named)\s+)?(.+?)\s*$`)
+	siblingFolderClause = regexp.MustCompile(`(?i)^\s*(?:a\s+|another\s+|the\s+)?folder\s+(?:(?:for|called|named)\s+)?(.+?)\s*$`)
+	nestedDeleteRequest = regexp.MustCompile(`(?i)^\s*(?:please\s+)?(?:delete|remove)\s+(?:the\s+)?["'` + "`" + `]?(.+?)["'` + "`" + `]?\s+folder\s+(?:in|from)\s+["'` + "`" + `]?(.+?)["'` + "`" + `]?\s*[.!?]?\s*$`)
+	nestedRenameRequest = regexp.MustCompile(`(?i)^\s*(?:please\s+)?rename\s+(?:the\s+)?["'` + "`" + `]?(.+?)["'` + "`" + `]?\s+folder\s+(?:in|from)\s+["'` + "`" + `]?(.+?)["'` + "`" + `]?\s+to\s+["'` + "`" + `]?(.+?)["'` + "`" + `]?\s*[.!?]?\s*$`)
 )
 
 // folderActions handles only complete, explicit folder requests. This keeps
@@ -298,6 +303,21 @@ var (
 // forgets to emit its action JSON; broader organizational requests still go
 // through the model, where their intent can be interpreted with vault context.
 func folderActions(input string) ([]ai.Action, bool) {
+	if match := nestedDeleteRequest.FindStringSubmatch(input); len(match) == 3 {
+		parent, name := cleanRequestedFolder(match[2]), cleanRequestedFolder(match[1])
+		if parent != "" && name != "" && !strings.Contains(name, "/") {
+			return []ai.Action{{Type: "delete_folder", Folder: parent + "/" + name}}, true
+		}
+	}
+	if match := nestedRenameRequest.FindStringSubmatch(input); len(match) == 4 {
+		parent, name, newName := cleanRequestedFolder(match[2]), cleanRequestedFolder(match[1]), cleanRequestedFolder(match[3])
+		if parent != "" && name != "" && newName != "" && !strings.Contains(name, "/") && !strings.Contains(newName, "/") {
+			return []ai.Action{{Type: "rename_folder", Folder: parent + "/" + name, NewFolder: newName}}, true
+		}
+	}
+	if actions, ok := compoundFolderActions(input); ok {
+		return actions, true
+	}
 	for _, request := range []struct {
 		re     *regexp.Regexp
 		action string
@@ -316,6 +336,60 @@ func folderActions(input string) ([]ai.Action, bool) {
 		return []ai.Action{{Type: request.action, Folder: folder}}, true
 	}
 	return nil, false
+}
+
+// compoundFolderActions handles explicit folder-only requests without asking
+// the model to infer paths from the current vault tree. The tree describes
+// existing folders; it does not constrain where a user may create a new one.
+func compoundFolderActions(input string) ([]ai.Action, bool) {
+	clauses := strings.Split(strings.Trim(strings.TrimSpace(input), ".!?"), " and ")
+	if len(clauses) < 2 {
+		return nil, false
+	}
+
+	match := firstFolderClause.FindStringSubmatch(clauses[0])
+	if len(match) != 2 {
+		return nil, false
+	}
+	root := cleanRequestedFolder(match[1])
+	if root == "" {
+		return nil, false
+	}
+
+	paths := []string{root}
+	currentParent := root
+	for _, clause := range clauses[1:] {
+		match = nestedFolderClause.FindStringSubmatch(clause)
+		if len(match) == 3 {
+			parent := currentParent
+			if match[1] != "" {
+				parent = cleanRequestedFolder(match[1])
+			}
+			name := cleanRequestedFolder(match[2])
+			if parent == "" || name == "" || strings.Contains(name, "/") {
+				return nil, false
+			}
+			currentParent = parent + "/" + name
+			paths = append(paths, currentParent)
+			continue
+		}
+		match = siblingFolderClause.FindStringSubmatch(clause)
+		if len(match) != 2 {
+			return nil, false
+		}
+		folder := cleanRequestedFolder(match[1])
+		if folder == "" {
+			return nil, false
+		}
+		paths = append(paths, folder)
+		currentParent = folder
+	}
+
+	return []ai.Action{{Type: "ensure_folders", Paths: paths}}, true
+}
+
+func cleanRequestedFolder(folder string) string {
+	return strings.Trim(strings.TrimSpace(folder), "`\"'")
 }
 
 // hasAdditionalFolderWork keeps this fast path from taking a compound request

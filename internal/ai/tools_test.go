@@ -107,6 +107,14 @@ func TestExtractActions_NormalizesWeakModelFolderAction(t *testing.T) {
 	}
 }
 
+func TestExtractActions_LinkFolders(t *testing.T) {
+	raw := "```action\n" + `{"type":"link_folders","folders":["work","hospital"]}` + "\n```"
+	_, found := ExtractActions(raw)
+	if len(found) != 1 || found[0].Type != "link_folders" || len(found[0].Folders) != 2 {
+		t.Fatalf("actions = %+v, want link_folders with two folders", found)
+	}
+}
+
 func TestExtractActions_NoFence(t *testing.T) {
 	raw := "Just a normal reply with no tools."
 	cleaned, found := ExtractActions(raw)

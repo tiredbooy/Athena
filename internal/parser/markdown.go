@@ -19,6 +19,7 @@ type Frontmatter struct {
 	Title          string     `yaml:"title"`
 	Tags           []string   `yaml:"tags"`
 	AthenaIndex    bool       `yaml:"athena_index,omitempty"`
+	LinkedFolders  []string   `yaml:"linked_folders,omitempty"`
 	Kind           string     `yaml:"kind,omitempty"`
 	Authors        []string   `yaml:"authors,omitempty"`
 	Genres         []string   `yaml:"genres,omitempty"`

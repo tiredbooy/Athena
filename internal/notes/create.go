@@ -3,6 +3,7 @@ package notes
 import (
 	"context"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 
@@ -125,18 +126,23 @@ func (s *Service) MoveNote(ctx context.Context, noteID int64, folder string) (*m
 		return nil, fmt.Errorf("note %d not found", noteID)
 	}
 
+	if _, err := os.Stat(n.Path); err != nil {
+		if os.IsNotExist(err) {
+			if err := s.reconcileMissingNotePath(n); err != nil {
+				return nil, err
+			}
+		}
+		if !os.IsNotExist(err) {
+			return nil, fmt.Errorf("inspect source file: %w", err)
+		}
+	}
+
 	newPath, err := utils.NotePath(s.vaultPath, folder, n.Title)
 	if err != nil {
 		return nil, err
 	}
 	if newPath == n.Path {
 		return n, nil
-	}
-	if _, err := os.Stat(n.Path); err != nil {
-		if os.IsNotExist(err) {
-			return nil, fmt.Errorf("source file is missing at %s; Athena's index is stale (the note may have been moved outside Athena)", utils.RelVault(s.vaultPath, n.Path))
-		}
-		return nil, fmt.Errorf("inspect source file: %w", err)
 	}
 
 	if existing, err := s.noteStore.GetByPath(newPath); err != nil {
@@ -161,6 +167,55 @@ func (s *Service) MoveNote(ctx context.Context, noteID int64, folder string) (*m
 		return nil, fmt.Errorf("update path: %w", err)
 	}
 	return n, nil
+}
+
+// reconcileMissingNotePath repairs a record after a user moves a note outside
+// Athena. Matching both filename and frontmatter title prevents a same-named
+// unrelated file from being adopted; ambiguous matches are left untouched.
+func (s *Service) reconcileMissingNotePath(n *models.Note) error {
+	filename := filepath.Base(n.Path)
+	var matches []string
+	err := filepath.WalkDir(s.vaultPath, func(path string, entry fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if entry.IsDir() {
+			rel := utils.RelVault(s.vaultPath, path)
+			if rel == ".obsidian" || rel == ".trash" {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if entry.Name() != filename {
+			return nil
+		}
+		raw, err := utils.ReadNoteFile(path)
+		if err != nil {
+			return err
+		}
+		frontmatter, _, err := parser.ParseMarkdown(raw)
+		if err != nil {
+			return nil
+		}
+		if frontmatter.Title == n.Title {
+			matches = append(matches, path)
+		}
+		return nil
+	})
+	if err != nil {
+		return fmt.Errorf("search vault for moved note: %w", err)
+	}
+	if len(matches) == 0 {
+		return fmt.Errorf("source file is missing at %s and no matching moved note was found", utils.RelVault(s.vaultPath, n.Path))
+	}
+	if len(matches) > 1 {
+		return fmt.Errorf("source file is missing at %s and %d matching files were found; move it manually to avoid choosing the wrong note", utils.RelVault(s.vaultPath, n.Path), len(matches))
+	}
+	n.Path = matches[0]
+	if err := s.noteStore.Update(n); err != nil {
+		return fmt.Errorf("repair moved note path: %w", err)
+	}
+	return nil
 }
 
 // ListNotes returns every note for slash-command display.

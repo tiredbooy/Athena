@@ -12,7 +12,9 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -37,10 +39,11 @@ type CodexOAuth struct {
 	http        *http.Client
 	mu          sync.Mutex
 	credentials CodexCredentials
+	openBrowser func(string) error
 }
 
 func LoadCodexOAuth() (*CodexOAuth, error) {
-	o := &CodexOAuth{http: &http.Client{Timeout: 30 * time.Second}}
+	o := &CodexOAuth{http: &http.Client{Timeout: 30 * time.Second}, openBrowser: openBrowser}
 	path, err := codexCredentialsPath()
 	if err != nil {
 		return nil, err
@@ -58,12 +61,15 @@ func LoadCodexOAuth() (*CodexOAuth, error) {
 	return o, nil
 }
 
-// Start opens a localhost callback listener and returns a URL the user may
-// open in any browser. The returned channel delivers exactly one result.
+// Start opens a localhost callback listener, launches the default browser when
+// possible, and returns the authorization URL as a fallback for headless use.
+// The returned channel delivers exactly one result.
 func (o *CodexOAuth) Start(ctx context.Context) (string, <-chan error, error) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
-	listener, err := net.Listen("tcp", "127.0.0.1:1455")
+	// The OAuth redirect uses localhost, not 127.0.0.1. Binding to that same
+	// hostname avoids a failed callback on systems where browsers prefer ::1.
+	listener, err := net.Listen("tcp", "localhost:1455")
 	if err != nil {
 		return "", nil, fmt.Errorf("start OpenAI sign-in callback on port 1455: %w", err)
 	}
@@ -114,13 +120,32 @@ func (o *CodexOAuth) Start(ctx context.Context) (string, <-chan error, error) {
 	})}
 	go func() { _ = server.Serve(listener) }()
 	go func() { <-ctx.Done(); complete(ctx.Err()) }()
-	return codexAuthorizeURL(challenge, state), result, nil
+	authorizeURL := codexAuthorizeURL(challenge, state)
+	if o.openBrowser != nil {
+		// A browser can be unavailable in a headless session. The caller still
+		// receives the URL and can complete the same flow from another browser.
+		_ = o.openBrowser(authorizeURL)
+	}
+	return authorizeURL, result, nil
+}
+
+func openBrowser(rawURL string) error {
+	var command *exec.Cmd
+	switch runtime.GOOS {
+	case "darwin":
+		command = exec.Command("open", rawURL)
+	case "windows":
+		command = exec.Command("rundll32", "url.dll,FileProtocolHandler", rawURL)
+	default:
+		command = exec.Command("xdg-open", rawURL)
+	}
+	return command.Start()
 }
 
 func codexAuthorizeURL(challenge, state string) string {
-	// Match the proven Codex PKCE flow exactly. In particular, this public
-	// client does not accept an application-specific originator parameter.
-	params := url.Values{"response_type": {"code"}, "client_id": {codexOAuthClientID}, "redirect_uri": {codexRedirectURI}, "scope": {"openid profile email offline_access"}, "code_challenge": {challenge}, "code_challenge_method": {"S256"}, "id_token_add_organizations": {"true"}, "codex_cli_simplified_flow": {"true"}, "state": {state}}
+	// Match the Codex PKCE flow while identifying Athena truthfully rather than
+	// pretending to be another client such as OpenCode.
+	params := url.Values{"response_type": {"code"}, "client_id": {codexOAuthClientID}, "redirect_uri": {codexRedirectURI}, "scope": {"openid profile email offline_access"}, "code_challenge": {challenge}, "code_challenge_method": {"S256"}, "id_token_add_organizations": {"true"}, "codex_cli_simplified_flow": {"true"}, "originator": {"athena"}, "state": {state}}
 	return codexOAuthIssuer + "/oauth/authorize?" + params.Encode()
 }
 

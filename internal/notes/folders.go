@@ -3,8 +3,10 @@ package notes
 import (
 	"fmt"
 	"path/filepath"
+	"sort"
 	"strings"
 
+	"github.com/tiredbooy/internal/parser"
 	"github.com/tiredbooy/internal/utils"
 )
 
@@ -32,6 +34,88 @@ func (s *Service) ListFolders() ([]string, error) {
 // FolderExists reports whether folder exists under the vault.
 func (s *Service) FolderExists(folder string) (bool, error) {
 	return utils.FolderExists(s.vaultPath, folder)
+}
+
+// LinkFolders records a bidirectional Obsidian graph connection between the
+// supplied folders. Folder index notes own this metadata because they are the
+// graph nodes Athena generates for real directories.
+func (s *Service) LinkFolders(folders []string) ([]string, error) {
+	unique := make(map[string]bool, len(folders))
+	for _, folder := range folders {
+		clean, err := utils.CleanFolder(folder)
+		if err != nil {
+			return nil, err
+		}
+		if clean == "" || isManagedFolder(clean) {
+			return nil, fmt.Errorf("invalid folder %q", folder)
+		}
+		exists, err := utils.FolderExists(s.vaultPath, clean)
+		if err != nil {
+			return nil, err
+		}
+		if !exists {
+			return nil, fmt.Errorf("folder %q not found", clean)
+		}
+		unique[clean] = true
+	}
+	if len(unique) < 2 {
+		return nil, fmt.Errorf("at least two distinct folders are required")
+	}
+
+	linked := make([]string, 0, len(unique))
+	for folder := range unique {
+		linked = append(linked, folder)
+	}
+	sort.Strings(linked)
+	if err := s.SyncFolderGraph(); err != nil {
+		return nil, err
+	}
+	for _, folder := range linked {
+		if err := s.addFolderLinks(folder, linked); err != nil {
+			return nil, err
+		}
+	}
+	if err := s.SyncFolderGraph(); err != nil {
+		return nil, err
+	}
+	return linked, nil
+}
+
+func (s *Service) addFolderLinks(folder string, related []string) error {
+	indexPath := filepath.Join(s.vaultPath, filepath.FromSlash(folder)+".md")
+	raw, err := utils.ReadNoteFile(indexPath)
+	if err != nil {
+		return fmt.Errorf("read folder index %s: %w", folder, err)
+	}
+	fm, body, err := parser.ParseMarkdown(raw)
+	if err != nil {
+		return fmt.Errorf("parse folder index %s: %w", folder, err)
+	}
+	if !fm.AthenaIndex {
+		return fmt.Errorf("folder index %q is not Athena-managed", folder)
+	}
+	links := make(map[string]bool, len(fm.LinkedFolders)+len(related))
+	for _, linked := range fm.LinkedFolders {
+		links[linked] = true
+	}
+	for _, relatedFolder := range related {
+		if relatedFolder != folder {
+			links[relatedFolder] = true
+		}
+	}
+	fm.LinkedFolders = fm.LinkedFolders[:0]
+	for linked := range links {
+		fm.LinkedFolders = append(fm.LinkedFolders, linked)
+	}
+	sort.Strings(fm.LinkedFolders)
+	content, err := parser.RenderMarkdown(fm, body)
+	if err != nil {
+		return fmt.Errorf("render folder index %s: %w", folder, err)
+	}
+	if err := utils.OverwriteNoteFile(indexPath, content); err != nil {
+		return fmt.Errorf("write folder index %s: %w", folder, err)
+	}
+	return nil
 }
 
 // DeleteEmptyFolder removes folder if it contains no files or subfolders.

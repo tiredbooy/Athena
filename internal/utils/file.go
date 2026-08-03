@@ -133,7 +133,7 @@ func ListFolders(vaultRoot string) ([]string, error) {
 			return nil
 		}
 		rel := RelVault(vaultRoot, path)
-		if rel == ".trash" || strings.HasPrefix(rel, ".trash/") {
+		if rel == ".trash" || strings.HasPrefix(rel, ".trash/") || rel == ".obsidian" || strings.HasPrefix(rel, ".obsidian/") {
 			return filepath.SkipDir
 		}
 		folders = append(folders, rel)

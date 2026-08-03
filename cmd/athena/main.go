@@ -85,7 +85,7 @@ func main() {
 	}
 	loop := chat.NewLoop(activeProvider, providers, oauth, retrievalSvc, dispatcher, cfg)
 	session := chat.NewSession(loop)
-	if err := tui.RunBubble(session.Submit, session.Clear,
+	if err := tui.RunBubble(session.Submit, session.Clear, session.HasPendingActions,
 		func(ctx context.Context) ([]tui.ModelOption, error) {
 			options, err := session.Models(ctx)
 			out := make([]tui.ModelOption, len(options))
@@ -240,6 +240,14 @@ func buildDispatcher(notesSvc *notes.Service, bookResolver *books.Resolver) *too
 		return fmt.Sprintf("Created Folder %s", folder), nil
 	})
 
+	d.Register("link_folders", func(_ context.Context, a ai.Action) (string, error) {
+		folders, err := notesSvc.LinkFolders(a.Folders)
+		if err != nil {
+			return "", err
+		}
+		return fmt.Sprintf("Linked folders in Obsidian: %s", strings.Join(folders, ", ")), nil
+	})
+
 	d.Register("list_folders", func(_ context.Context, _ ai.Action) (string, error) {
 		folders, err := notesSvc.ListFolders()
 		if err != nil {
@@ -361,7 +369,7 @@ func registerWriteVerifiers(d *tools.Dispatcher, notesSvc *notes.Service) {
 		"create_note", "create_task", "move_note", "update_note", "mark_done",
 		"append_note", "replace_section",
 		"rename_note", "duplicate_note", "trash_note", "restore_note", "archive_note", "unarchive_note",
-		"create_folder", "ensure_folders", "delete_folder", "rename_folder", "move_folder",
+		"create_folder", "ensure_folders", "delete_folder", "rename_folder", "move_folder", "link_folders",
 	} {
 		d.RegisterVerifier(actionType, func(ctx context.Context, action ai.Action) error {
 			return verifyWrite(ctx, notesSvc, action)
@@ -394,6 +402,17 @@ func verifyWrite(_ context.Context, notesSvc *notes.Service, action ai.Action) e
 			}
 			if !exists {
 				return fmt.Errorf("verify ensure_folders: %q not found", folder)
+			}
+		}
+		return nil
+	case "link_folders":
+		for _, folder := range action.Folders {
+			exists, err := notesSvc.FolderExists(folder)
+			if err != nil {
+				return fmt.Errorf("verify link_folders: %w", err)
+			}
+			if !exists {
+				return fmt.Errorf("verify link_folders: %q not found", folder)
 			}
 		}
 		return nil

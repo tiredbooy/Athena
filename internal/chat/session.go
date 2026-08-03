@@ -271,6 +271,11 @@ func (s *Session) Clear() {
 	s.history = s.history[:1]
 	s.pendingActions = nil
 }
+
+// HasPendingActions is the UI contract for whether its approval controls are
+// valid. Keeping this state in Session avoids inferring it from model prose.
+func (s *Session) HasPendingActions() bool { return len(s.pendingActions) > 0 }
+
 func (s *Session) append(input, reply string) {
 	s.history = append(s.history, models.Message{Role: "user", Content: input}, models.Message{Role: "assistant", Content: reply})
 }

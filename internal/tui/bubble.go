@@ -13,6 +13,7 @@ import (
 
 type SubmitFunc func(context.Context, string, func(string), func(string)) (string, error)
 type ResetFunc func()
+type PendingActionsFunc func() bool
 type ModelOption struct {
 	ProviderID, ProviderName, Model string
 	Current                         bool
@@ -45,38 +46,45 @@ type providerConnectedMsg struct {
 	err  error
 }
 
+type chatMessage struct {
+	header, text            string
+	contentStyle, railStyle lipgloss.Style
+}
+
 type bubbleModel struct {
-	submit        SubmitFunc
-	reset         ResetFunc
-	models        ModelsFunc
-	selectModel   SelectModelFunc
-	connect       ConnectFunc
-	subscription  SubscriptionFunc
-	input         textarea.Model
-	output        viewport.Model
-	lines         []string
-	status        string
-	busy          bool
-	width, height int
-	events        <-chan workerMsg
-	cancel        context.CancelFunc
-	spinner       spinner.Model
-	hintIndex     int
-	hintTicks     int
-	commandIndex  int
-	commandMenu   bool
-	streaming     bool
-	streamText    string
-	picker        bool
-	pickerLoading bool
-	pickerOptions []ModelOption
-	pickerIndex   int
-	connecting    bool
-	connectType   string
-	connectStep   int
-	connectValues []string
-	reviewing     bool
-	requestID     uint64
+	submit         SubmitFunc
+	reset          ResetFunc
+	pendingActions PendingActionsFunc
+	models         ModelsFunc
+	selectModel    SelectModelFunc
+	connect        ConnectFunc
+	subscription   SubscriptionFunc
+	input          textarea.Model
+	output         viewport.Model
+	lines          []chatMessage
+	status         string
+	busy           bool
+	width, height  int
+	events         <-chan workerMsg
+	cancel         context.CancelFunc
+	spinner        spinner.Model
+	hintIndex      int
+	hintTicks      int
+	commandIndex   int
+	commandMenu    bool
+	streaming      bool
+	streamText     string
+	followOutput   bool
+	picker         bool
+	pickerLoading  bool
+	pickerOptions  []ModelOption
+	pickerIndex    int
+	connecting     bool
+	connectType    string
+	connectStep    int
+	connectValues  []string
+	reviewing      bool
+	requestID      uint64
 }
 
 type commandSpec struct {
@@ -180,7 +188,7 @@ func applyInputTheme(input *textarea.Model) {
 	input.SetStyles(styles)
 }
 
-func RunBubble(submit SubmitFunc, reset ResetFunc, models ModelsFunc, selectModel SelectModelFunc, connect ConnectFunc, subscription SubscriptionFunc) error {
+func RunBubble(submit SubmitFunc, reset ResetFunc, pendingActions PendingActionsFunc, models ModelsFunc, selectModel SelectModelFunc, connect ConnectFunc, subscription SubscriptionFunc) error {
 	input := textarea.New()
 	input.Placeholder = "Ask Athena…"
 	input.ShowLineNumbers = false
@@ -192,8 +200,8 @@ func RunBubble(submit SubmitFunc, reset ResetFunc, models ModelsFunc, selectMode
 	spin := spinner.New()
 	spin.Style = accent
 	output := viewport.New()
-	output.MouseWheelEnabled = true
-	model := bubbleModel{submit: submit, reset: reset, models: models, selectModel: selectModel, connect: connect, subscription: subscription, input: input, output: output, status: "Ready", spinner: spin}
+	output.SoftWrap = true
+	model := bubbleModel{submit: submit, reset: reset, pendingActions: pendingActions, models: models, selectModel: selectModel, connect: connect, subscription: subscription, input: input, output: output, status: "Ready", spinner: spin, followOutput: true}
 	_, err := tea.NewProgram(model, tea.WithContext(context.Background())).Run()
 	return err
 }
@@ -210,9 +218,7 @@ func (m bubbleModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.refreshOutput()
 		return m, nil
 	case tea.MouseWheelMsg:
-		var cmd tea.Cmd
-		m.output, cmd = m.output.Update(msg)
-		return m, cmd
+		return m, nil
 	case tea.KeyPressMsg:
 		if m.reviewing && (msg.String() == "y" || msg.String() == "Y") {
 			m.reviewing = false
@@ -249,22 +255,21 @@ func (m bubbleModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			return m, nil
 		case "home", "ctrl+home":
-			if !m.busy && m.input.Value() == "" {
+			if m.input.Value() == "" {
 				m.output.GotoTop()
+				m.followOutput = false
 				return m, nil
 			}
 		case "pgup", "ctrl+u":
-			if !m.busy {
-				var cmd tea.Cmd
-				m.output, cmd = m.output.Update(msg)
-				return m, cmd
-			}
+			var cmd tea.Cmd
+			m.output, cmd = m.output.Update(msg)
+			m.followOutput = m.output.AtBottom()
+			return m, cmd
 		case "pgdown", "ctrl+d":
-			if !m.busy {
-				var cmd tea.Cmd
-				m.output, cmd = m.output.Update(msg)
-				return m, cmd
-			}
+			var cmd tea.Cmd
+			m.output, cmd = m.output.Update(msg)
+			m.followOutput = m.output.AtBottom()
+			return m, cmd
 		case "up":
 			if m.picker && len(m.pickerOptions) > 0 {
 				count := len(m.filteredModels()) + 1
@@ -279,6 +284,11 @@ func (m bubbleModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.commandIndex = (m.commandIndex - 1 + len(matches)) % len(matches)
 				return m, nil
 			}
+			if m.input.Value() == "" {
+				m.output.ScrollUp(1)
+				m.followOutput = m.output.AtBottom()
+				return m, nil
+			}
 		case "down":
 			if m.picker && len(m.pickerOptions) > 0 {
 				count := len(m.filteredModels()) + 1
@@ -291,6 +301,11 @@ func (m bubbleModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			if matches := m.commandMatches(); len(matches) > 0 {
 				m.commandIndex = (m.commandIndex + 1) % len(matches)
+				return m, nil
+			}
+			if m.input.Value() == "" {
+				m.output.ScrollDown(1)
+				m.followOutput = m.output.AtBottom()
 				return m, nil
 			}
 		case "tab":
@@ -390,7 +405,7 @@ func (m bubbleModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.refreshOutput()
 				return m, nil
 			case "/help":
-				m.lines = append(m.lines, renderAssistantMessage("Commands\n/clear — clear the visible pane\n/reset — clear pane and model history\n/compact — shrink older conversation context\n/help — show this help\n/confirm — apply a reviewed change plan\n/cancel — discard a reviewed change plan\n\nKeys: Enter send · Shift+Enter newline · Esc cancel · Ctrl+C quit"))
+				m.lines = append(m.lines, m.renderAssistantMessage("Commands\n/clear — clear the visible pane\n/reset — clear pane and model history\n/compact — shrink older conversation context\n/help — show this help\n/confirm — apply a reviewed change plan\n/cancel — discard a reviewed change plan\n\nKeys: Enter send · Shift+Enter newline · Esc cancel · Ctrl+C quit"))
 				m.input.SetValue("")
 				m.refreshOutput()
 				return m, nil
@@ -418,12 +433,12 @@ func (m bubbleModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		if !msg.done {
 			if !m.streaming {
-				m.lines = append(m.lines, renderAssistantMessage(""))
+				m.lines = append(m.lines, m.renderAssistantMessage(""))
 				m.streaming = true
 				m.streamText = ""
 			}
 			m.streamText += msg.text
-			m.lines[len(m.lines)-1] = renderAssistantMessage(RenderMarkdown(m.streamText))
+			m.lines[len(m.lines)-1] = m.renderAssistantMessage(RenderMarkdown(m.streamText))
 			m.refreshOutput()
 			return m, waitForWorker(m.events)
 		}
@@ -431,16 +446,16 @@ func (m bubbleModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.cancel = nil
 		m.status = "Ready"
 		if msg.err != nil {
-			m.lines = append(m.lines, renderErrorMessage(msg.err.Error()))
+			m.lines = append(m.lines, m.renderErrorMessage(msg.err.Error()))
 		} else {
-			entry := renderAssistantMessage(RenderMarkdown(msg.text))
+			entry := m.renderAssistantMessage(RenderMarkdown(msg.text))
 			if m.streaming {
 				m.lines[len(m.lines)-1] = entry
 			} else {
 				m.lines = append(m.lines, entry)
 			}
 		}
-		m.reviewing = msg.err == nil && strings.Contains(msg.text, "Review required — no changes have been made.")
+		m.reviewing = msg.err == nil && m.pendingActions != nil && m.pendingActions()
 		if m.reviewing {
 			m.status = "Apply this plan? Press Y or Enter to approve · N or Esc to cancel"
 		}
@@ -452,7 +467,7 @@ func (m bubbleModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.pickerLoading = false
 		if msg.err != nil {
 			m.closeOverlay()
-			m.lines = append(m.lines, renderErrorMessage(msg.err.Error()))
+			m.lines = append(m.lines, m.renderErrorMessage(msg.err.Error()))
 			m.refreshOutput()
 			return m, nil
 		}
@@ -461,7 +476,7 @@ func (m bubbleModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case modelSelectedMsg:
 		m.closeOverlay()
 		if msg.err != nil {
-			m.lines = append(m.lines, renderErrorMessage(msg.err.Error()))
+			m.lines = append(m.lines, m.renderErrorMessage(msg.err.Error()))
 		} else {
 			m.status = msg.text
 		}
@@ -470,7 +485,7 @@ func (m bubbleModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case providerConnectedMsg:
 		m.closeOverlay()
 		if msg.err != nil {
-			m.lines = append(m.lines, renderErrorMessage(msg.err.Error()))
+			m.lines = append(m.lines, m.renderErrorMessage(msg.err.Error()))
 		} else {
 			m.status = msg.text
 		}
@@ -479,9 +494,9 @@ func (m bubbleModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case subscriptionMsg:
 		m.closeOverlay()
 		if msg.err != nil {
-			m.lines = append(m.lines, renderErrorMessage(msg.err.Error()))
+			m.lines = append(m.lines, m.renderErrorMessage(msg.err.Error()))
 		} else {
-			m.lines = append(m.lines, renderAssistantMessage("Open this URL in any browser, sign in, then approve Athena:\n\n"+msg.url+"\n\nAthena will switch to your ChatGPT subscription after approval."))
+			m.lines = append(m.lines, m.renderAssistantMessage("Open this URL in any browser, sign in, then approve Athena:\n\n"+msg.url+"\n\nAthena will switch to your ChatGPT subscription after approval."))
 			m.status = "Waiting for browser approval"
 		}
 		m.refreshOutput()
@@ -521,7 +536,8 @@ func (m *bubbleModel) startSubmit(input string) tea.Cmd {
 	m.input.SetValue("")
 	m.busy = true
 	m.status = "Starting request…"
-	m.lines = append(m.lines, renderUserMessage(input))
+	m.followOutput = true
+	m.lines = append(m.lines, m.renderUserMessage(input))
 	m.refreshOutput()
 	ctx, cancel := context.WithCancel(context.Background())
 	m.cancel = cancel
@@ -636,31 +652,45 @@ func subscriptionCmd(subscription SubscriptionFunc) tea.Cmd {
 }
 
 func (m *bubbleModel) refreshOutput() {
-	m.output.SetContent(strings.Join(m.lines, "\n\n"))
-	m.output.GotoBottom()
+	rendered := make([]string, 0, len(m.lines))
+	for _, line := range m.lines {
+		rendered = append(rendered, renderChatMessage(line.header, line.text, line.contentStyle, line.railStyle, m.messageWidth()))
+	}
+	offset := m.output.YOffset()
+	m.output.SetContent(strings.Join(rendered, "\n\n"))
+	if m.followOutput {
+		m.output.GotoBottom()
+	} else {
+		m.output.SetYOffset(offset)
+	}
 }
 
 // Chat entries use a restrained rail instead of full boxes. It gives each
 // streamed response a stable visual boundary without consuming much terminal
 // space or making long answers feel like a stack of UI panels.
-func renderUserMessage(text string) string {
-	return renderChatMessage(accent.Render("❯")+muted.Render(" You"), text, userMessage, accent)
+func (m bubbleModel) renderUserMessage(text string) chatMessage {
+	return chatMessage{header: accent.Render("❯") + muted.Render(" You"), text: text, contentStyle: userMessage, railStyle: accent}
 }
 
-func renderAssistantMessage(text string) string {
-	return renderChatMessage(accent.Render("✦ Athena"), text, assistantMessage, accent)
+func (m bubbleModel) renderAssistantMessage(text string) chatMessage {
+	return chatMessage{header: accent.Render("✦ Athena"), text: text, contentStyle: assistantMessage, railStyle: accent}
 }
 
-func renderErrorMessage(text string) string {
-	return renderChatMessage(errorMessage.Render("! Request failed"), text, errorMessage, errorMessage)
+func (m bubbleModel) renderErrorMessage(text string) chatMessage {
+	return chatMessage{header: errorMessage.Render("! Request failed"), text: text, contentStyle: errorMessage, railStyle: errorMessage}
 }
 
-func renderChatMessage(header, text string, contentStyle, railStyle lipgloss.Style) string {
+func renderChatMessage(header, text string, contentStyle, railStyle lipgloss.Style, width int) string {
+	text = lipgloss.Wrap(text, max(1, width-2), "")
 	lines := strings.Split(text, "\n")
 	for i, line := range lines {
 		lines[i] = railStyle.Render("│ ") + contentStyle.Render(line)
 	}
 	return header + "\n" + strings.Join(lines, "\n")
+}
+
+func (m bubbleModel) messageWidth() int {
+	return max(20, m.output.Width())
 }
 
 func (m bubbleModel) composerWidth() int {
@@ -703,12 +733,12 @@ func (m bubbleModel) View() tea.View {
 	if approval != "" {
 		approval += "\n"
 	}
-	content := header + "\n" + muted.Render(strings.Repeat("─", width)) + "\n\n" + body + "\n\n" + suggestions + approval + composer + "\n" + status + "\n" + muted.Render("Enter send · Shift+Enter newline · ↑↓ select command · Tab complete · Esc cancel")
+	content := header + "\n" + muted.Render(strings.Repeat("─", width)) + "\n\n" + body + "\n\n" + suggestions + approval + composer + "\n" + status + "\n" + muted.Render("Enter send · Shift+Enter newline · PgUp/PgDn or empty-input arrows scroll · Esc cancel")
 	v := tea.NewView(content)
 	v.AltScreen = true
 	v.WindowTitle = "Athena"
-	// Leave the mouse to the terminal so users can select and copy any message
-	// normally. Keyboard viewport scrolling remains available (PgUp/PgDn).
+	// Mouse tracking prevents terminal text selection. Keep it disabled so chat
+	// messages can be selected and copied with the terminal's normal controls.
 	v.MouseMode = tea.MouseModeNone
 	return v
 }

@@ -46,3 +46,40 @@ func TestSyncFolderGraphBuildsParentCategoryAndItemLinks(t *testing.T) {
 		t.Fatalf("category index = %q, err=%v", category, err)
 	}
 }
+
+func TestLinkFoldersCreatesPersistentBidirectionalObsidianLinks(t *testing.T) {
+	vault := t.TempDir()
+	db, err := storage.Open(filepath.Join(t.TempDir(), "athena.db"))
+	if err != nil {
+		t.Fatalf("open database: %v", err)
+	}
+	defer db.Close()
+	service := NewService(vault, storage.NewNoteStore(db), storage.NewChunkStore(db), nil)
+
+	if err := utils.EnsureDir(vault, "work"); err != nil {
+		t.Fatalf("create work folder: %v", err)
+	}
+	if err := utils.EnsureDir(vault, "hospital"); err != nil {
+		t.Fatalf("create hospital folder: %v", err)
+	}
+	if _, err := service.LinkFolders([]string{"work", "hospital"}); err != nil {
+		t.Fatalf("link folders: %v", err)
+	}
+
+	work, err := utils.ReadNoteFile(filepath.Join(vault, "work.md"))
+	if err != nil || !strings.Contains(work, "[[hospital|Hospital]]") {
+		t.Fatalf("work index = %q, err=%v", work, err)
+	}
+	hospital, err := utils.ReadNoteFile(filepath.Join(vault, "hospital.md"))
+	if err != nil || !strings.Contains(hospital, "[[work|Work]]") {
+		t.Fatalf("hospital index = %q, err=%v", hospital, err)
+	}
+
+	if err := service.SyncFolderGraph(); err != nil {
+		t.Fatalf("resync graph: %v", err)
+	}
+	work, err = utils.ReadNoteFile(filepath.Join(vault, "work.md"))
+	if err != nil || !strings.Contains(work, "[[hospital|Hospital]]") {
+		t.Fatalf("work link was not preserved after graph sync: %q, err=%v", work, err)
+	}
+}

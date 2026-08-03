@@ -40,6 +40,7 @@ var actionPolicies = map[string]Policy{
 	"replace_section": {Kind: ToolWrite, Timeout: time.Minute},
 	"mark_done":       {Kind: ToolWrite, Timeout: time.Minute},
 	"create_folder":   {Kind: ToolWrite, Timeout: time.Minute},
+	"link_folders":    {Kind: ToolWrite, Timeout: time.Minute},
 	"rename_note":     {Kind: ToolWrite, Timeout: time.Minute},
 	"duplicate_note":  {Kind: ToolWrite, Timeout: time.Minute},
 	"restore_note":    {Kind: ToolWrite, Timeout: time.Minute},
@@ -109,6 +110,10 @@ func validateAction(action ai.Action, known bool) error {
 	case "ensure_folders":
 		if len(action.Paths) == 0 {
 			return fmt.Errorf("ensure_folders requires paths")
+		}
+	case "link_folders":
+		if len(action.Folders) < 2 {
+			return fmt.Errorf("link_folders requires at least two folders")
 		}
 	case "move_note", "update_note", "append_note", "replace_section", "mark_done", "rename_note", "duplicate_note", "trash_note", "restore_note", "archive_note", "unarchive_note", "finish_book":
 		if action.NoteID <= 0 {

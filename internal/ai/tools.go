@@ -21,6 +21,7 @@ import (
 //   - delete_folder:    Folder
 //   - rename_folder:    Folder (old), NewFolder (new name, single segment)
 //   - move_folder:      Folder (old), NewFolder (new parent)
+//   - link_folders:     Folders
 //   - rename_note:      NoteID, Title (new title)
 //   - duplicate_note:   NoteID, Title (optional new title), Folder (optional target)
 //   - trash_note:       NoteID
@@ -52,6 +53,7 @@ type Action struct {
 	Path      string   `json:"path,omitempty"`
 	NewFolder string   `json:"new_folder,omitempty"`
 	Paths     []string `json:"paths,omitempty"`
+	Folders   []string `json:"folders,omitempty"`
 	Done      bool     `json:"done,omitempty"`
 	ISBN      string   `json:"isbn,omitempty"`
 }

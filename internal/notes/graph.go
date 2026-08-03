@@ -60,7 +60,11 @@ func (s *Service) SyncFolderGraph() error {
 	}
 
 	for _, folder := range folders {
-		content, err := renderFolderIndex(folder, children[folder], notesByFolder[folder], s.vaultPath)
+		linkedFolders, err := s.readFolderLinks(folder, folders)
+		if err != nil {
+			return err
+		}
+		content, err := renderFolderIndex(folder, children[folder], linkedFolders, notesByFolder[folder], s.vaultPath)
 		if err != nil {
 			return err
 		}
@@ -83,10 +87,10 @@ func visibleFolders(folders []string) []string {
 }
 
 func isManagedFolder(value string) bool {
-	return value == ".trash" || strings.HasPrefix(value, ".trash/") || value == "archive" || strings.HasPrefix(value, "archive/")
+	return value == ".trash" || strings.HasPrefix(value, ".trash/") || value == ".obsidian" || strings.HasPrefix(value, ".obsidian/") || value == "archive" || strings.HasPrefix(value, "archive/")
 }
 
-func renderFolderIndex(folder string, childFolders []string, notes []*models.Note, vaultPath string) (string, error) {
+func renderFolderIndex(folder string, childFolders, linkedFolders []string, notes []*models.Note, vaultPath string) (string, error) {
 	name := folderName(folder)
 	var body strings.Builder
 	body.WriteString("# ")
@@ -105,6 +109,14 @@ func renderFolderIndex(folder string, childFolders []string, notes []*models.Not
 			body.WriteString("\n")
 		}
 	}
+	if len(linkedFolders) > 0 {
+		body.WriteString("\n## Related folders\n")
+		for _, linked := range linkedFolders {
+			body.WriteString("- ")
+			body.WriteString(wikiLink(linked, folderName(linked)))
+			body.WriteString("\n")
+		}
+	}
 	if len(notes) > 0 {
 		body.WriteString("\n## Notes\n")
 		for _, note := range notes {
@@ -115,7 +127,41 @@ func renderFolderIndex(folder string, childFolders []string, notes []*models.Not
 		}
 	}
 	body.WriteString("\n<!-- Managed by Athena: folder graph index -->\n")
-	return parser.RenderMarkdown(parser.Frontmatter{Title: name, AthenaIndex: true}, strings.TrimSpace(body.String()))
+	return parser.RenderMarkdown(parser.Frontmatter{Title: name, AthenaIndex: true, LinkedFolders: linkedFolders}, strings.TrimSpace(body.String()))
+}
+
+func (s *Service) readFolderLinks(folder string, knownFolders []string) ([]string, error) {
+	raw, err := utils.ReadNoteFile(filepath.Join(s.vaultPath, filepath.FromSlash(folder)+".md"))
+	if os.IsNotExist(err) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("read folder index %s: %w", folder, err)
+	}
+	fm, _, err := parser.ParseMarkdown(raw)
+	if err != nil {
+		return nil, fmt.Errorf("parse folder index %s: %w", folder, err)
+	}
+	if !fm.AthenaIndex {
+		return nil, fmt.Errorf("cannot create folder graph index for %q: %s is an existing user note", folder, utils.RelVault(s.vaultPath, filepath.Join(s.vaultPath, filepath.FromSlash(folder)+".md")))
+	}
+
+	known := make(map[string]bool, len(knownFolders))
+	for _, knownFolder := range knownFolders {
+		known[knownFolder] = true
+	}
+	unique := make(map[string]bool, len(fm.LinkedFolders))
+	for _, linked := range fm.LinkedFolders {
+		if linked != folder && known[linked] {
+			unique[linked] = true
+		}
+	}
+	links := make([]string, 0, len(unique))
+	for linked := range unique {
+		links = append(links, linked)
+	}
+	sort.Strings(links)
+	return links, nil
 }
 
 func wikiLink(target, label string) string {

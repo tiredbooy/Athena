@@ -173,6 +173,12 @@ func (s *Session) chatWithRetry(ctx context.Context, messages []models.Message, 
 	if err == nil || !retryableModelError(err) || ctx.Err() != nil {
 		return response, err
 	}
+	// A tool-schema failure from Ollama is normally model capability mismatch,
+	// not a transient transport error. Return it immediately so runReadToolLoop
+	// can fall back to ordinary chat while most of the turn budget remains.
+	if s.loop.ai.Name() == "Ollama" && len(tools) > 0 {
+		return response, err
+	}
 	if status != nil {
 		status("Retrying the model request (1/1)")
 	}
