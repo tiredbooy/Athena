@@ -1,0 +1,72 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://athena.local/protocol/athena.v1.schema.json",
+  "title": "Athena engine protocol v1",
+  "description": "Newline-delimited JSON messages exchanged between a local Athena UI and `athena engine`.",
+  "oneOf": [
+    { "$ref": "#/$defs/request" },
+    { "$ref": "#/$defs/event" }
+  ],
+  "$defs": {
+    "request": {
+      "type": "object",
+      "required": ["version", "requestId", "type"],
+      "properties": {
+        "version": { "const": 1 },
+        "requestId": { "type": "string", "minLength": 1 },
+        "type": {
+          "enum": [
+            "engine.hello",
+            "session.submit",
+            "session.cancel",
+            "plan.approve",
+            "plan.reject"
+          ]
+        },
+        "input": { "type": "string" },
+        "turnId": { "type": "string" },
+        "planId": { "type": "string" }
+      }
+    },
+    "activity": {
+      "type": "object",
+      "required": ["phase", "message"],
+      "properties": {
+        "phase": { "type": "string" },
+        "message": { "type": "string" },
+        "provider": { "type": "string" },
+        "model": { "type": "string" },
+        "path": { "type": "string" }
+      }
+    },
+    "action": {
+      "type": "object",
+      "required": ["type"],
+      "properties": {
+        "id": { "type": "string" },
+        "depends_on": { "type": "array", "items": { "type": "string" } },
+        "type": { "type": "string" },
+        "note_id": { "type": "integer" },
+        "title": { "type": "string" },
+        "content": { "type": "string" },
+        "folder": { "type": "string" },
+        "paths": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "event": {
+      "type": "object",
+      "required": ["version", "type"],
+      "properties": {
+        "version": { "const": 1 },
+        "requestId": { "type": "string" },
+        "type": { "type": "string" },
+        "turnId": { "type": "string" },
+        "planId": { "type": "string" },
+        "message": { "type": "string" },
+        "error": { "type": "string" },
+        "activity": { "$ref": "#/$defs/activity" },
+        "actions": { "type": "array", "items": { "$ref": "#/$defs/action" } }
+      }
+    }
+  }
+}

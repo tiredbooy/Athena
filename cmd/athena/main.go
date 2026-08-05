@@ -16,11 +16,13 @@ import (
 	"github.com/tiredbooy/internal/retrieval"
 	"github.com/tiredbooy/internal/storage"
 	"github.com/tiredbooy/internal/tools"
+	"github.com/tiredbooy/internal/transport/stdio"
 	"github.com/tiredbooy/internal/tui"
 	"github.com/tiredbooy/internal/utils"
 )
 
 func main() {
+	engineMode := len(os.Args) > 1 && os.Args[1] == "engine"
 	ctx, cancel := context.WithTimeout(context.Background(), 3600*time.Second)
 	defer cancel()
 
@@ -62,8 +64,10 @@ func main() {
 	dispatcher := buildDispatcher(notesSvc, bookResolver)
 	dispatcher.SetAuditLogger(storage.NewActionAuditStore(db))
 
-	fmt.Println("second-brain ready.")
-	fmt.Printf("  vault: %s\n  db:    %s\n  model: %s\n\n", cfg.VaultPath, cfg.DBPath, cfg.ChatModel)
+	if !engineMode {
+		fmt.Println("second-brain ready.")
+		fmt.Printf("  vault: %s\n  db:    %s\n  model: %s\n\n", cfg.VaultPath, cfg.DBPath, cfg.ChatModel)
+	}
 
 	oauth, err := ai.LoadCodexOAuth()
 	if err != nil {
@@ -85,6 +89,12 @@ func main() {
 	}
 	loop := chat.NewLoop(activeProvider, providers, oauth, retrievalSvc, dispatcher, cfg)
 	session := chat.NewSession(loop)
+	if engineMode {
+		if err := stdio.Serve(ctx, os.Stdin, os.Stdout, session); err != nil {
+			fatal("run engine", err)
+		}
+		return
+	}
 	if err := tui.RunBubble(session.Submit, session.Clear, session.HasPendingActions,
 		func(ctx context.Context) ([]tui.ModelOption, error) {
 			options, err := session.Models(ctx)

@@ -91,6 +91,13 @@ func TestCompoundFolderActions(t *testing.T) {
 	}
 }
 
+func TestFolderActionsAcceptsQuotedNaturalLanguageHierarchy(t *testing.T) {
+	actions, ok := folderActions(`i want you to make me a folder for "work" and a folder inside it "Rumera" and another folder in work "projects"`)
+	if !ok || len(actions) != 1 || !slices.Equal(actions[0].Paths, []string{"work", "work/Rumera", "work/projects"}) {
+		t.Fatalf("unexpected folder actions: %#v", actions)
+	}
+}
+
 func TestIsListingRequest(t *testing.T) {
 	tests := []struct {
 		input string

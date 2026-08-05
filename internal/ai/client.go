@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"os/exec"
 	"strings"
 	"sync"
@@ -64,7 +65,7 @@ func (c *Client) EnsureRunning(ctx context.Context) error {
 		return nil
 	}
 
-	fmt.Println("Ollama isn't running — starting it...")
+	fmt.Fprintln(os.Stderr, "Ollama isn't running — starting it...")
 
 	cmd := exec.Command("ollama", "serve")
 	err := cmd.Start()
@@ -75,7 +76,7 @@ func (c *Client) EnsureRunning(ctx context.Context) error {
 	deadline := time.Now().Add(30 * time.Second)
 	for time.Now().Before(deadline) {
 		if c.isUp(ctx) {
-			fmt.Println("Ollama is Up.")
+			fmt.Fprintln(os.Stderr, "Ollama is up.")
 			return nil
 		}
 		time.Sleep(500 * time.Millisecond)

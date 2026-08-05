@@ -16,9 +16,10 @@ import (
 // status callback; they decide whether to render it in a CLI, Bubble Tea, or a
 // future frontend.
 type Session struct {
-	loop           *Loop
-	history        []models.Message
-	pendingActions []ai.Action
+	loop        *Loop
+	history     []models.Message
+	pendingPlan *PendingPlan
+	nextPlanID  uint64
 }
 
 func NewSession(loop *Loop) *Session {
@@ -42,7 +43,7 @@ func (s *Session) Submit(ctx context.Context, input string, status func(string),
 	if input == "/cancel" {
 		return s.cancelPending()
 	}
-	if len(s.pendingActions) > 0 {
+	if s.pendingPlan != nil {
 		return "A change plan is awaiting review. Type /confirm to apply it or /cancel to discard it.", nil
 	}
 	if strings.HasPrefix(input, "/") {
@@ -169,7 +170,12 @@ func asksUserForVaultInventory(reply string) bool {
 }
 
 func (s *Session) previewActions(actions []ai.Action) string {
-	s.pendingActions = append([]ai.Action(nil), actions...)
+	s.nextPlanID++
+	s.pendingPlan = &PendingPlan{
+		ID:        fmt.Sprintf("plan-%d", s.nextPlanID),
+		Actions:   append([]ai.Action(nil), actions...),
+		CreatedAt: time.Now(),
+	}
 	var out strings.Builder
 	out.WriteString("Review required — no changes have been made.\n")
 	for _, action := range actions {
@@ -190,21 +196,42 @@ func (s *Session) previewActions(actions []ai.Action) string {
 }
 
 func (s *Session) confirmPending(ctx context.Context) (string, error) {
-	if len(s.pendingActions) == 0 {
+	return s.ApprovePlan(ctx, "")
+}
+
+func (s *Session) cancelPending() (string, error) {
+	return s.RejectPlan("")
+}
+
+// PendingPlan returns a copy of the current plan so a UI cannot mutate the
+// engine-owned actions before approval.
+func (s *Session) PendingPlan() *PendingPlan { return clonePendingPlan(s.pendingPlan) }
+
+// ApprovePlan applies the pending plan once. An empty ID preserves the legacy
+// /confirm command; external callers must use the plan ID they received.
+func (s *Session) ApprovePlan(ctx context.Context, planID string) (string, error) {
+	if s.pendingPlan == nil {
 		return "There is no pending change to confirm.", nil
 	}
-	actions := s.pendingActions
-	s.pendingActions = nil
+	if planID != "" && planID != s.pendingPlan.ID {
+		return "", fmt.Errorf("plan %q is no longer pending", planID)
+	}
+	actions := s.pendingPlan.Actions
+	s.pendingPlan = nil
 	reply := s.loop.runActions(ctx, actions)
 	s.append("/confirm", reply)
 	return reply, nil
 }
 
-func (s *Session) cancelPending() (string, error) {
-	if len(s.pendingActions) == 0 {
+// RejectPlan discards the pending plan. Plans cannot be approved after this.
+func (s *Session) RejectPlan(planID string) (string, error) {
+	if s.pendingPlan == nil {
 		return "There is no pending change to cancel.", nil
 	}
-	s.pendingActions = nil
+	if planID != "" && planID != s.pendingPlan.ID {
+		return "", fmt.Errorf("plan %q is no longer pending", planID)
+	}
+	s.pendingPlan = nil
 	reply := "Pending changes discarded."
 	s.append("/cancel", reply)
 	return reply, nil
@@ -269,12 +296,12 @@ func (s *Session) command(ctx context.Context, input string) (string, error) {
 
 func (s *Session) Clear() {
 	s.history = s.history[:1]
-	s.pendingActions = nil
+	s.pendingPlan = nil
 }
 
 // HasPendingActions is the UI contract for whether its approval controls are
 // valid. Keeping this state in Session avoids inferring it from model prose.
-func (s *Session) HasPendingActions() bool { return len(s.pendingActions) > 0 }
+func (s *Session) HasPendingActions() bool { return s.pendingPlan != nil }
 
 func (s *Session) append(input, reply string) {
 	s.history = append(s.history, models.Message{Role: "user", Content: input}, models.Message{Role: "assistant", Content: reply})
