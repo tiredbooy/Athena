@@ -118,6 +118,20 @@ func validate(request Request) error {
 	if strings.TrimSpace(request.Type) == "" {
 		return fmt.Errorf("type is required")
 	}
+	switch request.Type {
+	case RequestSubmit:
+		if strings.TrimSpace(request.Input) == "" {
+			return fmt.Errorf("input is required for %s", RequestSubmit)
+		}
+	case RequestCancel:
+		if strings.TrimSpace(request.TurnID) == "" {
+			return fmt.Errorf("turnId is required for %s", RequestCancel)
+		}
+	case RequestPlanApprove, RequestPlanReject:
+		if strings.TrimSpace(request.PlanID) == "" {
+			return fmt.Errorf("planId is required for %s", request.Type)
+		}
+	}
 	return nil
 }
 

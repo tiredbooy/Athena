@@ -61,3 +61,17 @@ func TestValidateRequiresRequestIdentity(t *testing.T) {
 		t.Fatal("request without type was accepted")
 	}
 }
+
+func TestValidateRequiresOperationFields(t *testing.T) {
+	tests := []Request{
+		{Version: ProtocolVersion, RequestID: "r1", Type: RequestSubmit},
+		{Version: ProtocolVersion, RequestID: "r2", Type: RequestCancel},
+		{Version: ProtocolVersion, RequestID: "r3", Type: RequestPlanApprove},
+		{Version: ProtocolVersion, RequestID: "r4", Type: RequestPlanReject},
+	}
+	for _, request := range tests {
+		if err := validate(request); err == nil {
+			t.Fatalf("request without operation field was accepted: %#v", request)
+		}
+	}
+}

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/tiredbooy/internal/ai"
@@ -16,6 +17,7 @@ import (
 // status callback; they decide whether to render it in a CLI, Bubble Tea, or a
 // future frontend.
 type Session struct {
+	mu          sync.Mutex
 	loop        *Loop
 	history     []models.Message
 	pendingPlan *PendingPlan
@@ -27,6 +29,12 @@ func NewSession(loop *Loop) *Session {
 }
 
 func (s *Session) Submit(ctx context.Context, input string, status func(string), onToken func(string)) (string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.submit(ctx, input, status, onToken)
+}
+
+func (s *Session) submit(ctx context.Context, input string, status func(string), onToken func(string)) (string, error) {
 	ctx, cancel := context.WithTimeout(ctx, TurnTimeout)
 	defer cancel()
 
@@ -196,20 +204,30 @@ func (s *Session) previewActions(actions []ai.Action) string {
 }
 
 func (s *Session) confirmPending(ctx context.Context) (string, error) {
-	return s.ApprovePlan(ctx, "")
+	return s.approvePlan(ctx, "")
 }
 
 func (s *Session) cancelPending() (string, error) {
-	return s.RejectPlan("")
+	return s.rejectPlan("")
 }
 
 // PendingPlan returns a copy of the current plan so a UI cannot mutate the
 // engine-owned actions before approval.
-func (s *Session) PendingPlan() *PendingPlan { return clonePendingPlan(s.pendingPlan) }
+func (s *Session) PendingPlan() *PendingPlan {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return clonePendingPlan(s.pendingPlan)
+}
 
 // ApprovePlan applies the pending plan once. An empty ID preserves the legacy
 // /confirm command; external callers must use the plan ID they received.
 func (s *Session) ApprovePlan(ctx context.Context, planID string) (string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.approvePlan(ctx, planID)
+}
+
+func (s *Session) approvePlan(ctx context.Context, planID string) (string, error) {
 	if s.pendingPlan == nil {
 		return "There is no pending change to confirm.", nil
 	}
@@ -225,6 +243,12 @@ func (s *Session) ApprovePlan(ctx context.Context, planID string) (string, error
 
 // RejectPlan discards the pending plan. Plans cannot be approved after this.
 func (s *Session) RejectPlan(planID string) (string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.rejectPlan(planID)
+}
+
+func (s *Session) rejectPlan(planID string) (string, error) {
 	if s.pendingPlan == nil {
 		return "There is no pending change to cancel.", nil
 	}
@@ -295,13 +319,19 @@ func (s *Session) command(ctx context.Context, input string) (string, error) {
 }
 
 func (s *Session) Clear() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.history = s.history[:1]
 	s.pendingPlan = nil
 }
 
 // HasPendingActions is the UI contract for whether its approval controls are
 // valid. Keeping this state in Session avoids inferring it from model prose.
-func (s *Session) HasPendingActions() bool { return s.pendingPlan != nil }
+func (s *Session) HasPendingActions() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.pendingPlan != nil
+}
 
 func (s *Session) append(input, reply string) {
 	s.history = append(s.history, models.Message{Role: "user", Content: input}, models.Message{Role: "assistant", Content: reply})
