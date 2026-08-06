@@ -26,6 +26,7 @@ export class EngineClient extends EventEmitter {
     this.process = spawn(command, args, { stdio: ["pipe", "pipe", "pipe"] });
     this.lines = createInterface({ input: this.process.stdout });
     this.lines.on("line", (line) => this.handleLine(line));
+    this.process.stdin.on("error", (error) => this.close(new Error(`engine input failed: ${error.message}`)));
     this.process.stderr.on("data", (chunk: Buffer) => this.emit("diagnostic", chunk.toString()));
     this.process.once("error", (error) => this.close(new Error(`engine process failed: ${error.message}`)));
     this.process.once("exit", (code, signal) => {

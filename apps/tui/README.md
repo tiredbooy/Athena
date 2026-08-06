@@ -23,3 +23,17 @@ ATHENA_ENGINE=/path/to/athena npm start
 
 The Go process is always started with the `engine` argument. The legacy Go
 TUI remains the default `athena` experience until feature parity is reached.
+
+In a real terminal, drag across transcript text to copy it. Athena uses SGR
+mouse tracking and OSC 52, then clears the selection after the copy. Terminals
+without OSC 52 support may ignore the clipboard request.
+
+From the repository root, the automatic launcher is:
+
+```sh
+go run ./cmd/athena
+```
+
+Use `go run ./cmd/athena --legacy-tui` to force Bubble Tea, or
+`go run ./cmd/athena --tui` to require the built Ink app instead of falling
+back when it is unavailable.

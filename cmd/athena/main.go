@@ -23,6 +23,26 @@ import (
 
 func main() {
 	engineMode := len(os.Args) > 1 && os.Args[1] == "engine"
+	legacyMode := len(os.Args) > 1 && os.Args[1] == "--legacy-tui"
+	forceTypeScript := len(os.Args) > 1 && os.Args[1] == "--tui"
+	if !engineMode && !legacyMode {
+		started, err := launchTypeScriptTUI()
+		if started {
+			if err != nil {
+				fatal("run TypeScript TUI", err)
+			}
+			return
+		}
+		if forceTypeScript {
+			if err != nil {
+				fatal("start TypeScript TUI", err)
+			}
+			fatal("start TypeScript TUI", fmt.Errorf("built TUI entrypoint not found; run npm install && npm run build in apps/tui"))
+		}
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "warning: TypeScript TUI unavailable: %v; using legacy Go TUI\n", err)
+		}
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 3600*time.Second)
 	defer cancel()
 
