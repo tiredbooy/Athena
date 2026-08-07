@@ -53,6 +53,29 @@ func TestActivityEventOnlyExposesVaultRelativePaths(t *testing.T) {
 	}
 }
 
+func TestActionActivityIsShownAsExecution(t *testing.T) {
+	session := &Session{}
+	if got := session.activityEvent(`Creating note "Rumera"`); got.Phase != "executing" {
+		t.Fatalf("creating activity phase = %q, want executing", got.Phase)
+	}
+	if got := session.activityEvent(`Created note "Rumera"`); got.Phase != "executing" {
+		t.Fatalf("completed activity phase = %q, want executing", got.Phase)
+	}
+}
+
+func TestImplicitFolderCreationIsBlockedForRelationshipRequests(t *testing.T) {
+	actions := []ai.Action{{Type: "ensure_folders", Paths: []string{"invented"}}}
+	if warning := implicitFolderCreationWarning("remove the parent and connect this folder to work", actions); warning == "" {
+		t.Fatal("expected implicit folder creation warning")
+	}
+	if warning := implicitFolderCreationWarning("create a folder called work", actions); warning != "" {
+		t.Fatalf("explicit folder creation was blocked: %q", warning)
+	}
+	if warning := implicitFolderCreationWarning("create a note in books/reading/computer science", actions); warning != "" {
+		t.Fatalf("named note destination was blocked: %q", warning)
+	}
+}
+
 func TestHasPendingActionsReflectsSessionState(t *testing.T) {
 	session := &Session{}
 	if session.HasPendingActions() {

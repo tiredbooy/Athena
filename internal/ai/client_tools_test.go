@@ -21,6 +21,9 @@ func TestChatWithToolsSendsSchemaAndDecodesToolCall(t *testing.T) {
 		if request.Stream || len(request.Tools) != 1 || request.Tools[0].Function.Name != "list_folders" {
 			t.Fatalf("tool request = %+v", request)
 		}
+		if temperature, ok := request.Options["temperature"].(float64); !ok || temperature != 0.2 {
+			t.Fatalf("temperature option = %#v", request.Options["temperature"])
+		}
 		body, err := json.Marshal(map[string]any{
 			"message": map[string]any{
 				"role": "assistant",
@@ -45,6 +48,34 @@ func TestChatWithToolsSendsSchemaAndDecodesToolCall(t *testing.T) {
 	}
 	if len(response.ToolCalls) != 1 || response.ToolCalls[0].Function.Name != "list_folders" {
 		t.Fatalf("tool calls = %+v", response.ToolCalls)
+	}
+}
+
+func TestShouldThinkOnlyForReasoningModelNames(t *testing.T) {
+	for _, model := range []string{"qwen3:8b", "deepseek-r1:7b", "local-thinking-model"} {
+		if !shouldThink(model) {
+			t.Fatalf("shouldThink(%q) = false", model)
+		}
+	}
+	for _, model := range []string{"llama3.2:3b", "qwen2.5:7b"} {
+		if shouldThink(model) {
+			t.Fatalf("shouldThink(%q) = true", model)
+		}
+	}
+}
+
+func TestNativeToolSupportRejectsToollessTemplateEvenWhenAdvertised(t *testing.T) {
+	client := NewClient("http://ollama.test", "test-model", "test-embed")
+	client.http = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if r.URL.Path != "/api/show" {
+			t.Fatalf("path = %s, want /api/show", r.URL.Path)
+		}
+		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(`{"capabilities":["tools"],"template":"{{ .Prompt }}"}`)), Header: make(http.Header)}, nil
+	})}
+
+	support, err := client.NativeToolSupport(context.Background())
+	if err != nil || support.Available || support.Reason == "" {
+		t.Fatalf("support = %+v, err=%v", support, err)
 	}
 }
 

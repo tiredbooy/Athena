@@ -5,6 +5,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/tiredbooy/internal/agent"
 	"github.com/tiredbooy/internal/ai"
 )
 
@@ -30,6 +31,11 @@ type ActivityEvent struct {
 	Provider string `json:"provider,omitempty"`
 	Model    string `json:"model,omitempty"`
 	Path     string `json:"path,omitempty"`
+	RunID    string `json:"run_id,omitempty"`
+	Step     int    `json:"step,omitempty"`
+	Tool     string `json:"tool,omitempty"`
+	Target   string `json:"target,omitempty"`
+	State    string `json:"state,omitempty"`
 }
 
 // PendingPlan is the engine-owned, one-time approval target for write actions.
@@ -38,6 +44,8 @@ type PendingPlan struct {
 	ID        string      `json:"id"`
 	Actions   []ai.Action `json:"actions"`
 	CreatedAt time.Time   `json:"createdAt"`
+	run       *agent.RunState
+	lead      string
 }
 
 // SessionEvent is the stable application-facing event contract. The existing
@@ -57,16 +65,14 @@ type EventSink func(SessionEvent)
 // It is deliberately additive so the legacy UI keeps its established contract
 // while the new stdio engine is introduced.
 func (s *Session) SubmitWithEvents(ctx context.Context, input string, emit EventSink) (string, error) {
+	s.mu.Lock()
 	var beforeID string
-	if plan := s.PendingPlan(); plan != nil {
-		beforeID = plan.ID
+	if s.pendingPlan != nil {
+		beforeID = s.pendingPlan.ID
 	}
-
-	reply, err := s.Submit(ctx, input, func(message string) {
-		if emit != nil {
-			emit(SessionEvent{Type: EventActivity, Activity: s.activityEvent(message)})
-		}
-	}, nil)
+	reply, err := s.submit(ctx, input, runObserver{session: s, events: emit}, nil)
+	plan := clonePendingPlan(s.pendingPlan)
+	s.mu.Unlock()
 	if err != nil {
 		if emit != nil {
 			if ctx.Err() != nil {
@@ -79,7 +85,7 @@ func (s *Session) SubmitWithEvents(ctx context.Context, input string, emit Event
 	}
 
 	if emit != nil {
-		if plan := s.PendingPlan(); plan != nil && plan.ID != beforeID {
+		if plan != nil && plan.ID != beforeID {
 			emit(SessionEvent{Type: EventPlanReady, Plan: plan})
 		} else {
 			emit(SessionEvent{Type: EventResponse, Message: reply})
@@ -87,6 +93,52 @@ func (s *Session) SubmitWithEvents(ctx context.Context, input string, emit Event
 		emit(SessionEvent{Type: EventCompleted, Message: reply})
 	}
 	return reply, nil
+}
+
+// runObserver keeps legacy status callbacks and structured transport events in
+// sync. Agent events bypass text parsing; legacy operations are still adapted
+// through activityEvent until their APIs become structured too.
+type runObserver struct {
+	session *Session
+	status  func(string)
+	events  EventSink
+}
+
+func (o runObserver) statusMessage(message string) {
+	message = strings.TrimSpace(message)
+	if message == "" {
+		return
+	}
+	if o.status != nil {
+		o.status(message)
+	}
+	if o.events != nil {
+		activity := &ActivityEvent{Phase: "working", Message: message}
+		if o.session != nil {
+			activity = o.session.activityEvent(message)
+		}
+		o.events(SessionEvent{Type: EventActivity, Activity: activity})
+	}
+}
+
+func (o runObserver) agentSink() agent.EventSink {
+	if o.status == nil && o.events == nil {
+		return nil
+	}
+	return func(event agent.Event) {
+		if o.status != nil && strings.TrimSpace(event.Message) != "" {
+			o.status(event.Message)
+		}
+		if o.events == nil {
+			return
+		}
+		o.events(SessionEvent{Type: EventActivity, Activity: &ActivityEvent{
+			Phase: string(event.Phase), Message: event.Message,
+			Provider: event.Provider, Model: event.Model,
+			RunID: event.RunID, Step: event.Step, Tool: event.Tool,
+			Target: event.Target, State: event.State,
+		}})
+	}
 }
 
 func (s *Session) activityEvent(message string) *ActivityEvent {
@@ -106,7 +158,25 @@ func (s *Session) activityEvent(message string) *ActivityEvent {
 		activity.Phase = "provider_wait"
 		activity.Provider = s.loop.ai.Name()
 		activity.Model = s.loop.ai.ChatModel()
-	case strings.HasPrefix(lower, "executing "):
+	case strings.HasPrefix(lower, "executing ") ||
+		strings.HasPrefix(lower, "creating ") ||
+		strings.HasPrefix(lower, "editing ") ||
+		strings.HasPrefix(lower, "updating ") ||
+		strings.HasPrefix(lower, "moving ") ||
+		strings.HasPrefix(lower, "removing ") ||
+		strings.HasPrefix(lower, "restoring ") ||
+		strings.HasPrefix(lower, "archiving ") ||
+		strings.HasPrefix(lower, "unarchiving ") ||
+		strings.HasPrefix(lower, "preparing ") ||
+		strings.HasPrefix(lower, "linking ") ||
+		strings.HasPrefix(lower, "unlinking ") ||
+		strings.HasPrefix(lower, "finishing ") ||
+		strings.HasPrefix(lower, "running ") ||
+		strings.HasPrefix(lower, "could not ") ||
+		strings.HasPrefix(lower, "finished ") ||
+		strings.HasPrefix(lower, "created ") ||
+		strings.HasPrefix(lower, "updated ") ||
+		strings.HasPrefix(lower, "moved "):
 		activity.Phase = "executing"
 	}
 	return activity

@@ -115,7 +115,23 @@ func TestExtractActions_LinkFolders(t *testing.T) {
 	}
 }
 
-func TestExtractActions_NoFence(t *testing.T) {
+func TestExtractActions_UnlinkFolders(t *testing.T) {
+	raw := "```action\n" + `{"type":"disconnect_folders","folders":["work","hospital"]}` + "\n```"
+	_, found := ExtractActions(raw)
+	if len(found) != 1 || found[0].Type != "unlink_folders" || len(found[0].Folders) != 2 {
+		t.Fatalf("actions = %+v, want unlink_folders with two folders", found)
+	}
+}
+
+func TestExtractActions_BareJSON(t *testing.T) {
+	raw := `{"type":"create_note","title":"Standalone","content":"body"}`
+	cleaned, found := ExtractActions(raw)
+	if cleaned != "" || len(found) != 1 || found[0].Title != "Standalone" {
+		t.Fatalf("cleaned=%q actions=%+v", cleaned, found)
+	}
+}
+
+func TestExtractActions_DoesNotScrapeProse(t *testing.T) {
 	raw := "Just a normal reply with no tools."
 	cleaned, found := ExtractActions(raw)
 	if len(found) != 0 {

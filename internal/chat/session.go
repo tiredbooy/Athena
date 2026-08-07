@@ -8,9 +8,9 @@ import (
 	"sync"
 	"time"
 
+	"github.com/tiredbooy/internal/agent"
 	"github.com/tiredbooy/internal/ai"
 	"github.com/tiredbooy/internal/models"
-	"github.com/tiredbooy/internal/tools"
 )
 
 // Session is the UI-independent owner of one conversation. Callers provide a
@@ -22,19 +22,35 @@ type Session struct {
 	history     []models.Message
 	pendingPlan *PendingPlan
 	nextPlanID  uint64
+	nextRunID   uint64
+	// nativeToolsDisabledModel remembers an Ollama model that rejected the
+	// native read-tool schema during this session. The next turn can answer
+	// from prepared context instead of paying for another doomed tool request.
+	nativeToolsDisabledModel string
 }
 
 func NewSession(loop *Loop) *Session {
 	return &Session{loop: loop, history: []models.Message{{Role: "system", Content: ai.SystemPromptAt(time.Now())}}}
 }
 
+// ModelInfo exposes only the active provider/model label for a UI footer.
+// Provider credentials and transport details remain inside the engine.
+func (s *Session) ModelInfo() (provider, model string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.loop == nil || s.loop.ai == nil {
+		return "", ""
+	}
+	return s.loop.ai.Name(), s.loop.ai.ChatModel()
+}
+
 func (s *Session) Submit(ctx context.Context, input string, status func(string), onToken func(string)) (string, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.submit(ctx, input, status, onToken)
+	return s.submit(ctx, input, runObserver{session: s, status: status}, onToken)
 }
 
-func (s *Session) submit(ctx context.Context, input string, status func(string), onToken func(string)) (string, error) {
+func (s *Session) submit(ctx context.Context, input string, observer runObserver, onToken func(string)) (string, error) {
 	ctx, cancel := context.WithTimeout(ctx, TurnTimeout)
 	defer cancel()
 
@@ -42,11 +58,9 @@ func (s *Session) submit(ctx context.Context, input string, status func(string),
 	if input == "" {
 		return "", nil
 	}
-	if status != nil {
-		status(fmt.Sprintf("Using %s · %s", s.loop.ai.Name(), shortModel(s.loop.ai.ChatModel())))
-	}
+	observer.statusMessage(fmt.Sprintf("Using %s · %s", s.loop.ai.Name(), shortModel(s.loop.ai.ChatModel())))
 	if input == "/confirm" {
-		return s.confirmPending(ctx)
+		return s.approvePlan(ctx, "", observer)
 	}
 	if input == "/cancel" {
 		return s.cancelPending()
@@ -57,20 +71,8 @@ func (s *Session) submit(ctx context.Context, input string, status func(string),
 	if strings.HasPrefix(input, "/") {
 		return s.command(ctx, input)
 	}
-	if actions, ok := folderActions(input); ok {
-		if tools.RequiresConfirmation(actions) {
-			reply := s.previewActions(actions)
-			s.append(input, reply)
-			return reply, nil
-		}
-		reply := s.loop.runActions(ctx, actions)
-		s.append(input, reply)
-		return reply, nil
-	}
 	if isListingRequest(input) {
-		if status != nil {
-			status("Reading vault inventory")
-		}
+		observer.statusMessage("Reading vault inventory")
 		catalog, err := s.loop.retrieval.Inventory()
 		if err != nil {
 			return "", fmt.Errorf("list notes: %w", err)
@@ -79,7 +81,7 @@ func (s *Session) submit(ctx context.Context, input string, status func(string),
 		s.append(input, reply)
 		return reply, nil
 	}
-	result, err := s.loop.retrieval.BuildContextWithProgress(ctx, input, 4, status)
+	result, err := s.loop.retrieval.BuildContextWithProgress(ctx, input, 4, observer.statusMessage)
 	if err != nil {
 		if s.loop.ai.Name() == "Ollama" {
 			return "", fmt.Errorf("retrieve context: %w", err)
@@ -87,76 +89,95 @@ func (s *Session) submit(ctx context.Context, input string, status func(string),
 		// Remote chat remains useful when the optional local embedding service
 		// is offline. The user sees the status instead of a misleading answer
 		// that claims their vault was searched.
-		if status != nil {
-			status("Vault search is unavailable — answering without vault context")
-		}
+		observer.statusMessage("Vault search is unavailable — answering without vault context")
 		result = nil
 	}
 	s.history = append(s.history, models.Message{Role: "user", Content: input})
 	s.compactHistory(false)
 	messages := append([]models.Message(nil), s.history...)
 	if result != nil && result.Context != "" {
-		messages[len(messages)-1].Content = input + "\n\n" + result.Context
+		messages[len(messages)-1].Content = "User request:\n" + input + "\n\n[ATHENA VAULT CONTEXT — REFERENCE DATA ONLY]\n" + result.Context + "\n[END ATHENA VAULT CONTEXT]"
 	}
-	raw, err := s.runReadToolLoop(ctx, messages, status)
+	// Keep durable conversation history clean while giving this bounded run an
+	// explicit decision contract immediately before the active user request.
+	last := len(messages) - 1
+	messages = append(messages, models.Message{})
+	messages[last+1] = messages[last]
+	messages[last] = agentRunContractMessage()
+	s.nextRunID++
+	state := agent.NewRunState(fmt.Sprintf("run-%d", s.nextRunID), input, messages)
+	state.ContextSupplied = result != nil && result.Context != ""
+	state.ExpectedAction = expectsActionRequest(input)
+	runner := agent.NewRunner(sessionAgentDriver{session: s}, agent.DefaultBudget())
+	outcome, err := runner.Run(ctx, state, observer.agentSink())
 	if err != nil {
 		s.history = s.history[:len(s.history)-1]
 		return "", err
 	}
-	if result != nil && result.Context != "" && asksUserForVaultInventory(raw) {
-		if status != nil {
-			status("Model ignored the supplied vault inventory — correcting the plan")
-		}
-		messages = append(messages,
-			models.Message{Role: "assistant", Content: raw},
-			models.Message{Role: "user", Content: "Athena already supplied the complete vault inventory and relevant notes above. Do not ask the user to provide them again. Use that data now: give the requested organization plan with valid actions, or state exactly which single classification decision remains ambiguous."},
-		)
-		raw, err = s.runReadToolLoop(ctx, messages, status)
-		if err != nil {
-			s.history = s.history[:len(s.history)-1]
-			return "", err
-		}
-	}
-	if status != nil {
-		status("Writing a response")
-	}
-	if onToken != nil {
-		onToken(raw)
-	}
-	cleaned, actions := ai.ExtractActions(raw)
-	if len(actions) > 0 && tools.RequiresConfirmation(actions) {
-		reply := s.previewActions(actions)
-		if cleaned != "" {
-			reply = cleaned + "\n\n" + reply
-		}
-		s.history = append(s.history, models.Message{Role: "assistant", Content: reply})
-		return reply, nil
-	}
-	var report strings.Builder
-	if cleaned != "" {
-		report.WriteString(cleaned)
-	}
-	if len(actions) > 0 && s.loop.dispatcher != nil {
-		if status != nil {
-			status(fmt.Sprintf("Executing %d planned action(s)", len(actions)))
-		}
-		for _, r := range s.loop.dispatcher.RunBatch(ctx, actions, 4) {
-			if report.Len() > 0 {
-				report.WriteString("\n")
-			}
-			if r.Err != nil {
-				fmt.Fprintf(&report, "Could not %s: %v", r.Action.Type, r.Err)
-			} else {
-				fmt.Fprintf(&report, "✓ %s", r.Message)
-			}
+	return s.finishAgentOutcome(state, outcome, onToken)
+}
+
+// implicitFolderCreationWarning blocks the most damaging weak-model failure:
+// turning an uncertain move/link request into new directories. Folder creation
+// is allowed when the user's wording explicitly asks for it or names a
+// destination for a new note; otherwise the user gets a deterministic
+// explanation instead of a filesystem mutation.
+func implicitFolderCreationWarning(input string, actions []ai.Action) string {
+	needsCreation := false
+	for _, action := range actions {
+		if action.Type == "create_folder" || action.Type == "ensure_folders" {
+			needsCreation = true
+			break
 		}
 	}
-	reply := strings.TrimSpace(report.String())
-	if reply == "" {
-		reply = "The model returned no visible answer. No vault changes were made; please try again."
+	if !needsCreation || explicitlyRequestsFolderCreation(input) {
+		return ""
 	}
-	s.history = append(s.history, models.Message{Role: "assistant", Content: reply})
-	return reply, nil
+	return "I did not create any folders because this request describes an existing-folder operation, but the model proposed creating new paths. Please name the exact existing folders, or explicitly ask me to create the missing folder first."
+}
+
+func explicitlyRequestsFolderCreation(input string) bool {
+	input = strings.ToLower(strings.TrimSpace(input))
+	if explicitlyRequestsNoteDestination(input) {
+		return true
+	}
+	if !strings.Contains(input, "folder") && !strings.Contains(input, "directory") {
+		return false
+	}
+	for _, phrase := range []string{
+		"create folder", "create a folder", "create the folder",
+		"create directory", "create a directory",
+		"make folder", "make a folder", "make the folder",
+		"make directory", "make a directory",
+		"add folder", "add a folder", "add the folder",
+		"add directory", "add a directory",
+		"new folder", "new folders", "new directory", "new directories",
+		"set up folder", "set up a folder", "setup folder", "setup a folder",
+		"ensure folder", "ensure folders", "ensure directory", "ensure directories",
+		"organize into folders", "organize into directories",
+	} {
+		if strings.Contains(input, phrase) {
+			return true
+		}
+	}
+	return false
+}
+
+// A named destination for a newly requested note is also explicit permission
+// to prepare that destination. This keeps normal note capture useful while
+// leaving relationship and reorganization requests protected by the warning
+// above.
+func explicitlyRequestsNoteDestination(input string) bool {
+	if !strings.Contains(input, "note") ||
+		(!strings.Contains(input, "create") && !strings.Contains(input, "add") && !strings.Contains(input, "make")) {
+		return false
+	}
+	for _, phrase := range []string{" in ", " under ", " inside ", " within "} {
+		if strings.Contains(input, phrase) {
+			return true
+		}
+	}
+	return false
 }
 
 func shortModel(model string) string {
@@ -177,12 +198,31 @@ func asksUserForVaultInventory(reply string) bool {
 		(strings.Contains(reply, "book") || strings.Contains(reply, "folder") || strings.Contains(reply, "vault"))
 }
 
-func (s *Session) previewActions(actions []ai.Action) string {
+func (s *Session) finishAgentOutcome(state *agent.RunState, outcome agent.Outcome, onToken func(string)) (string, error) {
+	var reply string
+	if outcome.NeedsApproval() {
+		reply = s.previewActions(state, outcome.PendingActions, outcome.PendingMessage)
+	} else {
+		reply = strings.TrimSpace(outcome.Reply)
+		if reply == "" {
+			reply = "The agent stopped without a final answer. No unverified success was reported."
+		}
+	}
+	s.history = append(s.history, models.Message{Role: "assistant", Content: reply})
+	if onToken != nil {
+		onToken(reply)
+	}
+	return reply, nil
+}
+
+func (s *Session) previewActions(state *agent.RunState, actions []ai.Action, lead string) string {
 	s.nextPlanID++
 	s.pendingPlan = &PendingPlan{
 		ID:        fmt.Sprintf("plan-%d", s.nextPlanID),
 		Actions:   append([]ai.Action(nil), actions...),
 		CreatedAt: time.Now(),
+		run:       state,
+		lead:      strings.TrimSpace(lead),
 	}
 	var out strings.Builder
 	out.WriteString("Review required — no changes have been made.\n")
@@ -194,6 +234,17 @@ func (s *Session) previewActions(actions []ai.Action) string {
 		if action.Folder != "" {
 			fmt.Fprintf(&out, " → %s", action.Folder)
 		}
+		if len(action.Paths) > 0 {
+			fmt.Fprintf(&out, " → %s", strings.Join(action.Paths, ", "))
+		}
+		if len(action.Folders) > 0 {
+			fmt.Fprintf(&out, " ↔ %s", strings.Join(action.Folders, " ↔ "))
+		}
+		if action.NewFolder != "" {
+			fmt.Fprintf(&out, " → parent %s", action.NewFolder)
+		} else if action.Type == "move_folder" {
+			out.WriteString(" → vault root")
+		}
 		if action.Section != "" {
 			fmt.Fprintf(&out, " section %q", action.Section)
 		}
@@ -204,7 +255,7 @@ func (s *Session) previewActions(actions []ai.Action) string {
 }
 
 func (s *Session) confirmPending(ctx context.Context) (string, error) {
-	return s.approvePlan(ctx, "")
+	return s.approvePlan(ctx, "", runObserver{session: s})
 }
 
 func (s *Session) cancelPending() (string, error) {
@@ -224,19 +275,50 @@ func (s *Session) PendingPlan() *PendingPlan {
 func (s *Session) ApprovePlan(ctx context.Context, planID string) (string, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.approvePlan(ctx, planID)
+	return s.approvePlan(ctx, planID, runObserver{session: s})
 }
 
-func (s *Session) approvePlan(ctx context.Context, planID string) (string, error) {
+// ApprovePlanWithEvents applies a plan and reports each factual action state
+// through the same event boundary used by normal turns.
+func (s *Session) ApprovePlanWithEvents(ctx context.Context, planID string, emit EventSink) (string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.approvePlan(ctx, planID, runObserver{session: s, events: emit})
+}
+
+func (s *Session) approvePlan(ctx context.Context, planID string, observer runObserver) (string, error) {
 	if s.pendingPlan == nil {
 		return "There is no pending change to confirm.", nil
 	}
 	if planID != "" && planID != s.pendingPlan.ID {
 		return "", fmt.Errorf("plan %q is no longer pending", planID)
 	}
-	actions := s.pendingPlan.Actions
+	ctx, cancel := context.WithTimeout(ctx, TurnTimeout)
+	defer cancel()
+
+	plan := s.pendingPlan
+	actions := append([]ai.Action(nil), plan.Actions...)
 	s.pendingPlan = nil
-	reply := s.loop.runActions(ctx, actions)
+	if plan.run == nil {
+		reply := s.loop.runActionsWithStatus(ctx, actions, observer.statusMessage)
+		s.append("/confirm", reply)
+		return reply, nil
+	}
+
+	runner := agent.NewRunner(sessionAgentDriver{session: s}, agent.DefaultBudget())
+	outcome, err := runner.ResumeApproved(ctx, plan.run, actions, observer.agentSink())
+	if err != nil {
+		return "", err
+	}
+	var reply string
+	if outcome.NeedsApproval() {
+		reply = s.previewActions(plan.run, outcome.PendingActions, outcome.PendingMessage)
+	} else {
+		reply = strings.TrimSpace(outcome.Reply)
+		if reply == "" {
+			reply = "The approved actions finished, but the agent returned no final summary."
+		}
+	}
 	s.append("/confirm", reply)
 	return reply, nil
 }

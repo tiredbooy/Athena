@@ -3,6 +3,7 @@ package notes
 import (
 	"context"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 
@@ -23,6 +24,15 @@ func (s *Service) RenameNote(noteID int64, newTitle string) (*models.Note, error
 	newTitle = strings.TrimSpace(newTitle)
 	if newTitle == "" {
 		return nil, fmt.Errorf("new title is required")
+	}
+	if _, err := os.Stat(n.Path); err != nil {
+		if os.IsNotExist(err) {
+			if err := s.reconcileMissingNotePath(n); err != nil {
+				return nil, fmt.Errorf("locate source note before rename: %w", err)
+			}
+		} else {
+			return nil, fmt.Errorf("inspect source file before rename: %w", err)
+		}
 	}
 
 	folder := utils.RelVault(s.vaultPath, filepath.Dir(n.Path))

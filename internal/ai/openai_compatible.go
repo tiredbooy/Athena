@@ -20,7 +20,8 @@ import (
 type OpenAICompatibleProvider struct {
 	name, baseURL, apiKeyEnv string
 	mu                       sync.RWMutex
-	chatModel                string
+	chatModel, apiKey        string
+	tokenSource              func(context.Context) (string, error)
 	http                     *http.Client
 }
 
@@ -43,11 +44,45 @@ func (p *OpenAICompatibleProvider) SetChatModel(model string) {
 	p.chatModel = strings.TrimSpace(model)
 }
 
+func (p *OpenAICompatibleProvider) SetAPIKey(key string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.apiKey = strings.TrimSpace(key)
+}
+
+// SetTokenSource lets OAuth-backed OpenAI-compatible providers supply a fresh
+// bearer token for every request without coupling this wire-format adapter to
+// a particular provider's authorization protocol.
+func (p *OpenAICompatibleProvider) SetTokenSource(source func(context.Context) (string, error)) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.tokenSource = source
+}
+
 func (p *OpenAICompatibleProvider) authorize(req *http.Request) error {
+	p.mu.RLock()
+	key := p.apiKey
+	tokenSource := p.tokenSource
+	p.mu.RUnlock()
+	if tokenSource != nil {
+		token, err := tokenSource(req.Context())
+		if err != nil {
+			return err
+		}
+		if strings.TrimSpace(token) == "" {
+			return fmt.Errorf("provider %q returned an empty OAuth access token", p.name)
+		}
+		req.Header.Set("Authorization", "Bearer "+token)
+		return nil
+	}
+	if key != "" {
+		req.Header.Set("Authorization", "Bearer "+key)
+		return nil
+	}
 	if p.apiKeyEnv == "" {
 		return nil
 	}
-	key := strings.TrimSpace(os.Getenv(p.apiKeyEnv))
+	key = strings.TrimSpace(os.Getenv(p.apiKeyEnv))
 	if key == "" {
 		return fmt.Errorf("provider %q needs environment variable %s", p.name, p.apiKeyEnv)
 	}

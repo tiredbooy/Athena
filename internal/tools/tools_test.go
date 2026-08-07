@@ -62,6 +62,28 @@ func TestRunBatchFallsBackToSequentialActionsWithoutIDs(t *testing.T) {
 	}
 }
 
+func TestRunReportsActionProgress(t *testing.T) {
+	d := NewDispatcher()
+	d.Register("record", func(_ context.Context, action ai.Action) (string, error) {
+		return "recorded " + action.Title, nil
+	})
+	var progress []ActionProgress
+	ctx := WithActionProgress(context.Background(), func(update ActionProgress) {
+		progress = append(progress, update)
+	})
+
+	result := d.Run(ctx, []ai.Action{{Type: "record", Title: "Rumera"}})[0]
+	if result.Err != nil {
+		t.Fatalf("result = %+v", result)
+	}
+	if len(progress) != 2 || progress[0].State != "started" || progress[1].State != "completed" {
+		t.Fatalf("progress = %+v, want started then completed", progress)
+	}
+	if progress[0].Action.Title != "Rumera" || progress[1].Message != "recorded Rumera" {
+		t.Fatalf("progress payload = %+v", progress)
+	}
+}
+
 func TestRunRejectsInvalidActionBeforeHandler(t *testing.T) {
 	d := NewDispatcher()
 	called := false
@@ -76,6 +98,56 @@ func TestRunRejectsInvalidActionBeforeHandler(t *testing.T) {
 	}
 	if called {
 		t.Fatal("handler ran despite failed preflight validation")
+	}
+}
+
+func TestRunRejectsNoteFilePathInFolderFieldBeforeHandler(t *testing.T) {
+	d := NewDispatcher()
+	called := false
+	d.Register("move_note", func(_ context.Context, _ ai.Action) (string, error) {
+		called = true
+		return "moved", nil
+	})
+
+	result := d.Run(context.Background(), []ai.Action{{
+		Type:   "move_note",
+		NoteID: 7,
+		Folder: "books/reading/designing-data-intensive-applications.md",
+	}})[0]
+	want := `move_note folder must be a folder path, not a note file path "books/reading/designing-data-intensive-applications.md"`
+	if result.Err == nil || result.Error != want {
+		t.Fatalf("result = %+v, want %q", result, want)
+	}
+	if called {
+		t.Fatal("handler ran despite invalid folder semantics")
+	}
+}
+
+func TestRunRejectsUnsafeGraphNodeSize(t *testing.T) {
+	d := NewDispatcher()
+	d.Register("set_graph_node_size", func(_ context.Context, _ ai.Action) (string, error) {
+		t.Fatal("handler ran despite invalid node size")
+		return "", nil
+	})
+
+	result := d.Run(context.Background(), []ai.Action{{Type: "set_graph_node_size", NodeSizeMultiplier: 4}})[0]
+	if result.Err == nil || result.Error != "set_graph_node_size requires node_size_multiplier between 0.25 and 3" {
+		t.Fatalf("result = %+v", result)
+	}
+}
+
+func TestValidateChecksPlansWithoutRunningHandlers(t *testing.T) {
+	d := NewDispatcher()
+	d.Register("create_note", func(_ context.Context, _ ai.Action) (string, error) {
+		t.Fatal("validation must not run handlers")
+		return "", nil
+	})
+
+	if err := d.Validate([]ai.Action{{Type: "create_note", Title: "Plan"}}); err != nil {
+		t.Fatalf("valid plan rejected: %v", err)
+	}
+	if err := d.Validate([]ai.Action{{Type: "create_note", Folder: "notes.md", Title: "Plan"}}); err == nil {
+		t.Fatal("invalid note-file folder was accepted")
 	}
 }
 
@@ -149,6 +221,9 @@ func TestPolicyDeclaresReadRetryAndDestructiveConfirmation(t *testing.T) {
 	}
 	if RequiresConfirmation([]ai.Action{{Type: "list_folders"}, {Type: "folder_exists"}}) {
 		t.Fatal("read-only batch should not require confirmation")
+	}
+	if !RequiresConfirmation([]ai.Action{{Type: "ensure_folders", Paths: []string{"projects"}}}) {
+		t.Fatal("folder creation should require confirmation")
 	}
 }
 

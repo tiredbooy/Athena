@@ -24,14 +24,16 @@ type Client struct {
 
 	mu          sync.RWMutex
 	inferenceMu sync.Mutex
+	toolSupport map[string]NativeToolSupport
 }
 
 func NewClient(host, chatModel, embedModel string) *Client {
 	return &Client{
-		host:       host,
-		chatModel:  chatModel,
-		embedModel: embedModel,
-		http:       &http.Client{},
+		host:        host,
+		chatModel:   chatModel,
+		embedModel:  embedModel,
+		http:        &http.Client{},
+		toolSupport: make(map[string]NativeToolSupport),
 	}
 }
 
@@ -213,6 +215,111 @@ func (c *Client) ChatWithTools(ctx context.Context, messages []models.Message, t
 	return result.Message, err
 }
 
+// NativeToolSupport inspects the local model manifest once per model. Ollama
+// can advertise a tools capability while a custom template still omits
+// {{ .Tools }}; sending native tools to that combination wastes one complete
+// inference before the application can fall back to plain planning chat.
+func (c *Client) NativeToolSupport(ctx context.Context) (NativeToolSupport, error) {
+	model := c.ChatModel()
+	c.mu.RLock()
+	cached, ok := c.toolSupport[model]
+	c.mu.RUnlock()
+	if ok {
+		return cached, nil
+	}
+
+	probeCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+	body, err := json.Marshal(map[string]string{"name": model})
+	if err != nil {
+		return NativeToolSupport{}, fmt.Errorf("encode model tool support request: %w", err)
+	}
+	req, err := http.NewRequestWithContext(probeCtx, http.MethodPost, c.host+"/api/show", bytes.NewReader(body))
+	if err != nil {
+		return NativeToolSupport{}, fmt.Errorf("build model tool support request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return NativeToolSupport{}, fmt.Errorf("query model tool support: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return NativeToolSupport{}, fmt.Errorf("query model tool support: status %d", resp.StatusCode)
+	}
+	var shown struct {
+		Capabilities []string `json:"capabilities"`
+		Template     string   `json:"template"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&shown); err != nil {
+		return NativeToolSupport{}, fmt.Errorf("decode model tool support: %w", err)
+	}
+	support := NativeToolSupport{Reason: "model does not advertise native tools"}
+	for _, capability := range shown.Capabilities {
+		if strings.EqualFold(capability, "tools") {
+			support.Available = true
+			break
+		}
+	}
+	if support.Available && !strings.Contains(shown.Template, ".Tools") {
+		support.Available = false
+		support.Reason = "model template does not render tool definitions"
+	}
+	if support.Available {
+		support.Reason = ""
+	}
+	c.mu.Lock()
+	c.toolSupport[model] = support
+	c.mu.Unlock()
+	return support, nil
+}
+
+// CreativeText performs a short, no-tools completion for presentation text.
+// It is intentionally separate from action planning so a more expressive
+// title cannot make note IDs, paths, or action fields less reliable.
+func (c *Client) CreativeText(ctx context.Context, messages []models.Message, temperature float64) (string, error) {
+	c.inferenceMu.Lock()
+	defer c.inferenceMu.Unlock()
+
+	model := c.ChatModel()
+	body, err := json.Marshal(models.MessageReq{
+		Model:     model,
+		Messages:  messages,
+		Stream:    false,
+		Think:     false,
+		KeepAlive: "60s",
+		Options: map[string]any{
+			"temperature": temperature,
+			"top_p":       0.95,
+		},
+	})
+	if err != nil {
+		return "", fmt.Errorf("marshal creative text request: %w", err)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.host+"/api/chat", bytes.NewReader(body))
+	if err != nil {
+		return "", fmt.Errorf("build creative text request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("call ollama creative text (model %q pulled?): %w", model, err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		return "", fmt.Errorf("ollama creative text returned status %d: %s", resp.StatusCode, strings.TrimSpace(string(b)))
+	}
+	var out chatResponse
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return "", fmt.Errorf("decode creative text response: %w", err)
+	}
+	if strings.TrimSpace(out.Message.Content) == "" {
+		return "", fmt.Errorf("model returned no creative text")
+	}
+	return strings.TrimSpace(out.Message.Content), nil
+}
+
 func (c *Client) ChatWithToolsResult(ctx context.Context, messages []models.Message, tools []models.ToolDefinition) (ToolChatResult, error) {
 	c.inferenceMu.Lock()
 	defer c.inferenceMu.Unlock()
@@ -223,8 +330,9 @@ func (c *Client) ChatWithToolsResult(ctx context.Context, messages []models.Mess
 		Messages:  messages,
 		Tools:     tools,
 		Stream:    false,
-		Think:     false,
+		Think:     shouldThink(model),
 		KeepAlive: "60s",
+		Options:   localChatOptions(),
 	})
 	if err != nil {
 		return ToolChatResult{}, fmt.Errorf("marshal tool chat request: %w", err)
@@ -283,8 +391,9 @@ func (c *Client) StreamChatWith(ctx context.Context, messages []models.Message, 
 		Model:     model,
 		Messages:  messages,
 		Stream:    true,
-		Think:     false,
+		Think:     shouldThink(model),
 		KeepAlive: "60s",
+		Options:   localChatOptions(),
 	})
 	if err != nil {
 		return "", fmt.Errorf("marshal chat request: %w", err)
@@ -333,6 +442,29 @@ func (c *Client) StreamChatWith(ctx context.Context, messages []models.Message, 
 		return "", fmt.Errorf("model %q produced no visible response", model)
 	}
 	return full.String(), nil
+}
+
+// shouldThink opts into Ollama's private reasoning channel only for models
+// whose names indicate support for it. Older chat models may reject or ignore
+// the field, while Qwen3/DeepSeek-style models can become substantially more
+// reliable on multi-step vault tasks when they get a reasoning pass.
+func shouldThink(model string) bool {
+	model = strings.ToLower(model)
+	for _, marker := range []string{"thinking", "reasoning", "qwen3", "deepseek-r1", "deepseek-v3"} {
+		if strings.Contains(model, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+func localChatOptions() map[string]any {
+	return map[string]any{
+		// Low variance helps small models preserve exact IDs, paths, and JSON
+		// fields. The model still gets private reasoning when supported.
+		"temperature": 0.2,
+		"top_p":       0.9,
+	}
 }
 
 func (c *Client) Embed(ctx context.Context, text string) ([]float32, error) {

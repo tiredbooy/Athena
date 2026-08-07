@@ -1,7 +1,9 @@
 package notes
 
 import (
+	"encoding/json"
 	"fmt"
+	"hash/fnv"
 	"io/fs"
 	"os"
 	"path"
@@ -72,6 +74,9 @@ func (s *Service) SyncFolderGraph() error {
 			return err
 		}
 	}
+	if err := s.syncTopLevelFolderColors(folders); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -102,7 +107,7 @@ func renderFolderIndex(folder string, childFolders, linkedFolders []string, note
 		body.WriteString("\n")
 	}
 	if len(childFolders) > 0 {
-		body.WriteString("\n## Categories\n")
+		body.WriteString("\n## Subfolders\n")
 		for _, child := range childFolders {
 			body.WriteString("- ")
 			body.WriteString(wikiLink(child, folderName(child)))
@@ -128,6 +133,292 @@ func renderFolderIndex(folder string, childFolders, linkedFolders []string, note
 	}
 	body.WriteString("\n<!-- Managed by Athena: folder graph index -->\n")
 	return parser.RenderMarkdown(parser.Frontmatter{Title: name, AthenaIndex: true, LinkedFolders: linkedFolders}, strings.TrimSpace(body.String()))
+}
+
+// syncTopLevelFolderColors adds stable Obsidian graph color groups for the
+// generated index note of each top-level folder. It only appends missing
+// groups, so existing Obsidian settings and user-defined color groups remain
+// untouched. A query targets "work.md", not the whole work subtree, so the
+// colored orb represents the folder node itself.
+func (s *Service) syncTopLevelFolderColors(folders []string) error {
+	topLevel := make([]string, 0, len(folders))
+	for _, folder := range folders {
+		if path.Dir(folder) != "." {
+			continue
+		}
+		topLevel = append(topLevel, folder)
+	}
+	return s.syncFolderColors(topLevel)
+}
+
+// AddFolderGraphColors gives one real folder and, optionally, only its direct
+// children stable colors in Obsidian's graph. It never overwrites an existing
+// color group, including groups the user created themselves.
+func (s *Service) AddFolderGraphColors(folder string, includeChildren bool) ([]string, error) {
+	clean, err := utils.CleanFolder(folder)
+	if err != nil {
+		return nil, err
+	}
+	if clean == "" || isManagedFolder(clean) {
+		return nil, fmt.Errorf("invalid folder %q", folder)
+	}
+	exists, err := utils.FolderExists(s.vaultPath, clean)
+	if err != nil {
+		return nil, fmt.Errorf("check folder: %w", err)
+	}
+	if !exists {
+		return nil, fmt.Errorf("folder %q does not exist", clean)
+	}
+	if err := s.SyncFolderGraph(); err != nil {
+		return nil, err
+	}
+
+	colored, err := s.folderColorTargets(clean, includeChildren)
+	if err != nil {
+		return nil, err
+	}
+	if err := s.syncFolderColors(colored); err != nil {
+		return nil, err
+	}
+	return colored, nil
+}
+
+// VerifyFolderGraphColors confirms that the requested folder index nodes have
+// durable color groups. It keeps verification of Obsidian settings inside the
+// notes domain instead of making the application layer parse graph.json.
+func (s *Service) VerifyFolderGraphColors(folder string, includeChildren bool) error {
+	clean, err := utils.CleanFolder(folder)
+	if err != nil {
+		return err
+	}
+	if clean == "" || isManagedFolder(clean) {
+		return fmt.Errorf("invalid folder %q", folder)
+	}
+	targets, err := s.folderColorTargets(clean, includeChildren)
+	if err != nil {
+		return err
+	}
+
+	raw, err := os.ReadFile(filepath.Join(s.vaultPath, ".obsidian", "graph.json"))
+	if err != nil {
+		return fmt.Errorf("read Obsidian graph settings: %w", err)
+	}
+	var settings struct {
+		ColorGroups []struct {
+			Query string          `json:"query"`
+			Color json.RawMessage `json:"color"`
+		} `json:"colorGroups"`
+	}
+	if err := json.Unmarshal(raw, &settings); err != nil {
+		return fmt.Errorf("parse Obsidian graph settings: %w", err)
+	}
+	known := make(map[string]graphColor, len(settings.ColorGroups))
+	for _, group := range settings.ColorGroups {
+		var color graphColor
+		if err := json.Unmarshal(group.Color, &color); err == nil && color.Valid() {
+			known[group.Query] = color
+		}
+	}
+	for _, target := range targets {
+		query := graphPathQuery(target + ".md")
+		if !known[query].Valid() {
+			return fmt.Errorf("color group for folder %q is missing", target)
+		}
+	}
+	return nil
+}
+
+// SetGraphNodeSizeMultiplier changes Obsidian's native, graph-wide node size.
+// Per-folder node sizes are not supported by the core Graph view; that needs a
+// graph plugin rather than an unreliable private-file convention.
+func (s *Service) SetGraphNodeSizeMultiplier(multiplier float64) error {
+	if !validGraphNodeSize(multiplier) {
+		return fmt.Errorf("node size multiplier must be between 0.25 and 3")
+	}
+	settingsPath, raw, settings, err := s.loadGraphSettings()
+	if err != nil {
+		return err
+	}
+	settings["nodeSizeMultiplier"] = json.RawMessage(mustJSON(multiplier))
+	return saveGraphSettings(settingsPath, raw, settings)
+}
+
+func (s *Service) VerifyGraphNodeSizeMultiplier(multiplier float64) error {
+	if !validGraphNodeSize(multiplier) {
+		return fmt.Errorf("node size multiplier must be between 0.25 and 3")
+	}
+	_, _, settings, err := s.loadGraphSettings()
+	if err != nil {
+		return err
+	}
+	var saved float64
+	if err := json.Unmarshal(settings["nodeSizeMultiplier"], &saved); err != nil {
+		return fmt.Errorf("read saved node size multiplier: %w", err)
+	}
+	if saved != multiplier {
+		return fmt.Errorf("node size multiplier is %g, want %g", saved, multiplier)
+	}
+	return nil
+}
+
+func validGraphNodeSize(value float64) bool {
+	return value >= 0.25 && value <= 3
+}
+
+func (s *Service) folderColorTargets(folder string, includeChildren bool) ([]string, error) {
+	exists, err := utils.FolderExists(s.vaultPath, folder)
+	if err != nil {
+		return nil, fmt.Errorf("check folder: %w", err)
+	}
+	if !exists {
+		return nil, fmt.Errorf("folder %q does not exist", folder)
+	}
+
+	targets := []string{folder}
+	if includeChildren {
+		folders, err := utils.ListFolders(s.vaultPath)
+		if err != nil {
+			return nil, fmt.Errorf("list child folders: %w", err)
+		}
+		for _, candidate := range visibleFolders(folders) {
+			if path.Dir(candidate) == folder {
+				targets = append(targets, candidate)
+			}
+		}
+	}
+	sort.Strings(targets)
+	return targets, nil
+}
+
+func (s *Service) syncFolderColors(folders []string) error {
+	queries := make(map[string]graphColor, len(folders))
+	for _, folder := range folders {
+		indexPath := folder + ".md"
+		queries[graphPathQuery(indexPath)] = graphColorForFolder(folder)
+	}
+	if len(queries) == 0 {
+		return nil
+	}
+
+	settingsPath, raw, settings, err := s.loadGraphSettings()
+	if err != nil {
+		return err
+	}
+
+	var groups []map[string]json.RawMessage
+	if encoded, ok := settings["colorGroups"]; ok && len(encoded) > 0 && string(encoded) != "null" {
+		if err := json.Unmarshal(encoded, &groups); err != nil {
+			return fmt.Errorf("parse Obsidian graph color groups: %w", err)
+		}
+	}
+	knownGroups := make(map[string]int, len(groups))
+	for index, group := range groups {
+		var query string
+		if err := json.Unmarshal(group["query"], &query); err == nil {
+			knownGroups[query] = index
+		}
+	}
+	for query, color := range queries {
+		index, exists := knownGroups[query]
+		if exists && validGraphColor(groups[index]["color"]) {
+			continue
+		}
+		if exists {
+			// Athena previously wrote a CSS color string, which Obsidian rejects.
+			// Repair only malformed settings; a valid user-selected color wins.
+			groups[index]["color"] = json.RawMessage(mustJSON(color))
+			continue
+		}
+		groups = append(groups, map[string]json.RawMessage{
+			"query": json.RawMessage(mustJSON(query)),
+			"color": json.RawMessage(mustJSON(color)),
+		})
+	}
+	sort.SliceStable(groups, func(i, j int) bool {
+		var left, right string
+		_ = json.Unmarshal(groups[i]["query"], &left)
+		_ = json.Unmarshal(groups[j]["query"], &right)
+		return left < right
+	})
+	encodedGroups, err := json.Marshal(groups)
+	if err != nil {
+		return fmt.Errorf("encode Obsidian graph color groups: %w", err)
+	}
+	settings["colorGroups"] = encodedGroups
+	return saveGraphSettings(settingsPath, raw, settings)
+}
+
+func (s *Service) loadGraphSettings() (string, []byte, map[string]json.RawMessage, error) {
+	settingsPath := filepath.Join(s.vaultPath, ".obsidian", "graph.json")
+	raw, err := os.ReadFile(settingsPath)
+	settings := make(map[string]json.RawMessage)
+	if err == nil {
+		if err := json.Unmarshal(raw, &settings); err != nil {
+			return "", nil, nil, fmt.Errorf("parse Obsidian graph settings: %w", err)
+		}
+	} else if !os.IsNotExist(err) {
+		return "", nil, nil, fmt.Errorf("read Obsidian graph settings: %w", err)
+	}
+	return settingsPath, raw, settings, nil
+}
+
+func saveGraphSettings(settingsPath string, raw []byte, settings map[string]json.RawMessage) error {
+	encodedSettings, err := json.MarshalIndent(settings, "", "  ")
+	if err != nil {
+		return fmt.Errorf("encode Obsidian graph settings: %w", err)
+	}
+	encodedSettings = append(encodedSettings, '\n')
+	if string(raw) == string(encodedSettings) {
+		return nil
+	}
+	if err := os.MkdirAll(filepath.Dir(settingsPath), 0o755); err != nil {
+		return fmt.Errorf("create Obsidian settings directory: %w", err)
+	}
+	if err := os.WriteFile(settingsPath, encodedSettings, 0o644); err != nil {
+		return fmt.Errorf("write Obsidian graph settings: %w", err)
+	}
+	return nil
+}
+
+func graphPathQuery(indexPath string) string {
+	if strings.ContainsAny(indexPath, " \t") {
+		return `path:"` + strings.ReplaceAll(indexPath, `"`, `\"`) + `"`
+	}
+	return "path:" + indexPath
+}
+
+type graphColor struct {
+	Alpha float64 `json:"a"`
+	RGB   int     `json:"rgb"`
+}
+
+func (c graphColor) Valid() bool {
+	return c.Alpha > 0 && c.Alpha <= 1 && c.RGB >= 0 && c.RGB <= 0xFFFFFF
+}
+
+func validGraphColor(raw json.RawMessage) bool {
+	var color graphColor
+	return json.Unmarshal(raw, &color) == nil && color.Valid()
+}
+
+func graphColorForFolder(folder string) graphColor {
+	palette := []int{
+		0xE67E22,
+		0x3498DB,
+		0x9B59B6,
+		0x2ECC71,
+		0xE74C3C,
+		0x1ABC9C,
+		0xF1C40F,
+	}
+	hash := fnv.New32a()
+	_, _ = hash.Write([]byte(folder))
+	return graphColor{Alpha: 1, RGB: palette[int(hash.Sum32())%len(palette)]}
+}
+
+func mustJSON(value any) string {
+	encoded, _ := json.Marshal(value)
+	return string(encoded)
 }
 
 func (s *Service) readFolderLinks(folder string, knownFolders []string) ([]string, error) {

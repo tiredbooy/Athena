@@ -23,21 +23,52 @@ const (
 
 func readToolDefinitions() []models.ToolDefinition {
 	return []models.ToolDefinition{
+		toolDefinition("propose_actions", "Submit the smallest validated vault action plan needed for the current goal. This proposes work only; Athena validates, approves, executes, and verifies it outside the model.", objectSchema(
+			map[string]any{
+				"summary": stringSchema("Short user-facing description of the proposed work; do not claim it already happened"),
+				"actions": map[string]any{"type": "array", "items": proposalActionSchema(), "minItems": 1},
+			}, []string{"actions"})),
 		toolDefinition("search_notes", "Search note content semantically. Returns matching note IDs and excerpts.", objectSchema(
 			map[string]any{"query": stringSchema("What to search for"), "limit": integerSchema("Maximum results, 1-8")}, []string{"query"})),
 		toolDefinition("get_note", "Read the full current content of one note by its note_id.", objectSchema(
 			map[string]any{"note_id": integerSchema("The note ID from inventory or a previous search")}, []string{"note_id"})),
 		toolDefinition("list_notes", "List notes, optionally limited to a folder or task status. Returns metadata, not full content.", objectSchema(
 			map[string]any{"folder": stringSchema("Optional vault-relative folder"), "status": stringSchema("Optional task status: open, done, or any"), "limit": integerSchema("Maximum results, 1-8")}, nil)),
-		toolDefinition("list_folders", "List the current vault folder tree.", objectSchema(nil, nil)),
+		toolDefinition("list_folders", "List the authoritative vault folder tree, including each folder's existing parent, children, and explicit graph links.", objectSchema(nil, nil)),
 		toolDefinition("find_notes_by_title", "Find notes by a case-insensitive title fragment. Use this before guessing a note ID.", objectSchema(
 			map[string]any{"query": stringSchema("Title words to match"), "limit": integerSchema("Maximum results, 1-8")}, []string{"query"})),
 		toolDefinition("get_notes", "Read up to eight notes by ID in one call.", objectSchema(map[string]any{"note_ids": map[string]any{"type": "array", "items": integerSchema("Note ID")}}, []string{"note_ids"})),
-		toolDefinition("get_note_by_path", "Read a note by its vault-relative Markdown path.", objectSchema(map[string]any{"path": stringSchema("For example books/foundation.md")}, []string{"path"})),
+		toolDefinition("get_note_by_path", "Read a note by its vault-relative Markdown path.", objectSchema(map[string]any{"path": stringSchema("For example projects/example.md")}, []string{"path"})),
 		toolDefinition("list_tags", "List tags and their note counts.", objectSchema(nil, nil)),
 		toolDefinition("get_note_links", "Get a note's direct outgoing links and backlinks.", objectSchema(map[string]any{"note_id": integerSchema("Note ID")}, []string{"note_id"})),
 		toolDefinition("find_duplicate_titles", "Find potentially duplicate notes by normalized title.", objectSchema(nil, nil)),
 		toolDefinition("get_daily_note", "Read a daily note at daily/YYYY-MM-DD.md; omit date for today.", objectSchema(map[string]any{"date": stringSchema("Optional ISO date YYYY-MM-DD")}, nil)),
+	}
+}
+
+func proposalActionSchema() map[string]any {
+	return map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"id":                   stringSchema("Optional unique ID within this action batch"),
+			"depends_on":           map[string]any{"type": "array", "items": map[string]any{"type": "string"}},
+			"type":                 stringSchema("One valid Athena action type from the system instructions"),
+			"note_id":              integerSchema("Existing note ID resolved from inventory or read tools"),
+			"title":                stringSchema("Note title or new title"),
+			"content":              stringSchema("Note content"),
+			"section":              stringSchema("Heading for replace_section"),
+			"expected_content":     stringSchema("Exact previously-read section body for replace_section"),
+			"tags":                 map[string]any{"type": "array", "items": map[string]any{"type": "string"}},
+			"folder":               stringSchema("Vault-relative folder path"),
+			"include_children":     map[string]any{"type": "boolean"},
+			"node_size_multiplier": map[string]any{"type": "number", "minimum": 0.25, "maximum": 3},
+			"new_folder":           stringSchema("New folder name or destination parent, depending on action type"),
+			"paths":                map[string]any{"type": "array", "items": map[string]any{"type": "string"}},
+			"folders":              map[string]any{"type": "array", "items": map[string]any{"type": "string"}},
+			"done":                 map[string]any{"type": "boolean"},
+			"isbn":                 stringSchema("Optional ISBN for create_book"),
+		},
+		"required": []string{"type"},
 	}
 }
 
@@ -61,33 +92,65 @@ func integerSchema(description string) map[string]any {
 	return map[string]any{"type": "integer", "description": description}
 }
 
+type modelLoopResult struct {
+	Content   string
+	Messages  []models.Message
+	ReadCalls int
+}
+
 func (s *Session) runReadToolLoop(ctx context.Context, messages []models.Message, status func(string)) (string, error) {
+	result, err := s.runReadToolLoopState(ctx, messages, status)
+	return result.Content, err
+}
+
+func (s *Session) runReadToolLoopState(ctx context.Context, messages []models.Message, status func(string)) (modelLoopResult, error) {
+	messages = append([]models.Message(nil), messages...)
 	tools := readToolDefinitions()
+	if s.loop.ai.Name() == "Ollama" && s.nativeToolsDisabledModel == s.loop.ai.ChatModel() {
+		return s.runPlainChatState(ctx, messages)
+	}
+	if supportProvider, ok := s.loop.ai.(ai.NativeToolSupportProvider); ok {
+		support, err := supportProvider.NativeToolSupport(ctx)
+		if err == nil && !support.Available {
+			s.nativeToolsDisabledModel = s.loop.ai.ChatModel()
+			if status != nil {
+				status("Native tools unavailable (" + support.Reason + ") — using prepared vault context")
+			}
+			return s.runPlainChatState(ctx, messages)
+		}
+	}
 	continuations := 0
+	readCalls := 0
+	seenReads := make(map[string]bool)
 	var partialResponses []string
 	for round := 0; round < maxReadToolRounds; round++ {
 		response, err := s.chatWithRetry(ctx, messages, tools, status)
 		if err != nil {
 			// Some local models can emit Athena action blocks but reject Ollama's
 			// native tools schema. Keep the turn useful without bypassing dispatch.
-			if round == 0 && s.loop.ai.Name() == "Ollama" {
-				if status != nil {
-					status("Tool mode was rejected — retrying normal chat with the same model")
+			if round == 0 && s.loop.ai.Name() == "Ollama" && isNativeToolRejection(err) {
+				s.nativeToolsDisabledModel = s.loop.ai.ChatModel()
+				if ctx.Err() != nil {
+					return modelLoopResult{}, fmt.Errorf("Ollama native tools timed out before fallback; retrying the model without tools next turn")
 				}
-				fallback, fallbackErr := s.loop.ai.ChatWithToolsResult(ctx, messages, nil)
+				if status != nil {
+					status("Native tools were rejected — answering with prepared vault context")
+				}
+				fallback, fallbackErr := s.runPlainChatResult(ctx, messages)
 				if fallbackErr == nil && strings.TrimSpace(fallback.Message.Content) != "" {
-					return fallback.Message.Content, nil
+					messages = append(messages, fallback.Message)
+					return modelLoopResult{Content: strings.TrimSpace(fallback.Message.Content), Messages: messages, ReadCalls: readCalls}, nil
 				}
 				if fallbackErr == nil {
 					fallbackErr = fmt.Errorf("model returned no visible response")
 				}
-				return "", fmt.Errorf("Ollama rejected native tools, then normal chat failed: %w", fallbackErr)
+				return modelLoopResult{}, fmt.Errorf("Ollama native tools were rejected and fallback chat failed: %w", fallbackErr)
 			}
-			return "", err
+			return modelLoopResult{}, err
 		}
 		if len(response.Message.ToolCalls) == 0 {
 			if strings.TrimSpace(response.Message.Content) == "" {
-				return "", fmt.Errorf("model returned neither an answer nor a tool call")
+				return modelLoopResult{}, fmt.Errorf("model returned neither an answer nor a tool call")
 			}
 			if isIncompleteDoneReason(response.DoneReason) && continuations < maxAutoContinues {
 				continuations++
@@ -100,10 +163,24 @@ func (s *Session) runReadToolLoop(ctx context.Context, messages []models.Message
 				continue
 			}
 			partialResponses = append(partialResponses, response.Message.Content)
-			return strings.TrimSpace(strings.Join(partialResponses, "\n\n")), nil
+			content := strings.TrimSpace(strings.Join(partialResponses, "\n\n"))
+			response.Message.Content = content
+			messages = append(messages, response.Message)
+			return modelLoopResult{Content: content, Messages: messages, ReadCalls: readCalls}, nil
 		}
 		if len(response.Message.ToolCalls) > maxReadToolLimit {
-			return "", fmt.Errorf("model requested %d read tools at once; safety limit is %d", len(response.Message.ToolCalls), maxReadToolLimit)
+			return modelLoopResult{}, fmt.Errorf("model requested %d read tools at once; safety limit is %d", len(response.Message.ToolCalls), maxReadToolLimit)
+		}
+		proposal, hasProposal := proposedActionContent(response.Message)
+		if hasProposal && onlyActionProposals(response.Message.ToolCalls) {
+			// Do not retain an unresolved native tool call in provider history.
+			// Convert it to Athena's provider-neutral action representation; the
+			// agent runner will validate and execute it through the dispatcher.
+			decisionMessage := response.Message
+			decisionMessage.ToolCalls = nil
+			decisionMessage.Content = proposal
+			messages = append(messages, decisionMessage)
+			return modelLoopResult{Content: proposal, Messages: messages, ReadCalls: readCalls}, nil
 		}
 
 		messages = append(messages, response.Message)
@@ -116,12 +193,39 @@ func (s *Session) runReadToolLoop(ctx context.Context, messages []models.Message
 			// The queue is application-owned: every accepted call is completed
 			// before Athena asks the model to plan another turn.
 			for _, call := range calls[start:end] {
+				if call.Function.Name == "propose_actions" {
+					messages = append(messages, models.Message{
+						Role: "tool", ToolName: call.Function.Name, ToolCallID: call.ID,
+						Content: "Proposal not accepted in this read step. Use the read results, then return one updated valid actions array.",
+					})
+					continue
+				}
+				if readCalls >= maxReadToolLimit {
+					messages = append(messages, models.Message{
+						Role: "tool", ToolName: call.Function.Name, ToolCallID: call.ID,
+						Content: fmt.Sprintf("Read budget exhausted after %d calls. Use the facts already returned.", maxReadToolLimit),
+					})
+					continue
+				}
+				signature := readCallSignature(call)
+				if seenReads[signature] {
+					messages = append(messages, models.Message{
+						Role: "tool", ToolName: call.Function.Name, ToolCallID: call.ID,
+						Content: "Duplicate read skipped. The result of this exact call is already present above; use it instead of requesting it again.",
+					})
+					continue
+				}
+				seenReads[signature] = true
+				readCalls++
 				if status != nil {
 					status(readToolActivity(call))
 				}
 				content := s.executeReadTool(ctx, call)
 				messages = append(messages, models.Message{Role: "tool", ToolName: call.Function.Name, ToolCallID: call.ID, Content: content})
 			}
+		}
+		if readCalls >= maxReadToolLimit {
+			break
 		}
 	}
 	// A weak model can keep requesting the same read tools forever. Do not make
@@ -133,12 +237,84 @@ func (s *Session) runReadToolLoop(ctx context.Context, messages []models.Message
 	messages = append(messages, models.Message{Role: "user", Content: "You have enough vault results. Answer the user now using the tool results already provided. Do not request more tools."})
 	final, err := s.loop.ai.ChatWithToolsResult(ctx, messages, nil)
 	if err != nil {
-		return "", fmt.Errorf("finish after read limit: %w", err)
+		return modelLoopResult{}, fmt.Errorf("finish after read limit: %w", err)
 	}
 	if strings.TrimSpace(final.Message.Content) == "" {
-		return "", fmt.Errorf("model exceeded the %d-round read-tool limit without a final answer", maxReadToolRounds)
+		return modelLoopResult{}, fmt.Errorf("model exceeded the %d-round read-tool limit without a final answer", maxReadToolRounds)
 	}
-	return final.Message.Content, nil
+	messages = append(messages, final.Message)
+	return modelLoopResult{Content: strings.TrimSpace(final.Message.Content), Messages: messages, ReadCalls: readCalls}, nil
+}
+
+func proposedActionContent(message models.Message) (string, bool) {
+	var actions []ai.Action
+	for _, call := range message.ToolCalls {
+		if call.Function.Name != "propose_actions" {
+			continue
+		}
+		_, proposed := ai.ExtractActions(string(call.Function.Arguments))
+		actions = append(actions, proposed...)
+	}
+	if len(actions) == 0 {
+		return "", false
+	}
+	raw, err := json.Marshal(actions)
+	if err != nil {
+		return "", false
+	}
+	content := strings.TrimSpace(message.Content)
+	if content != "" {
+		content += "\n\n"
+	}
+	content += "```action\n" + string(raw) + "\n```"
+	return content, true
+}
+
+func onlyActionProposals(calls []models.ToolCall) bool {
+	if len(calls) == 0 {
+		return false
+	}
+	for _, call := range calls {
+		if call.Function.Name != "propose_actions" {
+			return false
+		}
+	}
+	return true
+}
+
+func readCallSignature(call models.ToolCall) string {
+	arguments := strings.TrimSpace(string(call.Function.Arguments))
+	var compact any
+	if json.Unmarshal(call.Function.Arguments, &compact) == nil {
+		if raw, err := json.Marshal(compact); err == nil {
+			arguments = string(raw)
+		}
+	}
+	return strings.TrimSpace(call.Function.Name) + ":" + arguments
+}
+
+func (s *Session) runPlainChat(ctx context.Context, messages []models.Message, status func(string)) (string, error) {
+	result, err := s.runPlainChatState(ctx, messages)
+	if err != nil {
+		return "", err
+	}
+	return result.Content, nil
+}
+
+func (s *Session) runPlainChatState(ctx context.Context, messages []models.Message) (modelLoopResult, error) {
+	response, err := s.runPlainChatResult(ctx, messages)
+	if err != nil {
+		return modelLoopResult{}, err
+	}
+	if strings.TrimSpace(response.Message.Content) == "" {
+		return modelLoopResult{}, fmt.Errorf("model returned no visible response")
+	}
+	messages = append(append([]models.Message(nil), messages...), response.Message)
+	return modelLoopResult{Content: strings.TrimSpace(response.Message.Content), Messages: messages}, nil
+}
+
+func (s *Session) runPlainChatResult(ctx context.Context, messages []models.Message) (ai.ToolChatResult, error) {
+	return s.loop.ai.ChatWithToolsResult(ctx, messages, nil)
 }
 
 func readToolActivity(call models.ToolCall) string {
@@ -195,6 +371,22 @@ func retryableModelError(err error) bool {
 	return strings.Contains(text, "call ollama tools") || strings.Contains(text, "status 500") || strings.Contains(text, "status 502") || strings.Contains(text, "status 503") || strings.Contains(text, "status 504")
 }
 
+func isNativeToolRejection(err error) bool {
+	text := strings.ToLower(err.Error())
+	if strings.Contains(text, "context deadline") || strings.Contains(text, "deadline exceeded") {
+		return false
+	}
+	if !strings.Contains(text, "tool") {
+		return false
+	}
+	return strings.Contains(text, "unsupported") ||
+		strings.Contains(text, "not support") ||
+		strings.Contains(text, "unknown field") ||
+		strings.Contains(text, "function calling") ||
+		strings.Contains(text, "status 400") ||
+		strings.Contains(text, "status 422")
+}
+
 func isIncompleteDoneReason(reason string) bool {
 	reason = strings.ToLower(strings.TrimSpace(reason))
 	return strings.Contains(reason, "length") || strings.Contains(reason, "context")
@@ -205,7 +397,11 @@ func compactContinuationMessages(messages []models.Message, partial models.Messa
 	goal := ""
 	for i := len(messages) - 1; i >= 0; i-- {
 		if messages[i].Role == "user" {
-			goal = strings.Split(messages[i].Content, "\n\nVault inventory")[0]
+			goal = messages[i].Content
+			if marker := strings.Index(goal, "\n\n[ATHENA VAULT CONTEXT"); marker >= 0 {
+				goal = goal[:marker]
+			}
+			goal = strings.TrimPrefix(goal, "User request:\n")
 			break
 		}
 	}
@@ -245,7 +441,7 @@ func (s *Session) executeReadTool(ctx context.Context, call models.ToolCall) str
 	case "list_notes":
 		result, err = filterCatalog(s.loop.retrieval, optionalString(arguments, "folder"), optionalString(arguments, "status"), limit)
 	case "list_folders":
-		result, err = s.loop.retrieval.Folders()
+		result, err = s.loop.retrieval.FolderInventory()
 	case "find_notes_by_title":
 		query, parseErr := requiredString(arguments, "query")
 		if parseErr != nil {

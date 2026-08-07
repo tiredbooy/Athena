@@ -19,7 +19,7 @@ import (
 type AnthropicProvider struct {
 	name, baseURL, keyEnv string
 	mu                    sync.RWMutex
-	model                 string
+	model, apiKey         string
 	http                  *http.Client
 }
 
@@ -32,6 +32,11 @@ func (p *AnthropicProvider) SetChatModel(model string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.model = strings.TrimSpace(model)
+}
+func (p *AnthropicProvider) SetAPIKey(key string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.apiKey = strings.TrimSpace(key)
 }
 func (p *AnthropicProvider) ChatModels(context.Context) ([]ModelInfo, error) {
 	return []ModelInfo{{Name: "claude-sonnet-4-5"}, {Name: "claude-opus-4-5"}, {Name: "claude-haiku-4-5"}}, nil
@@ -47,7 +52,12 @@ func (p *AnthropicProvider) StreamChatWith(ctx context.Context, messages []model
 	return result.Message.Content, nil
 }
 func (p *AnthropicProvider) ChatWithToolsResult(ctx context.Context, messages []models.Message, definitions []models.ToolDefinition) (ToolChatResult, error) {
-	key := strings.TrimSpace(os.Getenv(p.keyEnv))
+	p.mu.RLock()
+	key := p.apiKey
+	p.mu.RUnlock()
+	if key == "" {
+		key = strings.TrimSpace(os.Getenv(p.keyEnv))
+	}
 	if key == "" {
 		return ToolChatResult{}, fmt.Errorf("provider %q needs environment variable %s", p.name, p.keyEnv)
 	}

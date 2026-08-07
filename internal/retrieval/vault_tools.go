@@ -5,15 +5,32 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/tiredbooy/internal/models"
 	"github.com/tiredbooy/internal/parser"
 	"github.com/tiredbooy/internal/utils"
 )
 
+// NoteView is the transport-safe read representation of a note. Storage
+// keeps absolute paths internally, but the model only needs a vault-relative
+// path and the note's content/metadata to answer the user.
+type NoteView struct {
+	ID        int64           `json:"id"`
+	Title     string          `json:"title"`
+	Path      string          `json:"path"`
+	Content   string          `json:"content"`
+	Type      models.NoteType `json:"type"`
+	Done      bool            `json:"done,omitempty"`
+	Archived  bool            `json:"archived,omitempty"`
+	Trashed   bool            `json:"trashed,omitempty"`
+	CreatedAt time.Time       `json:"created_at"`
+	UpdatedAt time.Time       `json:"updated_at"`
+}
+
 // NoteByRelativePath resolves a vault-relative Markdown path through the index;
 // it never accepts an absolute or parent-traversing filesystem path.
-func (s *Service) NoteByRelativePath(rel string) (*models.Note, error) {
+func (s *Service) NoteByRelativePath(rel string) (*NoteView, error) {
 	rel = filepath.ToSlash(strings.TrimSpace(rel))
 	if rel == "" || strings.HasPrefix(rel, "/") || strings.Contains(rel, "..") {
 		return nil, fmt.Errorf("path must be a vault-relative note path")
@@ -27,17 +44,21 @@ func (s *Service) NoteByRelativePath(rel string) (*models.Note, error) {
 	}
 	for _, entry := range catalog {
 		if entry.Rel == rel {
-			return s.noteStore.GetByID(entry.ID)
+			note, err := s.noteStore.GetByID(entry.ID)
+			if err != nil || note == nil {
+				return nil, err
+			}
+			return s.noteView(note), nil
 		}
 	}
 	return nil, nil
 }
 
-func (s *Service) NotesByID(ids []int64) ([]*models.Note, error) {
+func (s *Service) NotesByID(ids []int64) ([]*NoteView, error) {
 	if len(ids) == 0 || len(ids) > 8 {
 		return nil, fmt.Errorf("note_ids must contain 1 to 8 IDs")
 	}
-	out := make([]*models.Note, 0, len(ids))
+	out := make([]*NoteView, 0, len(ids))
 	seen := map[int64]bool{}
 	for _, id := range ids {
 		if id <= 0 || seen[id] {
@@ -49,10 +70,25 @@ func (s *Service) NotesByID(ids []int64) ([]*models.Note, error) {
 			return nil, err
 		}
 		if note != nil {
-			out = append(out, note)
+			out = append(out, s.noteView(note))
 		}
 	}
 	return out, nil
+}
+
+func (s *Service) noteView(note *models.Note) *NoteView {
+	return &NoteView{
+		ID:        note.ID,
+		Title:     note.Title,
+		Path:      utils.RelVault(s.vaultPath, note.Path),
+		Content:   note.Content,
+		Type:      note.Type,
+		Done:      note.Done,
+		Archived:  note.Archived,
+		Trashed:   note.TrashedFrom != "",
+		CreatedAt: note.CreatedAt,
+		UpdatedAt: note.UpdatedAt,
+	}
 }
 
 func (s *Service) Tags() (map[string]int, error) {

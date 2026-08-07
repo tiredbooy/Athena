@@ -1,6 +1,7 @@
 package ai
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
@@ -24,6 +25,7 @@ const (
 	codexOAuthClientID = "app_EMoamEEZ73f0CkXaXp7hrann"
 	codexOAuthIssuer   = "https://auth.openai.com"
 	codexRedirectURI   = "http://localhost:1455/auth/callback"
+	codexDeviceURL     = codexOAuthIssuer + "/codex/device"
 )
 
 // CodexCredentials are OAuth tokens for the ChatGPT/Codex subscription flow.
@@ -50,6 +52,10 @@ func LoadCodexOAuth() (*CodexOAuth, error) {
 	}
 	raw, err := os.ReadFile(path)
 	if os.IsNotExist(err) {
+		credentials, cliErr := loadCodexCLICredentials()
+		if cliErr == nil {
+			o.credentials = credentials
+		}
 		return o, nil
 	}
 	if err != nil {
@@ -59,6 +65,205 @@ func LoadCodexOAuth() (*CodexOAuth, error) {
 		return nil, fmt.Errorf("parse OpenAI subscription credentials: %w", err)
 	}
 	return o, nil
+}
+
+func loadCodexCLICredentials() (CodexCredentials, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return CodexCredentials{}, err
+	}
+	raw, err := os.ReadFile(filepath.Join(home, ".codex", "auth.json"))
+	if err != nil {
+		return CodexCredentials{}, fmt.Errorf("read Codex login credentials: %w", err)
+	}
+	var auth struct {
+		Tokens struct {
+			AccessToken  string `json:"access_token"`
+			RefreshToken string `json:"refresh_token"`
+			IDToken      string `json:"id_token"`
+			AccountID    string `json:"account_id"`
+		} `json:"tokens"`
+	}
+	if err := json.Unmarshal(raw, &auth); err != nil {
+		return CodexCredentials{}, fmt.Errorf("parse Codex login credentials: %w", err)
+	}
+	if auth.Tokens.AccessToken == "" || auth.Tokens.RefreshToken == "" {
+		return CodexCredentials{}, fmt.Errorf("Codex is not signed in with a ChatGPT account")
+	}
+	account := auth.Tokens.AccountID
+	if account == "" {
+		account = accountID(auth.Tokens.IDToken)
+	}
+	expires := jwtExpiry(auth.Tokens.AccessToken)
+	if expires == 0 {
+		expires = time.Now().Add(5 * time.Minute).Unix()
+	}
+	return CodexCredentials{AccessToken: auth.Tokens.AccessToken, RefreshToken: auth.Tokens.RefreshToken, ExpiresAt: expires, AccountID: account}, nil
+}
+
+func jwtExpiry(token string) int64 {
+	parts := strings.Split(token, ".")
+	if len(parts) != 3 {
+		return 0
+	}
+	raw, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		return 0
+	}
+	var claims struct {
+		ExpiresAt int64 `json:"exp"`
+	}
+	if json.Unmarshal(raw, &claims) != nil {
+		return 0
+	}
+	return claims.ExpiresAt
+}
+
+// RunDeviceLogin uses OpenAI's Codex device authorization flow directly. It
+// works locally and over SSH without requiring a separately installed Codex
+// binary: Athena shows the URL/code, opens a browser when possible, then waits
+// for OpenAI to confirm the user's approval.
+func (o *CodexOAuth) RunDeviceLogin(ctx context.Context, onLine func(string)) error {
+	body, _ := json.Marshal(map[string]string{"client_id": codexOAuthClientID})
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, codexOAuthIssuer+"/api/accounts/deviceauth/usercode", bytes.NewReader(body))
+	if err != nil {
+		return fmt.Errorf("build OpenAI device login request: %w", err)
+	}
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Accept", "application/json")
+	request.Header.Set("User-Agent", "athena/1")
+	response, err := o.http.Do(request)
+	if err != nil {
+		return fmt.Errorf("start OpenAI device login: %w", err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		return codexOAuthStatusError("device login", response)
+	}
+	var device struct {
+		DeviceAuthID string       `json:"device_auth_id"`
+		UserCode     string       `json:"user_code"`
+		Interval     oauthSeconds `json:"interval"`
+	}
+	if err := json.NewDecoder(response.Body).Decode(&device); err != nil {
+		return fmt.Errorf("decode OpenAI device login: %w", err)
+	}
+	if device.DeviceAuthID == "" || device.UserCode == "" {
+		return fmt.Errorf("OpenAI device login returned no authorization code")
+	}
+	if onLine != nil {
+		onLine(fmt.Sprintf("Open %s and enter code: %s", codexDeviceURL, device.UserCode))
+	}
+	if o.openBrowser != nil {
+		_ = o.openBrowser(codexDeviceURL)
+	}
+	intervalSeconds := int64(device.Interval)
+	if intervalSeconds < 1 {
+		intervalSeconds = 5
+	}
+	interval := time.Duration(intervalSeconds)*time.Second + 3*time.Second
+	deadline := time.Now().Add(10 * time.Minute)
+	attempts := 0
+	for time.Now().Before(deadline) {
+		credentials, pending, err := o.pollDeviceLogin(ctx, device.DeviceAuthID, device.UserCode)
+		if err != nil {
+			return err
+		}
+		if !pending {
+			o.mu.Lock()
+			defer o.mu.Unlock()
+			return o.save(credentials)
+		}
+		attempts++
+		if attempts%3 == 0 && onLine != nil {
+			onLine("Still waiting for OpenAI approval…")
+		}
+		if err := waitForContext(ctx, minDuration(interval, time.Until(deadline))); err != nil {
+			return err
+		}
+	}
+	return fmt.Errorf("OpenAI device authorization timed out; start /connect again")
+}
+
+func (o *CodexOAuth) pollDeviceLogin(ctx context.Context, deviceAuthID, userCode string) (CodexCredentials, bool, error) {
+	body, _ := json.Marshal(map[string]string{"device_auth_id": deviceAuthID, "user_code": userCode})
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, codexOAuthIssuer+"/api/accounts/deviceauth/token", bytes.NewReader(body))
+	if err != nil {
+		return CodexCredentials{}, false, fmt.Errorf("build OpenAI device approval request: %w", err)
+	}
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Accept", "application/json")
+	request.Header.Set("User-Agent", "athena/1")
+	response, err := o.http.Do(request)
+	if err != nil {
+		return CodexCredentials{}, false, fmt.Errorf("poll OpenAI device approval: %w", err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode == http.StatusForbidden || response.StatusCode == http.StatusNotFound {
+		return CodexCredentials{}, true, nil
+	}
+	if response.StatusCode != http.StatusOK {
+		return CodexCredentials{}, false, codexOAuthStatusError("device approval", response)
+	}
+	var approval struct {
+		AuthorizationCode string `json:"authorization_code"`
+		CodeVerifier      string `json:"code_verifier"`
+	}
+	if err := json.NewDecoder(response.Body).Decode(&approval); err != nil {
+		return CodexCredentials{}, false, fmt.Errorf("decode OpenAI device approval: %w", err)
+	}
+	credentials, err := o.exchangeDeviceCode(ctx, approval.AuthorizationCode, approval.CodeVerifier)
+	return credentials, false, err
+}
+
+func (o *CodexOAuth) exchangeDeviceCode(ctx context.Context, code, verifier string) (CodexCredentials, error) {
+	if code == "" || verifier == "" {
+		return CodexCredentials{}, fmt.Errorf("OpenAI device approval response was incomplete")
+	}
+	form := url.Values{
+		"grant_type":    {"authorization_code"},
+		"code":          {code},
+		"redirect_uri":  {codexOAuthIssuer + "/deviceauth/callback"},
+		"client_id":     {codexOAuthClientID},
+		"code_verifier": {verifier},
+	}
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, codexOAuthIssuer+"/oauth/token", strings.NewReader(form.Encode()))
+	if err != nil {
+		return CodexCredentials{}, fmt.Errorf("build OpenAI device token exchange: %w", err)
+	}
+	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	response, err := o.http.Do(request)
+	if err != nil {
+		return CodexCredentials{}, fmt.Errorf("exchange OpenAI device token: %w", err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		return CodexCredentials{}, codexOAuthStatusError("device token exchange", response)
+	}
+	var token tokenResponse
+	if err := json.NewDecoder(response.Body).Decode(&token); err != nil {
+		return CodexCredentials{}, fmt.Errorf("decode OpenAI device token: %w", err)
+	}
+	if token.AccessToken == "" || token.RefreshToken == "" {
+		return CodexCredentials{}, fmt.Errorf("OpenAI device token response was incomplete")
+	}
+	expiresIn := token.ExpiresIn
+	if expiresIn <= 0 {
+		expiresIn = 3600
+	}
+	return CodexCredentials{
+		AccessToken: token.AccessToken, RefreshToken: token.RefreshToken,
+		ExpiresAt: time.Now().Add(time.Duration(expiresIn) * time.Second).Unix(), AccountID: accountID(token.IDToken),
+	}, nil
+}
+
+func codexOAuthStatusError(operation string, response *http.Response) error {
+	body, _ := io.ReadAll(io.LimitReader(response.Body, 2048))
+	detail := strings.TrimSpace(string(body))
+	if detail == "" {
+		return fmt.Errorf("OpenAI %s failed with status %d", operation, response.StatusCode)
+	}
+	return fmt.Errorf("OpenAI %s failed with status %d: %s", operation, response.StatusCode, detail)
 }
 
 // Start opens a localhost callback listener, launches the default browser when
@@ -212,19 +417,15 @@ func (o *CodexOAuth) exchange(ctx context.Context, code, verifier string) (Codex
 	return CodexCredentials{AccessToken: token.AccessToken, RefreshToken: token.RefreshToken, ExpiresAt: time.Now().Add(time.Duration(token.ExpiresIn) * time.Second).Unix(), AccountID: accountID(token.IDToken)}, nil
 }
 func (o *CodexOAuth) save(credentials CodexCredentials) error {
-	o.credentials = credentials
 	path, err := codexCredentialsPath()
 	if err != nil {
 		return err
 	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-		return err
+	if err := writeOwnerOnlyJSON(path, credentials); err != nil {
+		return fmt.Errorf("save OpenAI subscription credentials: %w", err)
 	}
-	raw, err := json.Marshal(credentials)
-	if err != nil {
-		return err
-	}
-	return os.WriteFile(path, raw, 0o600)
+	o.credentials = credentials
+	return nil
 }
 func codexCredentialsPath() (string, error) {
 	home, err := os.UserHomeDir()

@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -62,9 +63,14 @@ func main() {
 
 	noteStore := storage.NewNoteStore(db)
 	chunkStore := storage.NewChunkStore(db)
+	credentialStore, err := config.LoadCredentialStore()
+	if err != nil {
+		fatal("load provider credentials", err)
+	}
 
 	client := ai.NewClient(cfg.OllamaHost, cfg.ChatModel, cfg.EmbedModel)
-	if cfg.ActiveProvider == "" || cfg.ActiveProvider == "ollama" {
+	usesLocalEmbeddings := cfg.EmbeddingProvider.Type != "openai_compatible"
+	if usesLocalEmbeddings || cfg.ActiveProvider == "" || cfg.ActiveProvider == "ollama" {
 		if err := client.EnsureRunning(ctx); err != nil {
 			fatal("start ollama", err)
 		}
@@ -93,14 +99,28 @@ func main() {
 	if err != nil {
 		fatal("load OpenAI subscription credentials", err)
 	}
+	xaiOAuth, err := ai.LoadXAIOAuth()
+	if err != nil {
+		fatal("load xAI subscription credentials", err)
+	}
 	providers := map[string]ai.ChatProvider{"ollama": client}
 	for _, provider := range cfg.Providers {
 		if provider.Type == "openai_codex" {
 			providers[providerID(provider.Name)] = ai.NewCodexProvider(oauth, provider.ChatModel)
+		} else if provider.Type == "xai_oauth" {
+			connected := ai.NewOpenAICompatibleProvider(provider.Name, provider.BaseURL, "", provider.ChatModel)
+			connected.SetTokenSource(xaiOAuth.AccessToken)
+			providers[providerID(provider.Name)] = connected
 		} else if provider.Type == "anthropic" {
-			providers[providerID(provider.Name)] = ai.NewAnthropicProvider(provider.Name, provider.BaseURL, provider.APIKeyEnv, provider.ChatModel)
+			id := providerID(provider.Name)
+			connected := ai.NewAnthropicProvider(provider.Name, provider.BaseURL, provider.APIKeyEnv, provider.ChatModel)
+			connected.SetAPIKey(credentialStore.APIKey(id))
+			providers[id] = connected
 		} else {
-			providers[providerID(provider.Name)] = ai.NewOpenAICompatibleProvider(provider.Name, provider.BaseURL, provider.APIKeyEnv, provider.ChatModel)
+			id := providerID(provider.Name)
+			connected := ai.NewOpenAICompatibleProvider(provider.Name, provider.BaseURL, provider.APIKeyEnv, provider.ChatModel)
+			connected.SetAPIKey(credentialStore.APIKey(id))
+			providers[id] = connected
 		}
 	}
 	activeProvider := providers[cfg.ActiveProvider]
@@ -108,6 +128,8 @@ func main() {
 		activeProvider = client
 	}
 	loop := chat.NewLoop(activeProvider, providers, oauth, retrievalSvc, dispatcher, cfg)
+	loop.SetCredentialStore(credentialStore)
+	loop.SetXAIOAuth(xaiOAuth)
 	session := chat.NewSession(loop)
 	if engineMode {
 		if err := stdio.Serve(ctx, os.Stdin, os.Stdout, session); err != nil {
@@ -160,10 +182,11 @@ func buildDispatcher(notesSvc *notes.Service, bookResolver *books.Resolver) *too
 		if err != nil {
 			return "", err
 		}
+		path := utils.RelVault(notesSvc.VaultPath(), n.Path)
 		if !created {
-			return fmt.Sprintf("Note %q already exists at %s (left unchanged)", n.Title, n.Path), nil
+			return fmt.Sprintf("Note %q already exists at %s (left unchanged)", n.Title, path), nil
 		}
-		return fmt.Sprintf("Created note %q at %s", n.Title, n.Path), nil
+		return fmt.Sprintf("Created note %q at %s", n.Title, path), nil
 	})
 
 	d.Register("create_task", func(ctx context.Context, a ai.Action) (string, error) {
@@ -171,10 +194,11 @@ func buildDispatcher(notesSvc *notes.Service, bookResolver *books.Resolver) *too
 		if err != nil {
 			return "", err
 		}
+		path := utils.RelVault(notesSvc.VaultPath(), n.Path)
 		if !created {
-			return fmt.Sprintf("Task %q already exists at %s (left unchanged)", n.Title, n.Path), nil
+			return fmt.Sprintf("Task %q already exists at %s (left unchanged)", n.Title, path), nil
 		}
-		return fmt.Sprintf("Created task %q at %s", n.Title, n.Path), nil
+		return fmt.Sprintf("Created task %q at %s", n.Title, path), nil
 	})
 
 	d.Register("create_book", func(ctx context.Context, a ai.Action) (string, error) {
@@ -186,8 +210,9 @@ func buildDispatcher(notesSvc *notes.Service, bookResolver *books.Resolver) *too
 		if err != nil {
 			return "", err
 		}
+		path := utils.RelVault(notesSvc.VaultPath(), n.Path)
 		if !created {
-			return fmt.Sprintf("Book %q already exists at %s (left unchanged)", n.Title, n.Path), nil
+			return fmt.Sprintf("Book %q already exists at %s (left unchanged)", n.Title, path), nil
 		}
 		if metadata.Source == "unresolved" {
 			return fmt.Sprintf("Created book %q. Its metadata is unknown; Athena did not guess.", n.Title), nil
@@ -221,7 +246,7 @@ func buildDispatcher(notesSvc *notes.Service, bookResolver *books.Resolver) *too
 		if err != nil {
 			return "", err
 		}
-		return fmt.Sprintf("Moved note %q to %s", n.Title, n.Path), nil
+		return fmt.Sprintf("Moved note %q to %s", n.Title, utils.RelVault(notesSvc.VaultPath(), n.Path)), nil
 	})
 
 	d.Register("update_note", func(ctx context.Context, a ai.Action) (string, error) {
@@ -276,6 +301,29 @@ func buildDispatcher(notesSvc *notes.Service, bookResolver *books.Resolver) *too
 			return "", err
 		}
 		return fmt.Sprintf("Linked folders in Obsidian: %s", strings.Join(folders, ", ")), nil
+	})
+
+	d.Register("unlink_folders", func(_ context.Context, a ai.Action) (string, error) {
+		folders, err := notesSvc.UnlinkFolders(a.Folders)
+		if err != nil {
+			return "", err
+		}
+		return fmt.Sprintf("Unlinked folders in Obsidian: %s", strings.Join(folders, ", ")), nil
+	})
+
+	d.Register("set_folder_colors", func(_ context.Context, a ai.Action) (string, error) {
+		folders, err := notesSvc.AddFolderGraphColors(a.Folder, a.IncludeChildren)
+		if err != nil {
+			return "", err
+		}
+		return fmt.Sprintf("Added stable Obsidian graph colors for: %s", strings.Join(folders, ", ")), nil
+	})
+
+	d.Register("set_graph_node_size", func(_ context.Context, a ai.Action) (string, error) {
+		if err := notesSvc.SetGraphNodeSizeMultiplier(a.NodeSizeMultiplier); err != nil {
+			return "", err
+		}
+		return fmt.Sprintf("Set the Obsidian graph node size to %.2gx", a.NodeSizeMultiplier), nil
 	})
 
 	d.Register("list_folders", func(_ context.Context, _ ai.Action) (string, error) {
@@ -342,7 +390,7 @@ func buildDispatcher(notesSvc *notes.Service, bookResolver *books.Resolver) *too
 		if err != nil {
 			return "", err
 		}
-		return fmt.Sprintf("Duplicated note %d as %q at %s", a.NoteID, n.Title, n.Path), nil
+		return fmt.Sprintf("Duplicated note %d as %q at %s", a.NoteID, n.Title, utils.RelVault(notesSvc.VaultPath(), n.Path)), nil
 	})
 
 	d.Register("trash_note", func(_ context.Context, a ai.Action) (string, error) {
@@ -396,10 +444,10 @@ func buildDispatcher(notesSvc *notes.Service, bookResolver *books.Resolver) *too
 
 func registerWriteVerifiers(d *tools.Dispatcher, notesSvc *notes.Service) {
 	for _, actionType := range []string{
-		"create_note", "create_task", "move_note", "update_note", "mark_done",
+		"create_note", "create_task", "create_book", "finish_book", "move_note", "update_note", "mark_done",
 		"append_note", "replace_section",
 		"rename_note", "duplicate_note", "trash_note", "restore_note", "archive_note", "unarchive_note",
-		"create_folder", "ensure_folders", "delete_folder", "rename_folder", "move_folder", "link_folders",
+		"create_folder", "ensure_folders", "delete_folder", "rename_folder", "move_folder", "link_folders", "unlink_folders", "set_folder_colors", "set_graph_node_size",
 	} {
 		d.RegisterVerifier(actionType, func(ctx context.Context, action ai.Action) error {
 			return verifyWrite(ctx, notesSvc, action)
@@ -436,16 +484,9 @@ func verifyWrite(_ context.Context, notesSvc *notes.Service, action ai.Action) e
 		}
 		return nil
 	case "link_folders":
-		for _, folder := range action.Folders {
-			exists, err := notesSvc.FolderExists(folder)
-			if err != nil {
-				return fmt.Errorf("verify link_folders: %w", err)
-			}
-			if !exists {
-				return fmt.Errorf("verify link_folders: %q not found", folder)
-			}
-		}
-		return nil
+		return verifyFolderLinks(notesSvc, action.Folders, true)
+	case "unlink_folders":
+		return verifyFolderLinks(notesSvc, action.Folders, false)
 	case "delete_folder":
 		exists, err := notesSvc.FolderExists(action.Folder)
 		if err != nil {
@@ -455,9 +496,36 @@ func verifyWrite(_ context.Context, notesSvc *notes.Service, action ai.Action) e
 			return fmt.Errorf("verify delete_folder: folder remains")
 		}
 		return nil
+	case "rename_folder", "move_folder":
+		expected, err := expectedFolderDestination(action)
+		if err != nil {
+			return fmt.Errorf("verify %s: %w", action.Type, err)
+		}
+		oldExists, err := notesSvc.FolderExists(action.Folder)
+		if err != nil {
+			return fmt.Errorf("verify %s source: %w", action.Type, err)
+		}
+		newExists, err := notesSvc.FolderExists(expected)
+		if err != nil {
+			return fmt.Errorf("verify %s destination: %w", action.Type, err)
+		}
+		if oldExists || !newExists {
+			return fmt.Errorf("verify %s: source_exists=%t destination=%q exists=%t", action.Type, oldExists, expected, newExists)
+		}
+		return nil
+	case "set_folder_colors":
+		if err := notesSvc.VerifyFolderGraphColors(action.Folder, action.IncludeChildren); err != nil {
+			return fmt.Errorf("verify set_folder_colors: %w", err)
+		}
+		return nil
+	case "set_graph_node_size":
+		if err := notesSvc.VerifyGraphNodeSizeMultiplier(action.NodeSizeMultiplier); err != nil {
+			return fmt.Errorf("verify set_graph_node_size: %w", err)
+		}
+		return nil
 	}
 
-	if action.Type == "create_note" || action.Type == "create_task" {
+	if action.Type == "create_note" || action.Type == "create_task" || action.Type == "create_book" {
 		path, err := utils.NotePath(notesSvc.VaultPath(), action.Folder, action.Title)
 		if err != nil {
 			return fmt.Errorf("build expected note path: %w", err)
@@ -472,6 +540,9 @@ func verifyWrite(_ context.Context, notesSvc *notes.Service, action ai.Action) e
 		if action.Type == "create_task" && note.Type != models.NoteTypeTask {
 			return fmt.Errorf("verify created task: note type is %q", note.Type)
 		}
+		if action.Type == "create_book" && note.Type != models.NoteTypeBook {
+			return fmt.Errorf("verify created book: note type is %q", note.Type)
+		}
 		return nil
 	}
 
@@ -484,6 +555,14 @@ func verifyWrite(_ context.Context, notesSvc *notes.Service, action ai.Action) e
 	}
 
 	switch action.Type {
+	case "finish_book":
+		finished, err := notesSvc.IsBookFinished(action.NoteID)
+		if err != nil {
+			return fmt.Errorf("verify finish_book: %w", err)
+		}
+		if !finished {
+			return fmt.Errorf("verify finish_book: completion timestamp is missing")
+		}
 	case "move_note":
 		expected, err := utils.NotePath(notesSvc.VaultPath(), action.Folder, note.Title)
 		if err != nil {
@@ -512,6 +591,29 @@ func verifyWrite(_ context.Context, notesSvc *notes.Service, action ai.Action) e
 		if note.Title != action.Title {
 			return fmt.Errorf("verify rename_note: expected title %q", action.Title)
 		}
+	case "duplicate_note":
+		title := strings.TrimSpace(action.Title)
+		if title == "" {
+			title = note.Title + " (copy)"
+		}
+		folder := strings.TrimSpace(action.Folder)
+		if folder == "" {
+			folder = utils.RelVault(notesSvc.VaultPath(), filepath.Dir(note.Path))
+			if folder == "." {
+				folder = ""
+			}
+		}
+		expected, err := utils.NotePath(notesSvc.VaultPath(), folder, title)
+		if err != nil {
+			return fmt.Errorf("verify duplicate_note path: %w", err)
+		}
+		duplicate, err := notesSvc.GetNoteByPath(expected)
+		if err != nil {
+			return fmt.Errorf("verify duplicate_note: %w", err)
+		}
+		if duplicate == nil || duplicate.ID == note.ID || duplicate.Content != note.Content || duplicate.Type != note.Type {
+			return fmt.Errorf("verify duplicate_note: independent matching copy not found")
+		}
 	case "trash_note":
 		if note.TrashedFrom == "" {
 			return fmt.Errorf("verify trash_note: note is not marked as trashed")
@@ -527,6 +629,65 @@ func verifyWrite(_ context.Context, notesSvc *notes.Service, action ai.Action) e
 	case "unarchive_note":
 		if note.Archived {
 			return fmt.Errorf("verify unarchive_note: note remains archived")
+		}
+	}
+	return nil
+}
+
+func expectedFolderDestination(action ai.Action) (string, error) {
+	oldFolder, err := utils.CleanFolder(action.Folder)
+	if err != nil {
+		return "", err
+	}
+	name := oldFolder
+	parent := ""
+	if index := strings.LastIndex(oldFolder, "/"); index >= 0 {
+		parent = oldFolder[:index]
+		name = oldFolder[index+1:]
+	}
+	if action.Type == "rename_folder" {
+		name = strings.Trim(strings.TrimSpace(action.NewFolder), "/")
+		if name == "" || strings.Contains(name, "/") {
+			return "", fmt.Errorf("invalid new folder name %q", action.NewFolder)
+		}
+	} else {
+		parent, err = utils.CleanFolder(action.NewFolder)
+		if err != nil {
+			return "", err
+		}
+	}
+	if parent == "" {
+		return name, nil
+	}
+	return parent + "/" + name, nil
+}
+
+func verifyFolderLinks(notesSvc *notes.Service, folders []string, wantLinked bool) error {
+	linksByFolder, err := notesSvc.FolderLinks()
+	if err != nil {
+		return fmt.Errorf("read folder graph: %w", err)
+	}
+	for _, folder := range folders {
+		linkedFolders, ok := linksByFolder[folder]
+		if !ok {
+			return fmt.Errorf("verify folder graph: %q not found", folder)
+		}
+		linkedSet := make(map[string]bool, len(linkedFolders))
+		for _, linked := range linkedFolders {
+			linkedSet[linked] = true
+		}
+		for _, other := range folders {
+			if folder == other {
+				continue
+			}
+			linked := linkedSet[other]
+			if linked != wantLinked {
+				state := "linked"
+				if !wantLinked {
+					state = "unlinked"
+				}
+				return fmt.Errorf("verify folder graph: %q was not %s with %q", folder, state, other)
+			}
 		}
 	}
 	return nil

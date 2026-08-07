@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/tiredbooy/internal/models"
 	"github.com/tiredbooy/internal/utils"
 )
 
@@ -35,7 +34,7 @@ func (s *Service) SearchNotes(ctx context.Context, query string, limit int) ([]R
 		out = append(out, RetrievedNote{
 			ID:         note.ID,
 			Title:      note.Title,
-			Path:       note.Path,
+			Path:       utils.RelVault(s.vaultPath, note.Path),
 			Similarity: result.Score,
 			Content:    result.Content,
 		})
@@ -43,8 +42,12 @@ func (s *Service) SearchNotes(ctx context.Context, query string, limit int) ([]R
 	return out, nil
 }
 
-func (s *Service) NoteByID(noteID int64) (*models.Note, error) {
-	return s.noteStore.GetByID(noteID)
+func (s *Service) NoteByID(noteID int64) (*NoteView, error) {
+	note, err := s.noteStore.GetByID(noteID)
+	if err != nil || note == nil {
+		return nil, err
+	}
+	return s.noteView(note), nil
 }
 
 func (s *Service) Folders() ([]string, error) {

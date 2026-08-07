@@ -809,7 +809,6 @@ func (m bubbleModel) overlayView(width int) string {
 	labels := []string{"Provider name", "Base URL", "API-key environment variable", "Default chat model"}
 	defaultValue := m.connectValues[m.connectStep-1]
 	return panel.Width(width).Render(accent.Render("Connect a provider") + muted.Render("  "+labels[m.connectStep-1]) + "\n" + m.input.View() + "\n" + muted.Render("Enter to continue · leave blank to use: "+defaultValue+" · Esc close"))
-	return ""
 }
 
 type connectChoice struct {

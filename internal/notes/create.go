@@ -53,7 +53,21 @@ func (s *Service) createNote(ctx context.Context, title, body, folder string, fr
 		return nil, false, fmt.Errorf("title is required")
 	}
 
-	path, err := utils.NotePath(s.vaultPath, folder, title)
+	cleanFolder, err := utils.CleanFolder(folder)
+	if err != nil {
+		return nil, false, err
+	}
+	if cleanFolder != "" {
+		exists, err := utils.FolderExists(s.vaultPath, cleanFolder)
+		if err != nil {
+			return nil, false, fmt.Errorf("check destination folder: %w", err)
+		}
+		if !exists {
+			return nil, false, fmt.Errorf("destination folder %q does not exist; create it explicitly first", cleanFolder)
+		}
+	}
+
+	path, err := utils.NotePath(s.vaultPath, cleanFolder, title)
 	if err != nil {
 		return nil, false, err
 	}
@@ -67,10 +81,6 @@ func (s *Service) createNote(ctx context.Context, title, body, folder string, fr
 	// Disk file without a DB row (manual vault edit) — don't clobber it.
 	if _, statErr := os.Stat(path); statErr == nil {
 		return nil, false, fmt.Errorf("file already exists at %s (not in database — import or rename)", utils.RelVault(s.vaultPath, path))
-	}
-
-	if err := utils.EnsureDir(s.vaultPath, folder); err != nil {
-		return nil, false, fmt.Errorf("create folder: %w", err)
 	}
 
 	frontmatter.Title = title
@@ -137,7 +147,21 @@ func (s *Service) MoveNote(ctx context.Context, noteID int64, folder string) (*m
 		}
 	}
 
-	newPath, err := utils.NotePath(s.vaultPath, folder, n.Title)
+	cleanFolder, err := utils.CleanFolder(folder)
+	if err != nil {
+		return nil, err
+	}
+	if cleanFolder != "" {
+		exists, err := utils.FolderExists(s.vaultPath, cleanFolder)
+		if err != nil {
+			return nil, fmt.Errorf("check destination folder: %w", err)
+		}
+		if !exists {
+			return nil, fmt.Errorf("destination folder %q does not exist; create it explicitly first", cleanFolder)
+		}
+	}
+
+	newPath, err := utils.NotePath(s.vaultPath, cleanFolder, n.Title)
 	if err != nil {
 		return nil, err
 	}
@@ -149,10 +173,6 @@ func (s *Service) MoveNote(ctx context.Context, noteID int64, folder string) (*m
 		return nil, err
 	} else if existing != nil && existing.ID != n.ID {
 		return nil, fmt.Errorf("a note already exists at %s", utils.RelVault(s.vaultPath, newPath))
-	}
-
-	if err := utils.EnsureDir(s.vaultPath, folder); err != nil {
-		return nil, err
 	}
 
 	if err := os.MkdirAll(filepath.Dir(newPath), 0o755); err != nil {

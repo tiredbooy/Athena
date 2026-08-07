@@ -5,6 +5,7 @@ import {
   PROTOCOL_VERSION,
   type EngineEvent,
   type EngineRequest,
+  type ProviderConnection,
   type RequestType,
   isEngineEvent,
 } from "../protocol/types.js";
@@ -53,6 +54,18 @@ export class EngineClient extends EventEmitter {
 
   reject(planId: string): Promise<EngineEvent> {
     return this.request("plan.reject", { planId });
+  }
+
+  providers(): Promise<EngineEvent> {
+    return this.request("provider.list");
+  }
+
+  connect(connection: ProviderConnection): Promise<EngineEvent> {
+    return this.request("provider.connect", { connection });
+  }
+
+  startOAuth(providerId: string): Promise<EngineEvent> {
+    return this.request("provider.oauth.start", { providerId });
   }
 
   dispose(): void {

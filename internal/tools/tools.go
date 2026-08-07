@@ -14,6 +14,35 @@ import (
 
 type Handler func(ctx context.Context, a ai.Action) (string, error)
 
+// ActionProgress is a factual lifecycle update for one dispatched action.
+// It is carried through context so concurrent batches can report progress
+// without sharing mutable observer state on Dispatcher.
+type ActionProgress struct {
+	Action  ai.Action
+	State   string
+	Message string
+	Error   error
+}
+
+type actionProgressKey struct{}
+
+// WithActionProgress attaches a per-operation observer to a context. The
+// observer is optional; the dispatcher remains useful for callers that only
+// need final ActionResult values.
+func WithActionProgress(ctx context.Context, observer func(ActionProgress)) context.Context {
+	if observer == nil {
+		return ctx
+	}
+	return context.WithValue(ctx, actionProgressKey{}, observer)
+}
+
+func reportActionProgress(ctx context.Context, progress ActionProgress) {
+	observer, ok := ctx.Value(actionProgressKey{}).(func(ActionProgress))
+	if ok && observer != nil {
+		observer(progress)
+	}
+}
+
 type Dispatcher struct {
 	handlers  map[string]Handler
 	verifiers map[string]Verifier
@@ -41,6 +70,22 @@ func (d *Dispatcher) Register(actionType string, h Handler) {
 
 func (d *Dispatcher) SetAuditLogger(auditor AuditLogger) {
 	d.auditor = auditor
+}
+
+// Validate checks a model-generated plan without running handlers. The chat
+// layer uses this before showing an approval card so malformed plans can be
+// repaired by the model instead of making the user approve a doomed action.
+func (d *Dispatcher) Validate(actions []ai.Action) error {
+	if len(actions) > maxActionsPerBatch {
+		return fmt.Errorf("action batch exceeds limit of %d", maxActionsPerBatch)
+	}
+	for index, action := range actions {
+		action.Type = strings.TrimSpace(action.Type)
+		if err := validateAction(action, d.handlers[action.Type] != nil); err != nil {
+			return fmt.Errorf("action %d (%s): %w", index+1, action.Type, err)
+		}
+	}
+	return nil
 }
 
 func (d *Dispatcher) RegisterVerifier(actionType string, verifier Verifier) {
@@ -135,9 +180,12 @@ func (d *Dispatcher) rejectOversizedBatch(ctx context.Context, actions []ai.Acti
 
 func (d *Dispatcher) runAction(ctx context.Context, action ai.Action) ai.ActionResult {
 	action.Type = strings.TrimSpace(action.Type)
+	reportActionProgress(ctx, ActionProgress{Action: action, State: "started"})
 	handler, known := d.handlers[action.Type]
 	if err := validateAction(action, known); err != nil {
-		return d.finish(ctx, action, "", err)
+		result := d.finish(ctx, action, "", err)
+		reportActionProgress(ctx, ActionProgress{Action: action, State: "failed", Error: err})
+		return result
 	}
 
 	policy := policyFor(action.Type)
@@ -164,11 +212,20 @@ func (d *Dispatcher) runAction(ctx context.Context, action ai.Action) ai.ActionR
 		}
 		select {
 		case <-ctx.Done():
-			return d.finish(ctx, action, message, ctx.Err())
+			err = ctx.Err()
+			result := d.finish(ctx, action, message, err)
+			reportActionProgress(ctx, ActionProgress{Action: action, State: "failed", Message: message, Error: err})
+			return result
 		case <-time.After(100 * time.Millisecond):
 		}
 	}
-	return d.finish(ctx, action, message, err)
+	result := d.finish(ctx, action, message, err)
+	state := "completed"
+	if err != nil {
+		state = "failed"
+	}
+	reportActionProgress(ctx, ActionProgress{Action: action, State: state, Message: message, Error: err})
+	return result
 }
 
 // serialReady prevents two file/database writes from racing merely because a

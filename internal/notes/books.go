@@ -18,9 +18,6 @@ func (s *Service) CreateBook(ctx context.Context, metadata models.BookMetadata, 
 	if title == "" {
 		return nil, false, fmt.Errorf("book title is required")
 	}
-	if strings.TrimSpace(folder) == "" {
-		folder = "books/reading"
-	}
 	fm := parser.Frontmatter{
 		Title: title, Tags: []string{"book"}, Kind: "book", Authors: metadata.Authors,
 		Genres: metadata.Genres, PublishedYear: metadata.PublishedYear, ISBN: metadata.ISBN,
@@ -70,4 +67,29 @@ func (s *Service) FinishBook(ctx context.Context, noteID int64, finishedAt time.
 		return fmt.Errorf("book was finished, but re-embedding failed: %w", err)
 	}
 	return nil
+}
+
+// IsBookFinished re-reads the durable Markdown frontmatter used by Obsidian.
+// Agent verification uses this instead of trusting the write handler's return
+// value or the model's claim.
+func (s *Service) IsBookFinished(noteID int64) (bool, error) {
+	n, err := s.noteStore.GetByID(noteID)
+	if err != nil {
+		return false, fmt.Errorf("load book: %w", err)
+	}
+	if n == nil {
+		return false, fmt.Errorf("book %d not found", noteID)
+	}
+	if n.Type != models.NoteTypeBook {
+		return false, fmt.Errorf("note %d is not a book", noteID)
+	}
+	raw, err := utils.ReadNoteFile(n.Path)
+	if err != nil {
+		return false, fmt.Errorf("read book file: %w", err)
+	}
+	fm, _, err := parser.ParseMarkdown(raw)
+	if err != nil {
+		return false, fmt.Errorf("parse book frontmatter: %w", err)
+	}
+	return fm.FinishedAt != nil, nil
 }

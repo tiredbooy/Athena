@@ -22,6 +22,9 @@ import (
 //   - rename_folder:    Folder (old), NewFolder (new name, single segment)
 //   - move_folder:      Folder (old), NewFolder (new parent)
 //   - link_folders:     Folders
+//   - unlink_folders:   Folders
+//   - set_folder_colors: Folder, IncludeChildren (optional)
+//   - set_graph_node_size: NodeSizeMultiplier
 //   - rename_note:      NoteID, Title (new title)
 //   - duplicate_note:   NoteID, Title (optional new title), Folder (optional target)
 //   - trash_note:       NoteID
@@ -48,6 +51,12 @@ type Action struct {
 	ExpectedContent string   `json:"expected_content,omitempty"`
 	Tags            []string `json:"tags,omitempty"`
 	Folder          string   `json:"folder,omitempty"`
+	// IncludeChildren applies a folder visual setting to direct child folders
+	// as well. It is deliberately not recursive.
+	IncludeChildren bool `json:"include_children,omitempty"`
+	// NodeSizeMultiplier is Obsidian's global graph node-size multiplier.
+	// Obsidian does not support a different native size for each color group.
+	NodeSizeMultiplier float64 `json:"node_size_multiplier,omitempty"`
 	// Path is accepted from weaker models that use a generic path field for a
 	// folder action. normalizeAction maps it into Folder before dispatch.
 	Path      string   `json:"path,omitempty"`
@@ -113,7 +122,18 @@ func ExtractActions(raw string) (cleaned string, found []Action) {
 		rest = tail
 	}
 
-	return strings.TrimSpace(b.String()), found
+	cleaned = strings.TrimSpace(b.String())
+	if len(found) == 0 {
+		// Some small models omit the action fence but return a standalone JSON
+		// object or array. Accept only a payload that occupies the entire reply;
+		// never scrape arbitrary prose or note content for executable JSON.
+		if payload, consumed, ok := takeJSONValue(cleaned); ok && strings.TrimSpace(cleaned[consumed:]) == "" {
+			if actions := decodeActions(payload); len(actions) > 0 {
+				return "", actions
+			}
+		}
+	}
+	return cleaned, found
 }
 
 // takeJSONValue finds the first JSON object or array and returns the balanced
@@ -228,8 +248,14 @@ func normalizeAction(action Action) Action {
 		action.Type = "move_note"
 	case "movefolder":
 		action.Type = "move_folder"
+	case "unlinkfolders", "unlink_folder", "disconnect_folders", "disconnectfolders":
+		action.Type = "unlink_folders"
 	case "renamefolder":
 		action.Type = "rename_folder"
+	case "color_folder", "colorfolders", "setfoldercolors", "add_folder_color", "addfoldercolor":
+		action.Type = "set_folder_colors"
+	case "set_graph_size", "setgraphnodesize", "resize_graph_nodes", "resizegraphnodes":
+		action.Type = "set_graph_node_size"
 	case "createnote":
 		action.Type = "create_note"
 	case "createtask":

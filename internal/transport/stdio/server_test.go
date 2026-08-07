@@ -68,10 +68,38 @@ func TestValidateRequiresOperationFields(t *testing.T) {
 		{Version: ProtocolVersion, RequestID: "r2", Type: RequestCancel},
 		{Version: ProtocolVersion, RequestID: "r3", Type: RequestPlanApprove},
 		{Version: ProtocolVersion, RequestID: "r4", Type: RequestPlanReject},
+		{Version: ProtocolVersion, RequestID: "r5", Type: RequestProviderConnect},
+		{Version: ProtocolVersion, RequestID: "r6", Type: RequestProviderOAuth},
 	}
 	for _, request := range tests {
 		if err := validate(request); err == nil {
 			t.Fatalf("request without operation field was accepted: %#v", request)
+		}
+	}
+}
+
+func TestServeListsStaticAndCustomProviderOptions(t *testing.T) {
+	input := bytes.NewBufferString(`{"version":1,"requestId":"providers-1","type":"provider.list"}` + "\n")
+	var output bytes.Buffer
+	if err := Serve(context.Background(), input, &output, chat.NewSession(nil)); err != nil {
+		t.Fatalf("serve: %v", err)
+	}
+	var event Event
+	if err := json.NewDecoder(&output).Decode(&event); err != nil {
+		t.Fatal(err)
+	}
+	if event.Type != "provider.presets" || event.RequestID != "providers-1" {
+		t.Fatalf("event = %#v", event)
+	}
+	want := map[string]bool{"openai-codex": false, "xai-oauth": false, "xai": false, "custom": false}
+	for _, preset := range event.Presets {
+		if _, exists := want[preset.ID]; exists {
+			want[preset.ID] = true
+		}
+	}
+	for id, found := range want {
+		if !found {
+			t.Errorf("provider preset %q is missing", id)
 		}
 	}
 }

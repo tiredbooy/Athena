@@ -10,8 +10,7 @@ import (
 	"github.com/tiredbooy/internal/utils"
 )
 
-// CreateFolder makes a single vault-relative folder (and any missing
-// parents), e.g. "books/to-read".
+// CreateFolder makes a single vault-relative folder (and any missing parents).
 func (s *Service) CreateFolder(folder string) (string, error) {
 	clean, err := utils.CleanFolder(folder)
 	if err != nil {
@@ -31,6 +30,25 @@ func (s *Service) ListFolders() ([]string, error) {
 	return utils.ListFolders(s.vaultPath)
 }
 
+// FolderLinks returns explicit graph connections for every visible folder.
+// Parent/child relationships remain filesystem-derived and are intentionally
+// not represented as editable links here.
+func (s *Service) FolderLinks() (map[string][]string, error) {
+	folders, err := utils.ListFolders(s.vaultPath)
+	if err != nil {
+		return nil, err
+	}
+	links := make(map[string][]string, len(folders))
+	for _, folder := range folders {
+		linked, err := s.readFolderLinks(folder, folders)
+		if err != nil {
+			return nil, err
+		}
+		links[folder] = linked
+	}
+	return links, nil
+}
+
 // FolderExists reports whether folder exists under the vault.
 func (s *Service) FolderExists(folder string) (bool, error) {
 	return utils.FolderExists(s.vaultPath, folder)
@@ -40,23 +58,9 @@ func (s *Service) FolderExists(folder string) (bool, error) {
 // supplied folders. Folder index notes own this metadata because they are the
 // graph nodes Athena generates for real directories.
 func (s *Service) LinkFolders(folders []string) ([]string, error) {
-	unique := make(map[string]bool, len(folders))
-	for _, folder := range folders {
-		clean, err := utils.CleanFolder(folder)
-		if err != nil {
-			return nil, err
-		}
-		if clean == "" || isManagedFolder(clean) {
-			return nil, fmt.Errorf("invalid folder %q", folder)
-		}
-		exists, err := utils.FolderExists(s.vaultPath, clean)
-		if err != nil {
-			return nil, err
-		}
-		if !exists {
-			return nil, fmt.Errorf("folder %q not found", clean)
-		}
-		unique[clean] = true
+	unique, err := s.validFolderSet(folders)
+	if err != nil {
+		return nil, err
 	}
 	if len(unique) < 2 {
 		return nil, fmt.Errorf("at least two distinct folders are required")
@@ -79,6 +83,59 @@ func (s *Service) LinkFolders(folders []string) ([]string, error) {
 		return nil, err
 	}
 	return linked, nil
+}
+
+// UnlinkFolders removes only explicit Related folders connections. The
+// Parent link shown in a folder index is derived from the real filesystem
+// path; moving a folder is required to change that structural relationship.
+func (s *Service) UnlinkFolders(folders []string) ([]string, error) {
+	unique, err := s.validFolderSet(folders)
+	if err != nil {
+		return nil, err
+	}
+	if len(unique) < 2 {
+		return nil, fmt.Errorf("at least two distinct folders are required")
+	}
+
+	linked := make([]string, 0, len(unique))
+	for folder := range unique {
+		linked = append(linked, folder)
+	}
+	sort.Strings(linked)
+	if err := s.SyncFolderGraph(); err != nil {
+		return nil, err
+	}
+	for _, folder := range linked {
+		if err := s.removeFolderLinks(folder, linked); err != nil {
+			return nil, err
+		}
+	}
+	if err := s.SyncFolderGraph(); err != nil {
+		return nil, err
+	}
+	return linked, nil
+}
+
+func (s *Service) validFolderSet(folders []string) (map[string]bool, error) {
+	unique := make(map[string]bool, len(folders))
+	for _, folder := range folders {
+		clean, err := utils.CleanFolder(folder)
+		if err != nil {
+			return nil, err
+		}
+		if clean == "" || isManagedFolder(clean) {
+			return nil, fmt.Errorf("invalid folder %q", folder)
+		}
+		exists, err := utils.FolderExists(s.vaultPath, clean)
+		if err != nil {
+			return nil, err
+		}
+		if !exists {
+			return nil, fmt.Errorf("folder %q not found", clean)
+		}
+		unique[clean] = true
+	}
+	return unique, nil
 }
 
 func (s *Service) addFolderLinks(folder string, related []string) error {
@@ -108,6 +165,42 @@ func (s *Service) addFolderLinks(folder string, related []string) error {
 		fm.LinkedFolders = append(fm.LinkedFolders, linked)
 	}
 	sort.Strings(fm.LinkedFolders)
+	content, err := parser.RenderMarkdown(fm, body)
+	if err != nil {
+		return fmt.Errorf("render folder index %s: %w", folder, err)
+	}
+	if err := utils.OverwriteNoteFile(indexPath, content); err != nil {
+		return fmt.Errorf("write folder index %s: %w", folder, err)
+	}
+	return nil
+}
+
+func (s *Service) removeFolderLinks(folder string, related []string) error {
+	indexPath := filepath.Join(s.vaultPath, filepath.FromSlash(folder)+".md")
+	raw, err := utils.ReadNoteFile(indexPath)
+	if err != nil {
+		return fmt.Errorf("read folder index %s: %w", folder, err)
+	}
+	fm, body, err := parser.ParseMarkdown(raw)
+	if err != nil {
+		return fmt.Errorf("parse folder index %s: %w", folder, err)
+	}
+	if !fm.AthenaIndex {
+		return fmt.Errorf("folder index %q is not Athena-managed", folder)
+	}
+	remove := make(map[string]bool, len(related))
+	for _, linked := range related {
+		if linked != folder {
+			remove[linked] = true
+		}
+	}
+	kept := fm.LinkedFolders[:0]
+	for _, linked := range fm.LinkedFolders {
+		if !remove[linked] {
+			kept = append(kept, linked)
+		}
+	}
+	fm.LinkedFolders = kept
 	content, err := parser.RenderMarkdown(fm, body)
 	if err != nil {
 		return fmt.Errorf("render folder index %s: %w", folder, err)
@@ -167,6 +260,15 @@ func (s *Service) MoveFolder(oldFolder, newParent string) (string, error) {
 	newParentClean, err := utils.CleanFolder(newParent)
 	if err != nil {
 		return "", err
+	}
+	if newParentClean != "" {
+		exists, err := utils.FolderExists(s.vaultPath, newParentClean)
+		if err != nil {
+			return "", fmt.Errorf("check destination parent: %w", err)
+		}
+		if !exists {
+			return "", fmt.Errorf("destination parent %q does not exist; create it explicitly first", newParentClean)
+		}
 	}
 	newFolder := name
 	if newParentClean != "" {

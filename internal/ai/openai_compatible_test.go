@@ -39,6 +39,25 @@ func TestOpenAICompatibleProviderChatWithTools(t *testing.T) {
 	}
 }
 
+func TestOpenAICompatibleProviderPrefersOAuthTokenSource(t *testing.T) {
+	provider := NewOpenAICompatibleProvider("xAI OAuth", "https://provider.test/v1", "ATHENA_UNUSED_KEY", "grok")
+	provider.SetAPIKey("unused-direct-key")
+	provider.SetTokenSource(func(context.Context) (string, error) { return "oauth-token", nil })
+	provider.http = &http.Client{Transport: roundTripper(func(request *http.Request) (*http.Response, error) {
+		if got := request.Header.Get("Authorization"); got != "Bearer oauth-token" {
+			t.Fatalf("authorization = %q", got)
+		}
+		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(`{"data":[{"id":"grok"}]}`)), Header: make(http.Header)}, nil
+	})}
+	models, err := provider.ChatModels(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(models) != 1 || models[0].Name != "grok" {
+		t.Fatalf("models = %#v", models)
+	}
+}
+
 type roundTripper func(*http.Request) (*http.Response, error)
 
 func (f roundTripper) RoundTrip(request *http.Request) (*http.Response, error) { return f(request) }

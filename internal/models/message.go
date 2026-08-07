@@ -37,10 +37,12 @@ type MessageReq struct {
 	Model    string    `json:"model"`
 	Messages []Message `json:"messages"`
 	Stream   bool      `json:"stream"`
-	// Think is disabled because Athena needs a reliable visible response for
-	// every turn; reasoning-only streams are not useful to the user or tools.
+	// Think enables private reasoning for Ollama models that advertise or imply
+	// a reasoning mode. The reasoning is never shown as the assistant answer;
+	// the client only uses it to improve planning and tool selection.
 	Think     bool             `json:"think"`
 	KeepAlive string           `json:"keep_alive,omitempty"`
+	Options   map[string]any   `json:"options,omitempty"`
 	Tools     []ToolDefinition `json:"tools,omitempty"`
 }
 

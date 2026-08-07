@@ -5,278 +5,82 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"regexp"
-	"strconv"
 	"strings"
-	"time"
 
 	"github.com/tiredbooy/internal/ai"
 	"github.com/tiredbooy/internal/config"
-	"github.com/tiredbooy/internal/models"
 	"github.com/tiredbooy/internal/retrieval"
 	"github.com/tiredbooy/internal/tools"
 	"github.com/tiredbooy/internal/tui"
 )
 
 type Loop struct {
-	ai         ai.ChatProvider
-	providers  map[string]ai.ChatProvider
-	oauth      *ai.CodexOAuth
-	retrieval  *retrieval.Service
-	dispatcher *tools.Dispatcher
-	config     *config.Config
+	ai          ai.ChatProvider
+	providers   map[string]ai.ChatProvider
+	oauth       *ai.CodexOAuth
+	xaiOAuth    *ai.XAIOAuth
+	retrieval   *retrieval.Service
+	dispatcher  *tools.Dispatcher
+	config      *config.Config
+	credentials *config.CredentialStore
 }
 
 func NewLoop(chatProvider ai.ChatProvider, providers map[string]ai.ChatProvider, oauth *ai.CodexOAuth, retrievalSvc *retrieval.Service, dispatcher *tools.Dispatcher, cfg *config.Config) *Loop {
 	return &Loop{ai: chatProvider, providers: providers, oauth: oauth, retrieval: retrievalSvc, dispatcher: dispatcher, config: cfg}
 }
 
-func (l *Loop) Run() {
-	history := []models.Message{
-		{
-			Role:    "system",
-			Content: ai.SystemPromptAt(time.Now()),
-		},
-	}
+func (l *Loop) SetCredentialStore(credentials *config.CredentialStore) {
+	l.credentials = credentials
+}
 
+func (l *Loop) SetXAIOAuth(oauth *ai.XAIOAuth) {
+	l.xaiOAuth = oauth
+}
+
+// Run is the line-oriented fallback UI. It intentionally delegates every turn
+// to Session so terminal and stdio/TypeScript clients share one agent policy.
+func (l *Loop) Run() {
+	session := NewSession(l)
 	scanner := bufio.NewScanner(os.Stdin)
 
 	fmt.Println()
 	fmt.Println("──────────────────────────────────────────────")
-	fmt.Println("🦉 Athena")
+	fmt.Println("Athena")
 	fmt.Println("──────────────────────────────────────────────")
 	fmt.Println("Ask anything. /models changes your model · exit quits.")
 
 	for {
 		fmt.Print("\n> ")
-
 		if !scanner.Scan() {
 			break
 		}
 
 		input := strings.TrimSpace(scanner.Text())
-
 		if input == "" {
 			continue
 		}
-
 		if input == "exit" || input == "quit" {
 			break
 		}
-		if strings.HasPrefix(input, "/") {
-			l.handleCommand(input)
+		if input == "/help" {
+			fmt.Println("Commands: /models, /model <number-or-name>, /doctor, /compact, /confirm, /cancel, /help, exit")
 			continue
 		}
 
-		l.handleTurn(input, &history)
-	}
-}
-
-// handleTurn runs one full retrieval -> model -> action-dispatch cycle.
-// historyPtr lets this append/rollback without the caller juggling slices.
-func (l *Loop) handleTurn(input string, historyPtr *[]models.Message) {
-	ctx, cancel := context.WithTimeout(context.Background(), TurnTimeout)
-	defer cancel()
-
-	loader := tui.NewLoader()
-	loader.Start()
-	if actions, ok := folderActions(input); ok {
+		ctx, cancel := context.WithTimeout(context.Background(), TurnTimeout)
+		loader := tui.NewLoader()
+		loader.Start()
+		reply, err := session.Submit(ctx, input, loader.Info, nil)
+		cancel()
 		loader.Stop()
-		reply := l.runActions(ctx, actions)
-		fmt.Println("\nAthena")
-		fmt.Println(reply)
-		*historyPtr = append(*historyPtr,
-			models.Message{Role: "user", Content: input},
-			models.Message{Role: "assistant", Content: reply},
-		)
-		return
-	}
-	if isBookMoveRequest(input) {
-		catalog, err := l.retrieval.Inventory()
 		if err != nil {
-			loader.Stop()
-			fmt.Printf("\nCould not inspect your vault: %v\n", err)
-			return
+			fmt.Printf("\nError: %v\n", err)
+			continue
 		}
-		if actions, ok := bookMoveActions(input, catalog); ok {
-			loader.Stop()
-			reply := l.runActions(ctx, actions)
+		if strings.TrimSpace(reply) != "" {
 			fmt.Println("\nAthena")
-			fmt.Println(reply)
-			*historyPtr = append(*historyPtr,
-				models.Message{Role: "user", Content: input},
-				models.Message{Role: "assistant", Content: reply},
-			)
-			return
+			fmt.Println(tui.RenderMarkdown(reply))
 		}
-	}
-	if isListingRequest(input) {
-		catalog, err := l.retrieval.Inventory()
-		loader.Stop()
-		if err != nil {
-			fmt.Printf("\nCould not list your notes: %v\n", err)
-			return
-		}
-		reply := printCatalog(catalog)
-		*historyPtr = append(*historyPtr,
-			models.Message{Role: "user", Content: input},
-			models.Message{Role: "assistant", Content: reply},
-		)
-		return
-	}
-	// -------------------------------------------------------
-	// Retrieval
-	// -------------------------------------------------------
-
-	retrievalStart := time.Now()
-
-	ctxResult, err := l.retrieval.BuildContextWithProgress(ctx, input, 4, loader.Info)
-
-	retrievalTime := time.Since(retrievalStart)
-
-	if err != nil {
-		loader.Step("Vector search", retrievalTime)
-		loader.Stop()
-
-		fmt.Printf("\nRetrieval failed: %v\n", err)
-		return
-	}
-
-	loader.Step("Vector search", retrievalTime)
-	loader.Step("Context assembled", 0)
-	// Keep chat history free of the injected vault context so follow-up
-	// turns don't accumulate stale catalogs. The model still sees the
-	// catalog for *this* turn via the messages we pass to StreamChat.
-	*historyPtr = append(*historyPtr, models.Message{
-		Role:    "user",
-		Content: input,
-	})
-
-	modelMessages := make([]models.Message, len(*historyPtr))
-	copy(modelMessages, *historyPtr)
-	if ctxResult.Context != "" {
-		// Attach retrieval context only to the latest user turn.
-		last := len(modelMessages) - 1
-		modelMessages[last].Content = input + "\n\n" + ctxResult.Context
-	}
-
-	// -------------------------------------------------------
-	// Model
-	// -------------------------------------------------------
-
-	loader.Info("Thinking about your question")
-	loader.Waiting()
-
-	firstToken := true
-
-	reply, err := l.ai.StreamChatWith(
-		ctx,
-		modelMessages,
-		ai.StreamCallbacks{
-			OnThinking: func(delta string) { loader.NoteReasoning(len(delta)) },
-			OnToken: func(tok string) {
-				if firstToken {
-					loader.TransitionToReply()
-					firstToken = false
-				}
-				loader.NoteStream(len(tok))
-			},
-		},
-	)
-
-	loader.Stop()
-
-	if err != nil {
-		fmt.Printf("\nError: %v\n", err)
-
-		// Roll back the user turn we appended above so history
-		// doesn't carry a dangling unanswered message.
-		*historyPtr = (*historyPtr)[:len(*historyPtr)-1]
-		return
-	}
-
-	// -------------------------------------------------------
-	// Tool / action dispatch
-	// -------------------------------------------------------
-	// Reuses ctx from the model call above. cancel() is deferred to the
-	// end of this function (not called early), so dispatch still has a
-	// live context as long as it finishes within the remaining timeout.
-
-	cleaned, foundActions := ai.ExtractActions(reply)
-	display := cleaned
-
-	if len(foundActions) > 0 && l.dispatcher != nil {
-		results := l.dispatcher.RunBatch(ctx, foundActions, 4)
-
-		// Prefer cleaned prose in history once actions ran, plus a short
-		// machine summary of what actually happened so follow-ups work.
-		var summary strings.Builder
-		if cleaned != "" {
-			summary.WriteString(cleaned)
-			summary.WriteString("\n\n")
-		}
-		for _, r := range results {
-			if r.Err != nil {
-				summary.WriteString(fmt.Sprintf("[action %s failed: %v]\n", r.Action.Type, r.Err))
-				continue
-			}
-			summary.WriteString(fmt.Sprintf("[action ok] %s\n", r.Message))
-		}
-		reply = strings.TrimSpace(summary.String())
-
-		// The model's confirmation is only an intention. Show what the
-		// dispatcher actually did so a rejected action (for example, deleting
-		// a non-empty folder) is visible instead of looking like a no-op.
-		var execution strings.Builder
-		for _, r := range results {
-			if r.Err != nil {
-				fmt.Fprintf(&execution, "Could not %s: %v\n", r.Action.Type, r.Err)
-				continue
-			}
-			fmt.Fprintf(&execution, "✓ %s\n", r.Message)
-		}
-		if execution.Len() > 0 {
-			if display != "" {
-				display += "\n\n"
-			}
-			display += strings.TrimSpace(execution.String())
-		}
-	}
-
-	if display == "" {
-		display = "The model returned no visible answer. No vault changes were made; please try again."
-		if strings.TrimSpace(reply) == "" {
-			reply = display
-		}
-	}
-	fmt.Println("\nAthena")
-	fmt.Println(tui.RenderMarkdown(display))
-
-	*historyPtr = append(*historyPtr, models.Message{
-		Role:    "assistant",
-		Content: reply,
-	})
-}
-
-func (l *Loop) handleCommand(input string) {
-	fields := strings.Fields(input)
-	if len(fields) == 0 {
-		return
-	}
-
-	switch fields[0] {
-	case "/help":
-		fmt.Println("Commands: /models, /model <number-or-name>, /help, exit")
-	case "/models":
-		l.printModels()
-	case "/model":
-		if len(fields) != 2 {
-			l.printModels()
-			return
-		}
-		l.selectModel(fields[1])
-	default:
-		fmt.Printf("Unknown command %q. Run /help.\n", fields[0])
 	}
 }
 
@@ -286,159 +90,6 @@ func isListingRequest(input string) bool {
 		q == "list my notes" ||
 		q == "show my notes" ||
 		q == "list notes" || q == "show notes" || q == "my notes"
-}
-
-var (
-	createFolderRequest = regexp.MustCompile(`(?i)^\s*(?:i\s+want\s+you\s+to\s+)?(?:please\s+)?(?:create|make|add)\s+(?:me\s+)?(?:a\s+|the\s+)?folder(?:\s+(?:for|called|named))?\s+(.+?)\s*[.!?]?\s*$`)
-	deleteFolderRequest = regexp.MustCompile(`(?i)^\s*(?:please\s+)?(?:delete|remove)\s+(?:the\s+)?folder(?:\s+(?:called|named))?\s+(.+?)\s*[.!?]?\s*$`)
-	firstFolderClause   = regexp.MustCompile(`(?i)^\s*(?:i\s+want\s+you\s+to\s+)?(?:please\s+)?(?:create|make|add)\s+(?:me\s+)?(?:a\s+|the\s+)?folder\s+(?:(?:for|called|named)\s+)?(.+?)\s*$`)
-	nestedFolderClause  = regexp.MustCompile(`(?i)^\s*(?:a\s+|another\s+|the\s+)?folder\s+(?:inside\s+it|in\s+([^\s]+))\s+(?:(?:called|named)\s+)?(.+?)\s*$`)
-	siblingFolderClause = regexp.MustCompile(`(?i)^\s*(?:a\s+|another\s+|the\s+)?folder\s+(?:(?:for|called|named)\s+)?(.+?)\s*$`)
-	quotedFolderName    = regexp.MustCompile(`["']([^"']+)["']`)
-	nestedDeleteRequest = regexp.MustCompile(`(?i)^\s*(?:please\s+)?(?:delete|remove)\s+(?:the\s+)?["'` + "`" + `]?(.+?)["'` + "`" + `]?\s+folder\s+(?:in|from)\s+["'` + "`" + `]?(.+?)["'` + "`" + `]?\s*[.!?]?\s*$`)
-	nestedRenameRequest = regexp.MustCompile(`(?i)^\s*(?:please\s+)?rename\s+(?:the\s+)?["'` + "`" + `]?(.+?)["'` + "`" + `]?\s+folder\s+(?:in|from)\s+["'` + "`" + `]?(.+?)["'` + "`" + `]?\s+to\s+["'` + "`" + `]?(.+?)["'` + "`" + `]?\s*[.!?]?\s*$`)
-)
-
-// folderActions handles only complete, explicit folder requests. This keeps
-// the common filesystem commands dependable even when a small local model
-// forgets to emit its action JSON; broader organizational requests still go
-// through the model, where their intent can be interpreted with vault context.
-func folderActions(input string) ([]ai.Action, bool) {
-	if match := nestedDeleteRequest.FindStringSubmatch(input); len(match) == 3 {
-		parent, name := cleanRequestedFolder(match[2]), cleanRequestedFolder(match[1])
-		if parent != "" && name != "" && !strings.Contains(name, "/") {
-			return []ai.Action{{Type: "delete_folder", Folder: parent + "/" + name}}, true
-		}
-	}
-	if match := nestedRenameRequest.FindStringSubmatch(input); len(match) == 4 {
-		parent, name, newName := cleanRequestedFolder(match[2]), cleanRequestedFolder(match[1]), cleanRequestedFolder(match[3])
-		if parent != "" && name != "" && newName != "" && !strings.Contains(name, "/") && !strings.Contains(newName, "/") {
-			return []ai.Action{{Type: "rename_folder", Folder: parent + "/" + name, NewFolder: newName}}, true
-		}
-	}
-	if actions, ok := compoundFolderActions(input); ok {
-		return actions, true
-	}
-	if actions, ok := quotedNestedFolderActions(input); ok {
-		return actions, true
-	}
-	for _, request := range []struct {
-		re     *regexp.Regexp
-		action string
-	}{
-		{createFolderRequest, "create_folder"},
-		{deleteFolderRequest, "delete_folder"},
-	} {
-		match := request.re.FindStringSubmatch(input)
-		if len(match) != 2 {
-			continue
-		}
-		folder := strings.Trim(strings.TrimSpace(match[1]), "`\"'")
-		if folder == "" || hasAdditionalFolderWork(folder) {
-			return nil, false
-		}
-		return []ai.Action{{Type: request.action, Folder: folder}}, true
-	}
-	return nil, false
-}
-
-// quotedNestedFolderActions is a tolerant fallback for natural phrasing such
-// as “make a folder for "work", a folder inside it "Rumera", …”. Existing
-// vault folders never participate in this decision.
-func quotedNestedFolderActions(input string) ([]ai.Action, bool) {
-	lower := strings.ToLower(input)
-	if !strings.Contains(lower, "folder") || !(strings.Contains(lower, "make") || strings.Contains(lower, "create") || strings.Contains(lower, "add")) {
-		return nil, false
-	}
-	matches := quotedFolderName.FindAllStringSubmatch(input, -1)
-	if len(matches) < 2 || !(strings.Contains(lower, "inside") || strings.Contains(lower, "folder in")) {
-		return nil, false
-	}
-	root := cleanRequestedFolder(matches[0][1])
-	if root == "" {
-		return nil, false
-	}
-	paths := []string{root}
-	for _, match := range matches[1:] {
-		name := cleanRequestedFolder(match[1])
-		if name == "" || strings.Contains(name, "/") {
-			return nil, false
-		}
-		paths = append(paths, root+"/"+name)
-	}
-	return []ai.Action{{Type: "ensure_folders", Paths: paths}}, true
-}
-
-// compoundFolderActions handles explicit folder-only requests without asking
-// the model to infer paths from the current vault tree. The tree describes
-// existing folders; it does not constrain where a user may create a new one.
-func compoundFolderActions(input string) ([]ai.Action, bool) {
-	clauses := strings.Split(strings.Trim(strings.TrimSpace(input), ".!?"), " and ")
-	if len(clauses) < 2 {
-		return nil, false
-	}
-
-	match := firstFolderClause.FindStringSubmatch(clauses[0])
-	if len(match) != 2 {
-		return nil, false
-	}
-	root := cleanRequestedFolder(match[1])
-	if root == "" {
-		return nil, false
-	}
-
-	paths := []string{root}
-	currentParent := root
-	for _, clause := range clauses[1:] {
-		match = nestedFolderClause.FindStringSubmatch(clause)
-		if len(match) == 3 {
-			parent := currentParent
-			if match[1] != "" {
-				parent = cleanRequestedFolder(match[1])
-			}
-			name := cleanRequestedFolder(match[2])
-			if parent == "" || name == "" || strings.Contains(name, "/") {
-				return nil, false
-			}
-			currentParent = parent + "/" + name
-			paths = append(paths, currentParent)
-			continue
-		}
-		match = siblingFolderClause.FindStringSubmatch(clause)
-		if len(match) != 2 {
-			return nil, false
-		}
-		folder := cleanRequestedFolder(match[1])
-		if folder == "" {
-			return nil, false
-		}
-		paths = append(paths, folder)
-		currentParent = folder
-	}
-
-	return []ai.Action{{Type: "ensure_folders", Paths: paths}}, true
-}
-
-func cleanRequestedFolder(folder string) string {
-	return strings.Trim(strings.TrimSpace(folder), "`\"'")
-}
-
-// hasAdditionalFolderWork keeps this fast path from taking a compound request
-// such as "create a folder for work and move notes into it" away from the
-// model, which has the context needed to handle all requested operations.
-func hasAdditionalFolderWork(folder string) bool {
-	folder = strings.ToLower(folder)
-	return strings.HasPrefix(folder, "for ") ||
-		strings.Contains(folder, " and ") ||
-		strings.Contains(folder, " then ") ||
-		strings.Contains(folder, " with ")
-}
-
-func printCatalog(catalog []retrieval.CatalogEntry) string {
-	reply := catalogText(catalog)
-	fmt.Println("\nAthena")
-	fmt.Println(reply)
-	return reply
 }
 
 func catalogText(catalog []retrieval.CatalogEntry) string {
@@ -462,66 +113,19 @@ func catalogText(catalog []retrieval.CatalogEntry) string {
 	return b.String()
 }
 
-// isBookMoveRequest recognizes a high-confidence organization request that
-// should not rely on a small local model correctly producing tool JSON.
-func isBookMoveRequest(input string) bool {
-	q := strings.ToLower(input)
-	return strings.Contains(q, "book") && strings.Contains(q, "folder") &&
-		strings.Contains(q, "reading") && strings.Contains(q, "move")
-}
-
-func bookMoveActions(input string, catalog []retrieval.CatalogEntry) ([]ai.Action, bool) {
-	queryWords := significantWords(input)
-	bestID, bestScore, ties := int64(0), 0, 0
-	for _, note := range catalog {
-		score := 0
-		for word := range significantWords(note.Title) {
-			if queryWords[word] {
-				score++
-			}
-		}
-		if score > bestScore {
-			bestID, bestScore, ties = note.ID, score, 1
-		} else if score == bestScore && score > 0 {
-			ties++
-		}
-	}
-	// Two title words (or a distinctive short ID such as D3) avoids moving a
-	// random note when the wording is ambiguous.
-	if bestScore < 2 || ties != 1 {
-		return nil, false
-	}
-	return []ai.Action{
-		{Type: "ensure_folders", Paths: []string{"book/reading"}},
-		{Type: "move_note", NoteID: bestID, Folder: "book/reading"},
-	}, true
-}
-
-func significantWords(text string) map[string]bool {
-	stop := map[string]bool{
-		"a": true, "about": true, "and": true, "book": true, "folder": true,
-		"for": true, "have": true, "i": true, "in": true, "make": true,
-		"me": true, "move": true, "my": true, "note": true, "reading": true,
-		"subfolder": true, "that": true, "the": true, "to": true, "want": true,
-		"with": true,
-	}
-	words := strings.FieldsFunc(strings.ToLower(text), func(r rune) bool {
-		return (r < 'a' || r > 'z') && (r < '0' || r > '9')
-	})
-	out := make(map[string]bool, len(words))
-	for _, word := range words {
-		if !stop[word] && (len(word) >= 3 || (len(word) >= 2 && word[0] >= '0' && word[0] <= '9')) {
-			out[word] = true
-		}
-	}
-	return out
-}
-
-func (l *Loop) runActions(ctx context.Context, actions []ai.Action) string {
+// runActionsWithStatus remains only as a compatibility path for plans created
+// before resumable agent state was introduced. New plans execute through the
+// agent driver's dispatcher boundary.
+func (l *Loop) runActionsWithStatus(ctx context.Context, actions []ai.Action, status func(string)) string {
 	if l.dispatcher == nil {
 		return "I can't make changes because the action handler is unavailable."
 	}
-	results := l.dispatcher.RunBatch(ctx, actions, 4)
+	progressCtx := tools.WithActionProgress(ctx, func(progress tools.ActionProgress) {
+		if status != nil {
+			status(actionProgressMessage(progress))
+		}
+	})
+	results := l.dispatcher.RunBatch(progressCtx, actions, 4)
 	var b strings.Builder
 	for _, result := range results {
 		if result.Err != nil {
@@ -533,68 +137,84 @@ func (l *Loop) runActions(ctx context.Context, actions []ai.Action) string {
 	return strings.TrimSpace(b.String())
 }
 
-func (l *Loop) printModels() {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	models, err := l.ai.ChatModels(ctx)
-	if err != nil {
-		fmt.Printf("Could not list Ollama models: %v\n", err)
-		return
+func actionProgressMessage(progress tools.ActionProgress) string {
+	target := actionTarget(progress.Action)
+	if progress.State == "started" {
+		return actionVerb(progress.Action) + " " + target
 	}
-	if len(models) == 0 {
-		fmt.Println("No chat-capable Ollama models found.")
-		return
+	if progress.Error != nil {
+		return "Could not " + strings.ToLower(actionVerb(progress.Action)) + " " + target + ": " + progress.Error.Error()
 	}
-	current := l.ai.ChatModel()
-	fmt.Println("Available chat models:")
-	for i, model := range models {
-		marker := " "
-		if model.Name == current {
-			marker = "*"
-		}
-		details := model.ParameterSize
-		if details == "" {
-			details = "local"
-		}
-		fmt.Printf("  %s %d. %s (%s)\n", marker, i+1, model.Name, details)
+	if progress.Message != "" {
+		return progress.Message
 	}
-	fmt.Println("Use /model <number-or-name> to switch.")
+	return "Finished " + target
 }
 
-func (l *Loop) selectModel(choice string) {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	models, err := l.ai.ChatModels(ctx)
-	if err != nil {
-		fmt.Printf("Could not list Ollama models: %v\n", err)
-		return
+func actionVerb(action ai.Action) string {
+	switch action.Type {
+	case "create_note", "create_task", "create_book":
+		return "Creating"
+	case "update_note", "replace_section", "rename_note":
+		return "Editing"
+	case "append_note", "mark_done":
+		return "Updating"
+	case "move_note", "move_folder":
+		return "Moving"
+	case "delete_folder", "trash_note":
+		return "Removing"
+	case "restore_note":
+		return "Restoring"
+	case "archive_note":
+		return "Archiving"
+	case "unarchive_note":
+		return "Unarchiving"
+	case "ensure_folders", "create_folder":
+		return "Preparing"
+	case "link_folders":
+		return "Linking"
+	case "unlink_folders":
+		return "Unlinking"
+	case "set_folder_colors":
+		return "Coloring"
+	case "set_graph_node_size":
+		return "Resizing"
+	case "finish_book":
+		return "Finishing"
+	default:
+		return "Running"
 	}
+}
 
-	selected := ""
-	if n, err := strconv.Atoi(choice); err == nil {
-		if n >= 1 && n <= len(models) {
-			selected = models[n-1].Name
-		}
-	} else {
-		for _, model := range models {
-			if model.Name == choice {
-				selected = model.Name
-				break
+func actionTarget(action ai.Action) string {
+	switch action.Type {
+	case "create_note", "create_task", "create_book":
+		kind := strings.TrimPrefix(action.Type, "create_")
+		return fmt.Sprintf("%s %q", kind, action.Title)
+	case "update_note", "append_note", "replace_section", "rename_note", "duplicate_note", "trash_note", "restore_note", "archive_note", "unarchive_note":
+		if action.NoteID != 0 {
+			if action.Section != "" {
+				return fmt.Sprintf("section %q in note %d", action.Section, action.NoteID)
 			}
+			return fmt.Sprintf("note %d", action.NoteID)
 		}
-	}
-	if selected == "" {
-		fmt.Println("That model was not found. Run /models to see choices.")
-		return
-	}
-
-	l.ai.SetChatModel(selected)
-	if l.config != nil {
-		l.config.ChatModel = selected
-		if err := l.config.Save(); err != nil {
-			fmt.Printf("Using %s for this session, but could not save the choice: %v\n", selected, err)
-			return
+	case "move_note":
+		return fmt.Sprintf("note %d to %s", action.NoteID, action.Folder)
+	case "create_folder", "delete_folder", "folder_exists":
+		return fmt.Sprintf("folder %q", action.Folder)
+	case "set_folder_colors":
+		if action.IncludeChildren {
+			return fmt.Sprintf("folder %q and its direct subfolders", action.Folder)
 		}
+		return fmt.Sprintf("folder %q", action.Folder)
+	case "set_graph_node_size":
+		return fmt.Sprintf("all graph nodes to %.2gx", action.NodeSizeMultiplier)
+	case "ensure_folders":
+		return "folders " + strings.Join(action.Paths, ", ")
+	case "link_folders", "unlink_folders":
+		return "folders " + strings.Join(action.Folders, ", ")
+	case "move_folder":
+		return fmt.Sprintf("folder %q", action.Folder)
 	}
-	fmt.Printf("Chat model switched to %s.\n", selected)
+	return strings.ReplaceAll(action.Type, "_", " ")
 }
