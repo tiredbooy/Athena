@@ -20,12 +20,19 @@
             "session.submit",
             "session.cancel",
             "plan.approve",
-            "plan.reject"
+            "plan.reject",
+            "model.list",
+            "model.select",
+            "provider.list",
+            "provider.connect",
+            "provider.oauth.start"
           ]
         },
         "input": { "type": "string" },
         "turnId": { "type": "string" },
-        "planId": { "type": "string" }
+        "planId": { "type": "string" },
+        "providerId": { "type": "string" },
+        "model": { "type": "string" }
       }
     },
     "activity": {
@@ -53,6 +60,16 @@
         "paths": { "type": "array", "items": { "type": "string" } }
       }
     },
+    "modelOption": {
+      "type": "object",
+      "required": ["providerId", "providerName", "model", "current"],
+      "properties": {
+        "providerId": { "type": "string" },
+        "providerName": { "type": "string" },
+        "model": { "type": "string" },
+        "current": { "type": "boolean" }
+      }
+    },
     "event": {
       "type": "object",
       "required": ["version", "type"],
@@ -64,6 +81,9 @@
         "planId": { "type": "string" },
         "message": { "type": "string" },
         "error": { "type": "string" },
+        "provider": { "type": "string" },
+        "model": { "type": "string" },
+        "models": { "type": "array", "items": { "$ref": "#/$defs/modelOption" } },
         "activity": { "$ref": "#/$defs/activity" },
         "actions": { "type": "array", "items": { "$ref": "#/$defs/action" } }
       }

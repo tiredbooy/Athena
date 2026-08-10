@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/tiredbooy/internal/ai"
@@ -49,6 +50,19 @@ func TestRejectedNativeToolsAreRememberedAndFallbackIsReused(t *testing.T) {
 	got, err = session.runReadToolLoop(t.Context(), []models.Message{{Role: "user", Content: "read another note"}}, nil)
 	if err != nil || got != "fallback answer" || provider.calls != 3 {
 		t.Fatalf("remembered fallback = %q, err=%v, calls=%d", got, err, provider.calls)
+	}
+}
+
+func TestRejectedToolHistoryFallsBackWithCollectedReadFacts(t *testing.T) {
+	provider := &rejectingToolHistoryProvider{}
+	session := &Session{loop: &Loop{ai: provider}}
+
+	got, err := session.runReadToolLoop(t.Context(), []models.Message{{Role: "user", Content: "organize my books"}}, nil)
+	if err != nil || got != "fallback using folder inventory" {
+		t.Fatalf("fallback = %q, err=%v", got, err)
+	}
+	if provider.calls != 3 || session.nativeToolsDisabledModel != "test" {
+		t.Fatalf("calls=%d disabled=%q", provider.calls, session.nativeToolsDisabledModel)
 	}
 }
 
@@ -117,6 +131,49 @@ func (p *rejectingToolProvider) StreamChatWith(context.Context, []models.Message
 }
 
 type knownPlainChatProvider struct{ calls int }
+
+type rejectingToolHistoryProvider struct{ calls int }
+
+func (p *rejectingToolHistoryProvider) Name() string        { return "Ollama" }
+func (p *rejectingToolHistoryProvider) ChatModel() string   { return "test" }
+func (p *rejectingToolHistoryProvider) SetChatModel(string) {}
+func (p *rejectingToolHistoryProvider) ChatModels(_ context.Context) ([]ai.ModelInfo, error) {
+	return nil, nil
+}
+func (p *rejectingToolHistoryProvider) ChatWithToolsResult(_ context.Context, messages []models.Message, tools []models.ToolDefinition) (ai.ToolChatResult, error) {
+	p.calls++
+	switch p.calls {
+	case 1:
+		return ai.ToolChatResult{Message: models.Message{
+			Role: "assistant",
+			ToolCalls: []models.ToolCall{{ID: "call-folders", Type: "function", Function: models.ToolCallFunction{
+				Name: "unsupported_read", Arguments: json.RawMessage(`{}`),
+			}}},
+		}}, nil
+	case 2:
+		return ai.ToolChatResult{}, errors.New("ollama tool chat returned status 400: invalid tool history")
+	default:
+		if len(tools) != 0 {
+			return ai.ToolChatResult{}, errors.New("fallback still included native tool definitions")
+		}
+		foundReadFacts := false
+		for _, message := range messages {
+			if message.Role == "tool" || len(message.ToolCalls) > 0 {
+				return ai.ToolChatResult{}, errors.New("fallback retained native tool protocol")
+			}
+			if message.Role == "system" && strings.Contains(message.Content, "ATHENA READ TOOL RESULT") && strings.Contains(message.Content, "unsupported_read") {
+				foundReadFacts = true
+			}
+		}
+		if !foundReadFacts {
+			return ai.ToolChatResult{}, errors.New("fallback discarded collected read facts")
+		}
+		return ai.ToolChatResult{Message: models.Message{Role: "assistant", Content: "fallback using folder inventory"}}, nil
+	}
+}
+func (p *rejectingToolHistoryProvider) StreamChatWith(context.Context, []models.Message, ai.StreamCallbacks) (string, error) {
+	return "", nil
+}
 
 func (p *knownPlainChatProvider) Name() string        { return "Ollama" }
 func (p *knownPlainChatProvider) ChatModel() string   { return "test" }

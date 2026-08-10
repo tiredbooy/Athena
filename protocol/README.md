@@ -11,6 +11,11 @@ The initial v1 slice supports:
 - `session.cancel`
 - `plan.approve`
 - `plan.reject`
+- `model.list`
+- `model.select`
+- `provider.list`
+- `provider.connect`
+- `provider.oauth.start`
 
 Every request needs `version: 1`, a client-generated `requestId`, and a
 `type`. A submitted turn receives a `turn.started` event, zero or more
@@ -27,6 +32,6 @@ Example:
 {"version":1,"requestId":"r2","type":"session.submit","turnId":"t1","input":"create a work folder"}
 ```
 
-See `athena.v1.schema.json` for the language-neutral envelope. The next
-migration slice adds models, provider connection, and doctor requests once the
-Ink client has a working conversation, cancellation, and approval flow.
+See `athena.v1.schema.json` for the language-neutral envelope. Model discovery
+and selection stay in the Go application layer; the Ink client only renders
+the returned options and sends the selected provider/model identity back.

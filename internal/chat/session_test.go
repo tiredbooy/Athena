@@ -74,6 +74,13 @@ func TestImplicitFolderCreationIsBlockedForRelationshipRequests(t *testing.T) {
 	if warning := implicitFolderCreationWarning("create a note in books/reading/computer science", actions); warning != "" {
 		t.Fatalf("named note destination was blocked: %q", warning)
 	}
+	bookRequest := `go into my books folder and i want you to add new book that i started reading into correct "reading/book genre" i started reading Project Mary Hill and Thinking Fast, And slow`
+	if warning := implicitFolderCreationWarning(bookRequest, actions); warning != "" {
+		t.Fatalf("named book destinations were blocked: %q", warning)
+	}
+	if warning := implicitFolderCreationWarning("start a task under work/projects", actions); warning != "" {
+		t.Fatalf("named task destination was blocked: %q", warning)
+	}
 }
 
 func TestHasPendingActionsReflectsSessionState(t *testing.T) {

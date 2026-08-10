@@ -24,6 +24,8 @@ const (
 	RequestCancel          = "session.cancel"
 	RequestPlanApprove     = "plan.approve"
 	RequestPlanReject      = "plan.reject"
+	RequestModelList       = "model.list"
+	RequestModelSelect     = "model.select"
 	RequestProviderList    = "provider.list"
 	RequestProviderConnect = "provider.connect"
 	RequestProviderOAuth   = "provider.oauth.start"
@@ -38,6 +40,7 @@ type Request struct {
 	TurnID     string                `json:"turnId,omitempty"`
 	PlanID     string                `json:"planId,omitempty"`
 	ProviderID string                `json:"providerId,omitempty"`
+	Model      string                `json:"model,omitempty"`
 	Connection *chat.ConnectionInput `json:"connection,omitempty"`
 }
 
@@ -55,6 +58,7 @@ type Event struct {
 	Model     string                `json:"model,omitempty"`
 	Activity  *chat.ActivityEvent   `json:"activity,omitempty"`
 	Actions   []ai.Action           `json:"actions,omitempty"`
+	Models    []chat.ModelOption    `json:"models,omitempty"`
 	Presets   []chat.ProviderPreset `json:"presets,omitempty"`
 }
 
@@ -139,6 +143,10 @@ func validate(request Request) error {
 		if strings.TrimSpace(request.PlanID) == "" {
 			return fmt.Errorf("planId is required for %s", request.Type)
 		}
+	case RequestModelSelect:
+		if strings.TrimSpace(request.ProviderID) == "" || strings.TrimSpace(request.Model) == "" {
+			return fmt.Errorf("providerId and model are required for %s", request.Type)
+		}
 	case RequestProviderConnect:
 		if request.Connection == nil {
 			return fmt.Errorf("connection is required for %s", request.Type)
@@ -164,6 +172,21 @@ func (s *Server) handle(request Request) {
 		s.startPlanApproval(request, true)
 	case RequestPlanReject:
 		s.startPlanApproval(request, false)
+	case RequestModelList:
+		models, err := s.session.Models(s.ctx)
+		if err != nil {
+			s.emit(Event{RequestID: request.RequestID, Type: "error", Error: err.Error()})
+			return
+		}
+		s.emit(Event{RequestID: request.RequestID, Type: "model.options", Models: models})
+	case RequestModelSelect:
+		message, err := s.session.SelectModel(s.ctx, chat.ModelOption{ProviderID: request.ProviderID, Model: request.Model})
+		if err != nil {
+			s.emit(Event{RequestID: request.RequestID, Type: "error", Error: err.Error()})
+			return
+		}
+		provider, model := s.session.ModelInfo()
+		s.emit(Event{RequestID: request.RequestID, Type: "model.selected", Message: message, Provider: provider, Model: model})
 	case RequestProviderList:
 		s.emit(Event{RequestID: request.RequestID, Type: "provider.presets", Presets: s.session.ProviderPresets()})
 	case RequestProviderConnect:

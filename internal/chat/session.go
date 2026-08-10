@@ -120,7 +120,7 @@ func (s *Session) submit(ctx context.Context, input string, observer runObserver
 // implicitFolderCreationWarning blocks the most damaging weak-model failure:
 // turning an uncertain move/link request into new directories. Folder creation
 // is allowed when the user's wording explicitly asks for it or names a
-// destination for a new note; otherwise the user gets a deterministic
+// destination for new content; otherwise the user gets a deterministic
 // explanation instead of a filesystem mutation.
 func implicitFolderCreationWarning(input string, actions []ai.Action) string {
 	needsCreation := false
@@ -138,7 +138,7 @@ func implicitFolderCreationWarning(input string, actions []ai.Action) string {
 
 func explicitlyRequestsFolderCreation(input string) bool {
 	input = strings.ToLower(strings.TrimSpace(input))
-	if explicitlyRequestsNoteDestination(input) {
+	if explicitlyRequestsContentDestination(input) {
 		return true
 	}
 	if !strings.Contains(input, "folder") && !strings.Contains(input, "directory") {
@@ -163,16 +163,16 @@ func explicitlyRequestsFolderCreation(input string) bool {
 	return false
 }
 
-// A named destination for a newly requested note is also explicit permission
-// to prepare that destination. This keeps normal note capture useful while
-// leaving relationship and reorganization requests protected by the warning
-// above.
-func explicitlyRequestsNoteDestination(input string) bool {
-	if !strings.Contains(input, "note") ||
-		(!strings.Contains(input, "create") && !strings.Contains(input, "add") && !strings.Contains(input, "make")) {
+// A named destination for newly requested content is explicit permission to
+// prepare that destination. Books and tasks use the same validated creation
+// path as notes, so applying a note-only wording rule rejects legitimate plans.
+func explicitlyRequestsContentDestination(input string) bool {
+	hasContentKind := containsAny(input, []string{"note", "book", "task"})
+	hasCreateIntent := containsAny(input, []string{"create", "add", "make", "start"})
+	if !hasContentKind || !hasCreateIntent {
 		return false
 	}
-	for _, phrase := range []string{" in ", " under ", " inside ", " within "} {
+	for _, phrase := range []string{" in ", " into ", " under ", " inside ", " within "} {
 		if strings.Contains(input, phrase) {
 			return true
 		}
@@ -357,7 +357,7 @@ func (s *Session) command(ctx context.Context, input string) (string, error) {
 	case "/doctor":
 		return s.loop.Doctor(ctx), nil
 	case "/models":
-		available, err := s.Models(ctx)
+		available, err := s.loop.Models(ctx)
 		if err != nil {
 			return "", fmt.Errorf("list models: %w", err)
 		}
@@ -378,7 +378,7 @@ func (s *Session) command(ctx context.Context, input string) (string, error) {
 		if len(fields) != 2 {
 			return "Usage: /model <number-or-name>", nil
 		}
-		available, err := s.Models(ctx)
+		available, err := s.loop.Models(ctx)
 		if err != nil {
 			return "", fmt.Errorf("list models: %w", err)
 		}
@@ -391,7 +391,7 @@ func (s *Session) command(ctx context.Context, input string) (string, error) {
 		}
 		for _, model := range available {
 			if model.Model == selected {
-				return s.SelectModel(ctx, model)
+				return s.loop.SelectModel(ctx, model.ProviderID, model.Model)
 			}
 		}
 		return fmt.Sprintf("Model %q is not available. Run /models first.", selected), nil

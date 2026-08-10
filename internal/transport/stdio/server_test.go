@@ -6,8 +6,25 @@ import (
 	"encoding/json"
 	"testing"
 
+	"github.com/tiredbooy/internal/ai"
 	"github.com/tiredbooy/internal/chat"
+	"github.com/tiredbooy/internal/models"
 )
+
+type modelProvider struct{ model string }
+
+func (p *modelProvider) Name() string          { return "Ollama" }
+func (p *modelProvider) ChatModel() string     { return p.model }
+func (p *modelProvider) SetChatModel(v string) { p.model = v }
+func (p *modelProvider) ChatModels(context.Context) ([]ai.ModelInfo, error) {
+	return []ai.ModelInfo{{Name: "small-chat"}, {Name: "large-chat"}}, nil
+}
+func (p *modelProvider) ChatWithToolsResult(context.Context, []models.Message, []models.ToolDefinition) (ai.ToolChatResult, error) {
+	return ai.ToolChatResult{}, nil
+}
+func (p *modelProvider) StreamChatWith(context.Context, []models.Message, ai.StreamCallbacks) (string, error) {
+	return "", nil
+}
 
 func TestServeHandlesMalformedRequestThenHello(t *testing.T) {
 	input := bytes.NewBufferString("not json\n{\"version\":1,\"requestId\":\"hello-1\",\"type\":\"engine.hello\"}\n")
@@ -68,13 +85,43 @@ func TestValidateRequiresOperationFields(t *testing.T) {
 		{Version: ProtocolVersion, RequestID: "r2", Type: RequestCancel},
 		{Version: ProtocolVersion, RequestID: "r3", Type: RequestPlanApprove},
 		{Version: ProtocolVersion, RequestID: "r4", Type: RequestPlanReject},
-		{Version: ProtocolVersion, RequestID: "r5", Type: RequestProviderConnect},
-		{Version: ProtocolVersion, RequestID: "r6", Type: RequestProviderOAuth},
+		{Version: ProtocolVersion, RequestID: "r5", Type: RequestModelSelect},
+		{Version: ProtocolVersion, RequestID: "r6", Type: RequestProviderConnect},
+		{Version: ProtocolVersion, RequestID: "r7", Type: RequestProviderOAuth},
 	}
 	for _, request := range tests {
 		if err := validate(request); err == nil {
 			t.Fatalf("request without operation field was accepted: %#v", request)
 		}
+	}
+}
+
+func TestServeListsAndSelectsModelsThroughSessionBoundary(t *testing.T) {
+	provider := &modelProvider{model: "small-chat"}
+	loop := chat.NewLoop(provider, map[string]ai.ChatProvider{"ollama": provider}, nil, nil, nil, nil)
+	session := chat.NewSession(loop)
+	input := bytes.NewBufferString(
+		`{"version":1,"requestId":"models-1","type":"model.list"}` + "\n" +
+			`{"version":1,"requestId":"models-2","type":"model.select","providerId":"ollama","model":"large-chat"}` + "\n",
+	)
+	var output bytes.Buffer
+	if err := Serve(context.Background(), input, &output, session); err != nil {
+		t.Fatalf("serve: %v", err)
+	}
+
+	decoder := json.NewDecoder(&output)
+	var listed, selected Event
+	if err := decoder.Decode(&listed); err != nil {
+		t.Fatal(err)
+	}
+	if err := decoder.Decode(&selected); err != nil {
+		t.Fatal(err)
+	}
+	if listed.Type != "model.options" || len(listed.Models) != 2 || !listed.Models[0].Current {
+		t.Fatalf("listed models = %#v", listed)
+	}
+	if selected.Type != "model.selected" || selected.Provider != "Ollama" || selected.Model != "large-chat" {
+		t.Fatalf("selected model = %#v", selected)
 	}
 }
 

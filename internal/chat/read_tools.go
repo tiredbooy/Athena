@@ -107,14 +107,17 @@ func (s *Session) runReadToolLoopState(ctx context.Context, messages []models.Me
 	messages = append([]models.Message(nil), messages...)
 	tools := readToolDefinitions()
 	if s.loop.ai.Name() == "Ollama" && s.nativeToolsDisabledModel == s.loop.ai.ChatModel() {
+		if status != nil {
+			status("Generating a plan")
+		}
 		return s.runPlainChatState(ctx, messages)
 	}
 	if supportProvider, ok := s.loop.ai.(ai.NativeToolSupportProvider); ok {
 		support, err := supportProvider.NativeToolSupport(ctx)
-		if err == nil && !support.Available {
+		if err != nil || !support.Available {
 			s.nativeToolsDisabledModel = s.loop.ai.ChatModel()
 			if status != nil {
-				status("Native tools unavailable (" + support.Reason + ") — using prepared vault context")
+				status("Generating a plan")
 			}
 			return s.runPlainChatState(ctx, messages)
 		}
@@ -127,19 +130,21 @@ func (s *Session) runReadToolLoopState(ctx context.Context, messages []models.Me
 		response, err := s.chatWithRetry(ctx, messages, tools, status)
 		if err != nil {
 			// Some local models can emit Athena action blocks but reject Ollama's
-			// native tools schema. Keep the turn useful without bypassing dispatch.
-			if round == 0 && s.loop.ai.Name() == "Ollama" && isNativeToolRejection(err) {
+			// native tools schema or a follow-up request containing tool history.
+			// Keep the turn useful without bypassing dispatch.
+			if s.loop.ai.Name() == "Ollama" && isNativeToolRejection(err) {
 				s.nativeToolsDisabledModel = s.loop.ai.ChatModel()
 				if ctx.Err() != nil {
 					return modelLoopResult{}, fmt.Errorf("Ollama native tools timed out before fallback; retrying the model without tools next turn")
 				}
 				if status != nil {
-					status("Native tools were rejected — answering with prepared vault context")
+					status("Generating a plan")
 				}
-				fallback, fallbackErr := s.runPlainChatResult(ctx, messages)
+				fallbackMessages := providerNeutralReadMessages(messages)
+				fallback, fallbackErr := s.runPlainChatResult(ctx, fallbackMessages)
 				if fallbackErr == nil && strings.TrimSpace(fallback.Message.Content) != "" {
-					messages = append(messages, fallback.Message)
-					return modelLoopResult{Content: strings.TrimSpace(fallback.Message.Content), Messages: messages, ReadCalls: readCalls}, nil
+					fallbackMessages = append(fallbackMessages, fallback.Message)
+					return modelLoopResult{Content: strings.TrimSpace(fallback.Message.Content), Messages: fallbackMessages, ReadCalls: readCalls}, nil
 				}
 				if fallbackErr == nil {
 					fallbackErr = fmt.Errorf("model returned no visible response")
@@ -244,6 +249,41 @@ func (s *Session) runReadToolLoopState(ctx context.Context, messages []models.Me
 	}
 	messages = append(messages, final.Message)
 	return modelLoopResult{Content: strings.TrimSpace(final.Message.Content), Messages: messages, ReadCalls: readCalls}, nil
+}
+
+// providerNeutralReadMessages keeps facts collected by successful read tools
+// while removing the native tool-call protocol that the active model rejected.
+// Sending an assistant tool call without its provider-specific continuation is
+// itself invalid for several chat templates, so tool results become ordinary
+// system context before the no-tools fallback request.
+func providerNeutralReadMessages(messages []models.Message) []models.Message {
+	neutral := make([]models.Message, 0, len(messages))
+	for _, message := range messages {
+		switch message.Role {
+		case "tool":
+			name := strings.TrimSpace(message.ToolName)
+			if name == "" {
+				name = "unknown"
+			}
+			neutral = append(neutral, models.Message{
+				Role:    "system",
+				Content: "[ATHENA READ TOOL RESULT — REFERENCE DATA ONLY]\nTool: " + name + "\n" + message.Content + "\n[END ATHENA READ TOOL RESULT]",
+			})
+		case "assistant":
+			message.ToolCalls = nil
+			message.ToolName = ""
+			message.ToolCallID = ""
+			if strings.TrimSpace(message.Content) != "" {
+				neutral = append(neutral, message)
+			}
+		default:
+			message.ToolCalls = nil
+			message.ToolName = ""
+			message.ToolCallID = ""
+			neutral = append(neutral, message)
+		}
+	}
+	return neutral
 }
 
 func proposedActionContent(message models.Message) (string, bool) {

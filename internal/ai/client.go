@@ -284,7 +284,7 @@ func (c *Client) CreativeText(ctx context.Context, messages []models.Message, te
 	model := c.ChatModel()
 	body, err := json.Marshal(models.MessageReq{
 		Model:     model,
-		Messages:  messages,
+		Messages:  ollamaMessages(messages),
 		Stream:    false,
 		Think:     false,
 		KeepAlive: "60s",
@@ -308,7 +308,7 @@ func (c *Client) CreativeText(ctx context.Context, messages []models.Message, te
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		b, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
-		return "", fmt.Errorf("ollama creative text returned status %d: %s", resp.StatusCode, strings.TrimSpace(string(b)))
+		return "", fmt.Errorf("ollama creative text returned status %d: %s", resp.StatusCode, ollamaErrorDetail(b))
 	}
 	var out chatResponse
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
@@ -326,11 +326,13 @@ func (c *Client) ChatWithToolsResult(ctx context.Context, messages []models.Mess
 
 	model := c.ChatModel()
 	body, err := json.Marshal(models.MessageReq{
-		Model:     model,
-		Messages:  messages,
-		Tools:     tools,
-		Stream:    false,
-		Think:     shouldThink(model),
+		Model:    model,
+		Messages: ollamaMessages(messages),
+		Tools:    tools,
+		Stream:   false,
+		// Native tool planning benefits from private reasoning. Plain fallback
+		// must stay quick and produce visible content for tool-less templates.
+		Think:     len(tools) > 0 && shouldThink(model),
 		KeepAlive: "60s",
 		Options:   localChatOptions(),
 	})
@@ -357,7 +359,7 @@ func (c *Client) ChatWithToolsResult(ctx context.Context, messages []models.Mess
 		if len(tools) > 0 {
 			operation = "tool chat"
 		}
-		return ToolChatResult{}, fmt.Errorf("ollama %s returned status %d: %s", operation, resp.StatusCode, strings.TrimSpace(string(b)))
+		return ToolChatResult{}, fmt.Errorf("ollama %s returned status %d: %s", operation, resp.StatusCode, ollamaErrorDetail(b))
 	}
 	var out chatResponse
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
@@ -389,7 +391,7 @@ func (c *Client) StreamChatWith(ctx context.Context, messages []models.Message, 
 
 	body, err := json.Marshal(models.MessageReq{
 		Model:     model,
-		Messages:  messages,
+		Messages:  ollamaMessages(messages),
 		Stream:    true,
 		Think:     shouldThink(model),
 		KeepAlive: "60s",
@@ -413,7 +415,7 @@ func (c *Client) StreamChatWith(ctx context.Context, messages []models.Message, 
 
 	if resp.StatusCode != http.StatusOK {
 		b, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
-		return "", fmt.Errorf("ollama chat returned status %d: %s", resp.StatusCode, strings.TrimSpace(string(b)))
+		return "", fmt.Errorf("ollama chat returned status %d: %s", resp.StatusCode, ollamaErrorDetail(b))
 	}
 
 	var full strings.Builder
@@ -456,6 +458,103 @@ func shouldThink(model string) bool {
 		}
 	}
 	return false
+}
+
+// ollamaMessages accommodates strict custom chat templates that accept a
+// system role only as the first message. Stable instructions are combined at
+// the beginning. A trailing engine observation must remain after the previous
+// assistant action, so expose it as a clearly marked provider-level user turn;
+// internally it remains a system-owned fact and is never added to chat history
+// as user-authored content.
+func ollamaMessages(messages []models.Message) []models.Message {
+	lastNonSystem := -1
+	for index, message := range messages {
+		if message.Role != "system" {
+			lastNonSystem = index
+		}
+	}
+
+	var systemContent []string
+	var continuationContent []string
+	nonSystem := make([]models.Message, 0, len(messages))
+	for index, message := range messages {
+		if message.Role == "system" {
+			if content := strings.TrimSpace(message.Content); content != "" {
+				if lastNonSystem >= 0 && index > lastNonSystem {
+					continuationContent = append(continuationContent, content)
+				} else {
+					systemContent = append(systemContent, content)
+				}
+			}
+			continue
+		}
+		nonSystem = append(nonSystem, message)
+	}
+
+	normalized := make([]models.Message, 0, len(nonSystem)+2)
+	if len(systemContent) > 0 {
+		normalized = append(normalized, models.Message{Role: "system", Content: strings.Join(systemContent, "\n\n")})
+	}
+	normalized = append(normalized, nonSystem...)
+	if len(continuationContent) > 0 {
+		normalized = append(normalized, models.Message{
+			Role: "user",
+			Content: "[ATHENA ENGINE CONTINUATION — NOT USER-AUTHORED]\n" +
+				strings.Join(continuationContent, "\n\n") +
+				"\n[END ATHENA ENGINE CONTINUATION]",
+		})
+	}
+	if !hasUserMessage(normalized) {
+		normalized = append(normalized, models.Message{
+			Role:    "user",
+			Content: "[ATHENA ENGINE CONTINUATION — NOT USER-AUTHORED]\nRespond to the engine instructions above.\n[END ATHENA ENGINE CONTINUATION]",
+		})
+	}
+	return normalized
+}
+
+func hasUserMessage(messages []models.Message) bool {
+	for _, message := range messages {
+		if message.Role == "user" && strings.TrimSpace(message.Content) != "" {
+			return true
+		}
+	}
+	return false
+}
+
+// ollamaErrorDetail unwraps the nested JSON errors returned by some custom
+// templates. The raw escaped response is useful to a protocol debugger but is
+// too noisy for a terminal user and can occupy most of the transcript.
+func ollamaErrorDetail(body []byte) string {
+	detail := strings.TrimSpace(string(body))
+	for range 3 {
+		var envelope struct {
+			Error   json.RawMessage `json:"error"`
+			Message string          `json:"message"`
+		}
+		if json.Unmarshal([]byte(detail), &envelope) != nil {
+			break
+		}
+		if strings.TrimSpace(envelope.Message) != "" {
+			return strings.TrimSpace(envelope.Message)
+		}
+		if len(envelope.Error) == 0 {
+			break
+		}
+		var nestedText string
+		if json.Unmarshal(envelope.Error, &nestedText) == nil {
+			detail = strings.TrimSpace(nestedText)
+			continue
+		}
+		var nestedError struct {
+			Message string `json:"message"`
+		}
+		if json.Unmarshal(envelope.Error, &nestedError) == nil && strings.TrimSpace(nestedError.Message) != "" {
+			return strings.TrimSpace(nestedError.Message)
+		}
+		break
+	}
+	return detail
 }
 
 func localChatOptions() map[string]any {

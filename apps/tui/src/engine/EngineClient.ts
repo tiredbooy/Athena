@@ -56,6 +56,14 @@ export class EngineClient extends EventEmitter {
     return this.request("plan.reject", { planId });
   }
 
+  models(): Promise<EngineEvent> {
+    return this.request("model.list");
+  }
+
+  selectModel(providerId: string, model: string): Promise<EngineEvent> {
+    return this.request("model.select", { providerId, model });
+  }
+
   providers(): Promise<EngineEvent> {
     return this.request("provider.list");
   }

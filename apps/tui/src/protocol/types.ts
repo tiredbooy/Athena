@@ -6,6 +6,8 @@ export type RequestType =
   | "session.cancel"
   | "plan.approve"
   | "plan.reject"
+  | "model.list"
+  | "model.select"
   | "provider.list"
   | "provider.connect"
   | "provider.oauth.start";
@@ -31,6 +33,13 @@ export type ProviderConnection = {
   api_key_env?: string;
   api_key?: string;
   chat_model: string;
+};
+
+export type ModelOption = {
+  providerId: string;
+  providerName: string;
+  model: string;
+  current: boolean;
 };
 
 export type Action = {
@@ -69,6 +78,7 @@ export type EngineRequest = {
   turnId?: string;
   planId?: string;
   providerId?: string;
+  model?: string;
   connection?: ProviderConnection;
 };
 
@@ -82,6 +92,7 @@ export type EngineEvent = {
   error?: string;
   provider?: string;
   model?: string;
+  models?: ModelOption[];
   activity?: Activity;
   actions?: Action[];
   presets?: ProviderPreset[];

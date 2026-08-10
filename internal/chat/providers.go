@@ -10,10 +10,10 @@ import (
 )
 
 type ModelOption struct {
-	ProviderID   string
-	ProviderName string
-	Model        string
-	Current      bool
+	ProviderID   string `json:"providerId"`
+	ProviderName string `json:"providerName"`
+	Model        string `json:"model"`
+	Current      bool   `json:"current"`
 }
 
 type ConnectionInput struct {
@@ -54,8 +54,14 @@ func ProviderPresets() []ProviderPreset {
 
 func (s *Session) ProviderPresets() []ProviderPreset { return ProviderPresets() }
 
-func (s *Session) Models(ctx context.Context) ([]ModelOption, error) { return s.loop.Models(ctx) }
+func (s *Session) Models(ctx context.Context) ([]ModelOption, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.loop.Models(ctx)
+}
 func (s *Session) SelectModel(ctx context.Context, option ModelOption) (string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	return s.loop.SelectModel(ctx, option.ProviderID, option.Model)
 }
 func (s *Session) Connect(input ConnectionInput) (string, error) {
