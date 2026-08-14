@@ -21,12 +21,18 @@ ATHENA_ENGINE=/path/to/athena npm run build
 ATHENA_ENGINE=/path/to/athena npm start
 ```
 
+Use `/models` to open the engine-backed model picker. Arrow keys move through
+the installed models, Enter selects one, and Escape closes the picker.
+
 The Go process is always started with the `engine` argument. The legacy Go
 TUI remains the default `athena` experience until feature parity is reached.
 
-In a real terminal, drag across transcript text to copy it. Athena uses SGR
-mouse tracking and OSC 52, then clears the selection after the copy. Terminals
-without OSC 52 support may ignore the clipboard request.
+In a real terminal, use Page Up/Page Down or the mouse wheel to scroll the
+transcript. Drag across visible transcript text—including error messages—to
+copy it. Scrolling and selection share the same source-row mapping, so copied
+text keeps the correct message offsets. Athena uses SGR mouse tracking and OSC
+52, then clears the selection after the copy. Terminals without OSC 52 support
+may ignore the clipboard request.
 
 From the repository root, the automatic launcher is:
 

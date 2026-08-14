@@ -27,6 +27,13 @@ func TestOpenAICompatibleProviderChatWithTools(t *testing.T) {
 		if request.Model != "test-model" || len(request.Tools) != 1 {
 			t.Fatalf("unexpected request: %#v", request)
 		}
+		parameters := request.Tools[0].Function.Parameters
+		if parameters["type"] != "object" {
+			t.Fatalf("parameters = %#v", parameters)
+		}
+		if properties, ok := parameters["properties"].(map[string]any); !ok || properties == nil {
+			t.Fatalf("properties = %#v", parameters["properties"])
+		}
 		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(`{"choices":[{"finish_reason":"tool_calls","message":{"role":"assistant","content":"","tool_calls":[{"id":"call_1","type":"function","function":{"name":"list_folders","arguments":"{}"}}]}}]}`)), Header: make(http.Header)}, nil
 	})}
 	t.Setenv("ATHENA_TEST_KEY", "test-key")

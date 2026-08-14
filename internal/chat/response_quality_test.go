@@ -9,6 +9,9 @@ func TestExpectsActionRequestDistinguishesQuestions(t *testing.T) {
 	if !expectsActionRequest("can you move this note to archive") {
 		t.Fatal("polite change request was not detected")
 	}
+	if !expectsActionRequest(`organize my "books" into genre folders and style them`) {
+		t.Fatal("book organization request was not detected")
+	}
 	if expectsActionRequest("how do I create a note") {
 		t.Fatal("how-to question was treated as a vault change")
 	}

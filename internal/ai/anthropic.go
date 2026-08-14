@@ -88,7 +88,7 @@ func (p *AnthropicProvider) ChatWithToolsResult(ctx context.Context, messages []
 	request["messages"] = chatMessages
 	if len(definitions) > 0 {
 		tools := make([]map[string]any, 0, len(definitions))
-		for _, tool := range definitions {
+		for _, tool := range normalizedToolDefinitions(definitions) {
 			tools = append(tools, map[string]any{"name": tool.Function.Name, "description": tool.Function.Description, "input_schema": tool.Function.Parameters})
 		}
 		request["tools"] = tools

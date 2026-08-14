@@ -8,10 +8,11 @@ import (
 	"net/http"
 	"net/url"
 	"os"
-	"path/filepath"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/tiredbooy/internal/appdirs"
 )
 
 const (
@@ -63,7 +64,7 @@ type XAIOAuth struct {
 }
 
 func LoadXAIOAuth() (*XAIOAuth, error) {
-	path, err := xaiCredentialsPath()
+	path, err := appdirs.PrepareConfigFile("xai-oauth.json")
 	if err != nil {
 		return nil, err
 	}
@@ -330,9 +331,5 @@ func waitForContext(ctx context.Context, duration time.Duration) error {
 }
 
 func xaiCredentialsPath() (string, error) {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return "", fmt.Errorf("resolve home directory: %w", err)
-	}
-	return filepath.Join(home, ".config", "second-brain", "xai-oauth.json"), nil
+	return appdirs.ConfigFile("xai-oauth.json")
 }

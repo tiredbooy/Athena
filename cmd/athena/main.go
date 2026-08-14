@@ -91,7 +91,7 @@ func main() {
 	dispatcher.SetAuditLogger(storage.NewActionAuditStore(db))
 
 	if !engineMode {
-		fmt.Println("second-brain ready.")
+		fmt.Println("Athena ready.")
 		fmt.Printf("  vault: %s\n  db:    %s\n  model: %s\n\n", cfg.VaultPath, cfg.DBPath, cfg.ChatModel)
 	}
 
@@ -128,6 +128,7 @@ func main() {
 		activeProvider = client
 	}
 	loop := chat.NewLoop(activeProvider, providers, oauth, retrievalSvc, dispatcher, cfg)
+	loop.SetBookCatalog(bookResolver)
 	loop.SetCredentialStore(credentialStore)
 	loop.SetXAIOAuth(xaiOAuth)
 	session := chat.NewSession(loop)
@@ -202,7 +203,7 @@ func buildDispatcher(notesSvc *notes.Service, bookResolver *books.Resolver) *too
 	})
 
 	d.Register("create_book", func(ctx context.Context, a ai.Action) (string, error) {
-		metadata, err := bookResolver.Resolve(ctx, a.Title, a.ISBN)
+		metadata, err := bookResolver.ResolveWithFallback(ctx, a.Title, a.ISBN, a.Authors, a.Genres)
 		if err != nil {
 			return "", err
 		}
@@ -212,12 +213,23 @@ func buildDispatcher(notesSvc *notes.Service, bookResolver *books.Resolver) *too
 		}
 		path := utils.RelVault(notesSvc.VaultPath(), n.Path)
 		if !created {
-			return fmt.Sprintf("Book %q already exists at %s (left unchanged)", n.Title, path), nil
+			return fmt.Sprintf("Book %q (note %d) already exists at %s (left unchanged)", n.Title, n.ID, path), nil
 		}
 		if metadata.Source == "unresolved" {
-			return fmt.Sprintf("Created book %q. Its metadata is unknown; Athena did not guess.", n.Title), nil
+			return fmt.Sprintf("Created book %q (note %d) at %s. Its metadata is unknown; Athena did not guess.", n.Title, n.ID, path), nil
 		}
-		return fmt.Sprintf("Created book %q with metadata from %s", n.Title, metadata.Source), nil
+		genres := "none listed"
+		if len(metadata.Genres) > 0 {
+			genres = strings.Join(metadata.Genres, ", ")
+		}
+		return fmt.Sprintf("Created book %q (note %d) at %s with metadata from %s; catalog genres: %s", n.Title, n.ID, path, metadata.Source, genres), nil
+	})
+
+	d.Register("update_book_metadata", func(ctx context.Context, a ai.Action) (string, error) {
+		if err := notesSvc.UpdateBookMetadata(ctx, a.NoteID, a.Authors, a.Genres); err != nil {
+			return "", err
+		}
+		return fmt.Sprintf("Updated factual metadata for book %d", a.NoteID), nil
 	})
 
 	d.Register("finish_book", func(ctx context.Context, a ai.Action) (string, error) {
@@ -444,7 +456,7 @@ func buildDispatcher(notesSvc *notes.Service, bookResolver *books.Resolver) *too
 
 func registerWriteVerifiers(d *tools.Dispatcher, notesSvc *notes.Service) {
 	for _, actionType := range []string{
-		"create_note", "create_task", "create_book", "finish_book", "move_note", "update_note", "mark_done",
+		"create_note", "create_task", "create_book", "update_book_metadata", "finish_book", "move_note", "update_note", "mark_done",
 		"append_note", "replace_section",
 		"rename_note", "duplicate_note", "trash_note", "restore_note", "archive_note", "unarchive_note",
 		"create_folder", "ensure_folders", "delete_folder", "rename_folder", "move_folder", "link_folders", "unlink_folders", "set_folder_colors", "set_graph_node_size",
@@ -534,6 +546,12 @@ func verifyWrite(_ context.Context, notesSvc *notes.Service, action ai.Action) e
 		if err != nil {
 			return fmt.Errorf("verify created note: %w", err)
 		}
+		if note == nil && action.Type == "create_book" {
+			note, err = findCanonicalBook(notesSvc, action)
+			if err != nil {
+				return fmt.Errorf("verify created book: %w", err)
+			}
+		}
 		if note == nil {
 			return fmt.Errorf("verify created note: record not found")
 		}
@@ -555,6 +573,17 @@ func verifyWrite(_ context.Context, notesSvc *notes.Service, action ai.Action) e
 	}
 
 	switch action.Type {
+	case "update_book_metadata":
+		metadata, err := notesSvc.BookMetadata(action.NoteID)
+		if err != nil {
+			return fmt.Errorf("verify update_book_metadata: %w", err)
+		}
+		if len(action.Authors) > 0 && !sameFoldedValues(metadata.Authors, action.Authors) {
+			return fmt.Errorf("verify update_book_metadata: saved authors differ")
+		}
+		if len(action.Genres) > 0 && !sameFoldedValues(metadata.Genres, action.Genres) {
+			return fmt.Errorf("verify update_book_metadata: saved genres differ")
+		}
 	case "finish_book":
 		finished, err := notesSvc.IsBookFinished(action.NoteID)
 		if err != nil {
@@ -632,6 +661,39 @@ func verifyWrite(_ context.Context, notesSvc *notes.Service, action ai.Action) e
 		}
 	}
 	return nil
+}
+
+func findCanonicalBook(notesSvc *notes.Service, action ai.Action) (*models.Note, error) {
+	all, err := notesSvc.ListNotes()
+	if err != nil {
+		return nil, err
+	}
+	wantedFolder, err := utils.CleanFolder(action.Folder)
+	if err != nil {
+		return nil, err
+	}
+	for _, note := range all {
+		folder := utils.RelVault(notesSvc.VaultPath(), filepath.Dir(note.Path))
+		if folder == "." {
+			folder = ""
+		}
+		if note.Type == models.NoteTypeBook && folder == wantedFolder && books.NormalizeTitle(note.Title) == books.NormalizeTitle(action.Title) {
+			return note, nil
+		}
+	}
+	return nil, nil
+}
+
+func sameFoldedValues(left, right []string) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for index := range left {
+		if !strings.EqualFold(strings.TrimSpace(left[index]), strings.TrimSpace(right[index])) {
+			return false
+		}
+	}
+	return true
 }
 
 func expectedFolderDestination(action ai.Action) (string, error) {

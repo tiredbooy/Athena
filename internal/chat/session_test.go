@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	"github.com/tiredbooy/internal/ai"
+	"github.com/tiredbooy/internal/models"
 )
 
 func TestAsksUserForVaultInventory(t *testing.T) {
@@ -12,6 +13,39 @@ func TestAsksUserForVaultInventory(t *testing.T) {
 	}
 	if asksUserForVaultInventory("Which genre should Animal Farm use?") {
 		t.Fatal("single classification question is not an inventory request")
+	}
+}
+
+func TestPermissionQuestionIsTrackedAsClarification(t *testing.T) {
+	if !looksLikeClarifyingQuestion("May I create Psychology and Science Fiction, then move the books?") {
+		t.Fatal("permission question was treated as a completed answer")
+	}
+}
+
+func TestMutationPermissionQuestionIsDeferredToPlanReview(t *testing.T) {
+	if !asksForActionPermission("May I create Psychology and Science Fiction, then move the books?") {
+		t.Fatal("redundant mutation permission was not detected")
+	}
+	if asksForActionPermission("Should I classify this book as Science Fiction?") {
+		t.Fatal("classification question was mistaken for plan approval")
+	}
+}
+
+func TestCancelDiscardsPendingConversationalTask(t *testing.T) {
+	session := &Session{history: []models.Message{{Role: "system", Content: "rules"}}, pendingTask: &PendingTask{OriginalGoal: "organize books", Question: "Which genre?"}}
+	reply, err := session.cancelPending()
+	if err != nil || reply != "Pending task discarded." || session.pendingTask != nil {
+		t.Fatalf("reply=%q pending=%+v err=%v", reply, session.pendingTask, err)
+	}
+}
+
+func TestAgentRunContractRequiresStructuredMutationPlans(t *testing.T) {
+	contract := agentRunContractMessage().Content
+	if !containsAny(contract, []string{"MUST call it with a non-empty actions array"}) {
+		t.Fatalf("agent contract does not require propose_actions for mutations: %s", contract)
+	}
+	if !containsAny(contract, []string{"Do not describe intended changes in prose without that tool call"}) {
+		t.Fatalf("agent contract still permits prose-only mutation plans: %s", contract)
 	}
 }
 
@@ -91,5 +125,25 @@ func TestHasPendingActionsReflectsSessionState(t *testing.T) {
 	session.pendingPlan = &PendingPlan{ID: "plan-1", Actions: []ai.Action{{Type: "create_folder", Folder: "work"}}}
 	if !session.HasPendingActions() {
 		t.Fatal("pending action was not reported")
+	}
+}
+
+func TestTrackedReadingRequestUsesBookActionsAndDropsDuplicates(t *testing.T) {
+	goal := `add books that i started reading into books/reading`
+	actions := []ai.Action{
+		{Type: "create_note", Title: "Thinking Fast And Slow", Content: "invented metadata", Folder: "books/reading"},
+		{Type: "create_note", Title: "Thinking Fast and Slow", Content: "different body", Folder: "books/reading"},
+		{Type: "create_note", Title: "Unrelated Journal", Content: "keep me", Folder: "journal"},
+	}
+
+	got := normalizeTrackedBookActions(goal, actions)
+	if len(got) != 2 {
+		t.Fatalf("actions = %+v, want one tracked book and one unrelated note", got)
+	}
+	if got[0].Type != "create_book" || got[0].Content != "" || got[0].Tags != nil {
+		t.Fatalf("book action = %+v", got[0])
+	}
+	if got[1].Type != "create_note" || got[1].Title != "Unrelated Journal" {
+		t.Fatalf("unrelated action changed: %+v", got[1])
 	}
 }

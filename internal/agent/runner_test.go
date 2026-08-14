@@ -102,6 +102,30 @@ func TestRunnerDoesNotRepeatVerifiedAction(t *testing.T) {
 	}
 }
 
+func TestRunnerDoesNotRepeatSameCreateTargetWithDifferentPresentation(t *testing.T) {
+	first := ai.Action{Type: "create_book", Title: "Thinking Fast And Slow", Folder: "books/reading"}
+	duplicate := ai.Action{Type: "create_book", Title: "Thinking Fast and Slow", Folder: "books/reading", ISBN: "9780141033570"}
+	driver := &scriptedDriver{
+		decisions: []Decision{
+			{Kind: DecisionAct, Actions: []ai.Action{first}},
+			{Kind: DecisionAct, Actions: []ai.Action{duplicate}},
+			{Kind: DecisionFinish, Message: "Created the tracked book once."},
+		},
+		execute: func(_ int, actions []ai.Action) []ai.ActionResult {
+			return []ai.ActionResult{{Action: actions[0], Message: "created and verified"}}
+		},
+	}
+	state := NewRunState("run-create-target", "track one book", nil)
+
+	outcome, err := NewRunner(driver, DefaultBudget()).Run(t.Context(), state, nil)
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if outcome.Reply != "Created the tracked book once." || driver.executeCalls != 1 {
+		t.Fatalf("outcome=%+v execute calls=%d", outcome, driver.executeCalls)
+	}
+}
+
 func TestRunnerDoesNotReplayAnIdenticalFailedWrite(t *testing.T) {
 	action := ai.Action{Type: "append_note", NoteID: 4, Content: "one line"}
 	driver := &scriptedDriver{
@@ -129,11 +153,47 @@ func TestRunnerDoesNotReplayAnIdenticalFailedWrite(t *testing.T) {
 	}
 }
 
+func TestRunnerCorrectionRequiresExecutableActionData(t *testing.T) {
+	action := ai.Action{Type: "ensure_folders", Paths: []string{"books/reading/science-fiction"}}
+	driver := &scriptedDriver{
+		decisions: []Decision{
+			{Kind: DecisionFinish, Message: "I will create and organize the genre folders.", Raw: "I will create and organize the genre folders."},
+			{Kind: DecisionAct, Actions: []ai.Action{action}},
+			{Kind: DecisionFinish, Message: "The genre folder was created and verified."},
+		},
+		validate: func(call int, _ *RunState, _ Decision) error {
+			if call == 1 {
+				return errors.New("the reply claimed a vault change but did not provide executable action data")
+			}
+			return nil
+		},
+		execute: func(_ int, actions []ai.Action) []ai.ActionResult {
+			return []ai.ActionResult{{Action: actions[0], Message: "folder created and verified"}}
+		},
+	}
+	state := NewRunState("run-correction", "organize my books", nil)
+
+	outcome, err := NewRunner(driver, DefaultBudget()).Run(t.Context(), state, nil)
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if outcome.Reply != "The genre folder was created and verified." || driver.executeCalls != 1 {
+		t.Fatalf("outcome=%+v execute calls=%d", outcome, driver.executeCalls)
+	}
+	correction := messageText(state.Messages)
+	if !strings.Contains(correction, "MUST either call propose_actions with a non-empty actions array") ||
+		!strings.Contains(correction, "A prose promise or description of intended changes is not an executable plan") {
+		t.Fatalf("correction did not explain the executable-action contract: %s", correction)
+	}
+}
+
 type scriptedDriver struct {
 	decisions        []Decision
 	decisionIndex    int
 	executeCalls     int
+	validationCalls  int
 	requiresApproval bool
+	validate         func(int, *RunState, Decision) error
 	execute          func(int, []ai.Action) []ai.ActionResult
 }
 
@@ -146,7 +206,13 @@ func (d *scriptedDriver) Decide(context.Context, *RunState, EventSink) (Decision
 	return decision, nil
 }
 
-func (d *scriptedDriver) Validate(*RunState, Decision) error { return nil }
+func (d *scriptedDriver) Validate(state *RunState, decision Decision) error {
+	d.validationCalls++
+	if d.validate != nil {
+		return d.validate(d.validationCalls, state, decision)
+	}
+	return nil
+}
 
 func (d *scriptedDriver) RequiresApproval([]ai.Action) bool {
 	return d.requiresApproval && d.executeCalls == 0

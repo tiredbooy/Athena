@@ -19,6 +19,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/tiredbooy/internal/appdirs"
 )
 
 const (
@@ -46,7 +48,7 @@ type CodexOAuth struct {
 
 func LoadCodexOAuth() (*CodexOAuth, error) {
 	o := &CodexOAuth{http: &http.Client{Timeout: 30 * time.Second}, openBrowser: openBrowser}
-	path, err := codexCredentialsPath()
+	path, err := appdirs.PrepareConfigFile("openai-codex-auth.json")
 	if err != nil {
 		return nil, err
 	}
@@ -428,11 +430,7 @@ func (o *CodexOAuth) save(credentials CodexCredentials) error {
 	return nil
 }
 func codexCredentialsPath() (string, error) {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return "", err
-	}
-	return filepath.Join(home, ".config", "second-brain", "openai-codex-auth.json"), nil
+	return appdirs.ConfigFile("openai-codex-auth.json")
 }
 func pkce() (string, string, error) {
 	verifier, err := randomURLToken(48)

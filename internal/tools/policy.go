@@ -45,15 +45,16 @@ var actionPolicies = map[string]Policy{
 	// This only adds missing Athena-owned visual groups in .obsidian/graph.json.
 	// SyncFolderGraph already writes the same settings after structural changes,
 	// so a single explicit color request is safe to apply directly.
-	"set_folder_colors":   {Kind: ToolWrite, Timeout: time.Minute},
-	"set_graph_node_size": {Kind: ToolWrite, Timeout: time.Minute},
-	"rename_note":         {Kind: ToolWrite, Timeout: time.Minute},
-	"duplicate_note":      {Kind: ToolWrite, Timeout: time.Minute},
-	"restore_note":        {Kind: ToolWrite, Timeout: time.Minute},
-	"archive_note":        {Kind: ToolWrite, Timeout: time.Minute},
-	"unarchive_note":      {Kind: ToolWrite, Timeout: time.Minute},
-	"create_book":         {Kind: ToolWrite, Timeout: time.Minute},
-	"finish_book":         {Kind: ToolWrite, Timeout: time.Minute},
+	"set_folder_colors":    {Kind: ToolWrite, Timeout: time.Minute},
+	"set_graph_node_size":  {Kind: ToolWrite, Timeout: time.Minute},
+	"rename_note":          {Kind: ToolWrite, Timeout: time.Minute},
+	"duplicate_note":       {Kind: ToolWrite, Timeout: time.Minute},
+	"restore_note":         {Kind: ToolWrite, Timeout: time.Minute},
+	"archive_note":         {Kind: ToolWrite, Timeout: time.Minute},
+	"unarchive_note":       {Kind: ToolWrite, Timeout: time.Minute},
+	"create_book":          {Kind: ToolWrite, Timeout: time.Minute},
+	"update_book_metadata": {Kind: ToolWrite, Timeout: time.Minute},
+	"finish_book":          {Kind: ToolWrite, Timeout: time.Minute},
 
 	"update_note":   {Kind: ToolDestructive, Timeout: time.Minute, RequiresConfirmation: true},
 	"trash_note":    {Kind: ToolDestructive, Timeout: time.Minute, RequiresConfirmation: true},
@@ -134,7 +135,7 @@ func validateAction(action ai.Action, known bool) error {
 				return err
 			}
 		}
-	case "move_note", "update_note", "append_note", "replace_section", "mark_done", "rename_note", "duplicate_note", "trash_note", "restore_note", "archive_note", "unarchive_note", "finish_book":
+	case "move_note", "update_note", "append_note", "replace_section", "mark_done", "rename_note", "duplicate_note", "trash_note", "restore_note", "archive_note", "unarchive_note", "finish_book", "update_book_metadata":
 		if action.NoteID <= 0 {
 			return fmt.Errorf("%s requires note_id", action.Type)
 		}
@@ -155,6 +156,9 @@ func validateAction(action ai.Action, known bool) error {
 				return err
 			}
 		}
+	}
+	if action.Type == "update_book_metadata" && len(action.Authors) == 0 && len(action.Genres) == 0 {
+		return fmt.Errorf("update_book_metadata requires authors or genres")
 	}
 
 	switch action.Type {

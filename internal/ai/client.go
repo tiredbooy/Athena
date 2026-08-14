@@ -9,6 +9,8 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -25,6 +27,7 @@ type Client struct {
 	mu          sync.RWMutex
 	inferenceMu sync.Mutex
 	toolSupport map[string]NativeToolSupport
+	contextSize map[string]int
 }
 
 func NewClient(host, chatModel, embedModel string) *Client {
@@ -34,6 +37,7 @@ func NewClient(host, chatModel, embedModel string) *Client {
 		embedModel:  embedModel,
 		http:        &http.Client{},
 		toolSupport: make(map[string]NativeToolSupport),
+		contextSize: make(map[string]int),
 	}
 }
 
@@ -325,44 +329,17 @@ func (c *Client) ChatWithToolsResult(ctx context.Context, messages []models.Mess
 	defer c.inferenceMu.Unlock()
 
 	model := c.ChatModel()
-	body, err := json.Marshal(models.MessageReq{
-		Model:    model,
-		Messages: ollamaMessages(messages),
-		Tools:    tools,
-		Stream:   false,
+	tools = normalizedToolDefinitions(tools)
+	response, err := c.openChatResponse(ctx, model, messages, tools, false,
 		// Native tool planning benefits from private reasoning. Plain fallback
 		// must stay quick and produce visible content for tool-less templates.
-		Think:     len(tools) > 0 && shouldThink(model),
-		KeepAlive: "60s",
-		Options:   localChatOptions(),
-	})
+		len(tools) > 0 && shouldThink(model))
 	if err != nil {
-		return ToolChatResult{}, fmt.Errorf("marshal tool chat request: %w", err)
+		return ToolChatResult{}, err
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.host+"/api/chat", bytes.NewReader(body))
-	if err != nil {
-		return ToolChatResult{}, fmt.Errorf("build tool chat request: %w", err)
-	}
-	req.Header.Set("Content-Type", "application/json")
-	resp, err := c.http.Do(req)
-	if err != nil {
-		operation := "chat"
-		if len(tools) > 0 {
-			operation = "tool chat"
-		}
-		return ToolChatResult{}, fmt.Errorf("call ollama %s (model %q pulled?): %w", operation, model, err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		b, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
-		operation := "chat"
-		if len(tools) > 0 {
-			operation = "tool chat"
-		}
-		return ToolChatResult{}, fmt.Errorf("ollama %s returned status %d: %s", operation, resp.StatusCode, ollamaErrorDetail(b))
-	}
+	defer response.Body.Close()
 	var out chatResponse
-	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+	if err := json.NewDecoder(response.Body).Decode(&out); err != nil {
 		return ToolChatResult{}, fmt.Errorf("decode tool chat response: %w", err)
 	}
 	return ToolChatResult{Message: out.Message, DoneReason: out.DoneReason}, nil
@@ -388,39 +365,15 @@ func (c *Client) StreamChatWith(ctx context.Context, messages []models.Message, 
 	defer c.inferenceMu.Unlock()
 
 	model := c.ChatModel()
-
-	body, err := json.Marshal(models.MessageReq{
-		Model:     model,
-		Messages:  ollamaMessages(messages),
-		Stream:    true,
-		Think:     shouldThink(model),
-		KeepAlive: "60s",
-		Options:   localChatOptions(),
-	})
+	response, err := c.openChatResponse(ctx, model, messages, nil, true, shouldThink(model))
 	if err != nil {
-		return "", fmt.Errorf("marshal chat request: %w", err)
+		return "", err
 	}
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.host+"/api/chat", bytes.NewReader(body))
-	if err != nil {
-		return "", fmt.Errorf("build chat request: %w", err)
-	}
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := c.http.Do(req)
-	if err != nil {
-		return "", fmt.Errorf("call ollama chat (model %q pulled?): %w", model, err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		b, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
-		return "", fmt.Errorf("ollama chat returned status %d: %s", resp.StatusCode, ollamaErrorDetail(b))
-	}
+	defer response.Body.Close()
 
 	var full strings.Builder
 	visible := false
-	decoder := json.NewDecoder(resp.Body)
+	decoder := json.NewDecoder(response.Body)
 	for {
 		var chunk chatResponse
 		if err := decoder.Decode(&chunk); err != nil {
@@ -446,6 +399,94 @@ func (c *Client) StreamChatWith(ctx context.Context, messages []models.Message, 
 	return full.String(), nil
 }
 
+const (
+	ollamaContextOutputReserve = 1_024
+	maxAutomaticContextSize    = 16_384
+)
+
+var ollamaContextErrorPattern = regexp.MustCompile(`(?i)request \((\d+) tokens?\) exceeds the available context size \((\d+) tokens?\)`)
+
+// openChatResponse retries one Ollama request when the runtime's default
+// context is smaller than the prompt. Athena grows to the smallest power of
+// two that leaves a response reserve, then remembers that size for this model.
+// The cap prevents an unexpectedly large prompt from silently reserving an
+// unbounded amount of local RAM or VRAM.
+func (c *Client) openChatResponse(ctx context.Context, model string, messages []models.Message, tools []models.ToolDefinition, stream, think bool) (*http.Response, error) {
+	operation := "chat"
+	if len(tools) > 0 {
+		operation = "tool chat"
+	}
+	for attempt := 0; attempt < 2; attempt++ {
+		body, err := json.Marshal(models.MessageReq{
+			Model: model, Messages: ollamaMessages(messages), Tools: tools,
+			Stream: stream, Think: think, KeepAlive: "60s", Options: c.localChatOptions(model),
+		})
+		if err != nil {
+			return nil, fmt.Errorf("marshal %s request: %w", operation, err)
+		}
+		request, err := http.NewRequestWithContext(ctx, http.MethodPost, c.host+"/api/chat", bytes.NewReader(body))
+		if err != nil {
+			return nil, fmt.Errorf("build %s request: %w", operation, err)
+		}
+		request.Header.Set("Content-Type", "application/json")
+		response, err := c.http.Do(request)
+		if err != nil {
+			return nil, fmt.Errorf("call ollama %s (model %q pulled?): %w", operation, model, err)
+		}
+		if response.StatusCode == http.StatusOK {
+			return response, nil
+		}
+		raw, _ := io.ReadAll(io.LimitReader(response.Body, 512))
+		response.Body.Close()
+		detail := ollamaErrorDetail(raw)
+		if attempt == 0 && response.StatusCode == http.StatusBadRequest && c.expandContextFor(model, detail) {
+			continue
+		}
+		return nil, fmt.Errorf("ollama %s returned status %d: %s", operation, response.StatusCode, detail)
+	}
+	return nil, fmt.Errorf("ollama %s context retry was exhausted", operation)
+}
+
+func (c *Client) localChatOptions(model string) map[string]any {
+	options := localChatOptions()
+	c.mu.RLock()
+	contextSize := c.contextSize[model]
+	c.mu.RUnlock()
+	if contextSize > 0 {
+		options["num_ctx"] = contextSize
+	}
+	return options
+}
+
+func (c *Client) expandContextFor(model, detail string) bool {
+	matches := ollamaContextErrorPattern.FindStringSubmatch(detail)
+	if len(matches) != 3 {
+		return false
+	}
+	requested, requestedErr := strconv.Atoi(matches[1])
+	available, availableErr := strconv.Atoi(matches[2])
+	if requestedErr != nil || availableErr != nil || requested <= available || available <= 0 {
+		return false
+	}
+	required := requested + ollamaContextOutputReserve
+	target := 1
+	for target < required && target < maxAutomaticContextSize {
+		target *= 2
+	}
+	if target < required || target <= available || target > maxAutomaticContextSize {
+		return false
+	}
+	c.mu.Lock()
+	if c.contextSize == nil {
+		c.contextSize = make(map[string]int)
+	}
+	if target > c.contextSize[model] {
+		c.contextSize[model] = target
+	}
+	c.mu.Unlock()
+	return true
+}
+
 // shouldThink opts into Ollama's private reasoning channel only for models
 // whose names indicate support for it. Older chat models may reject or ignore
 // the field, while Qwen3/DeepSeek-style models can become substantially more
@@ -460,49 +501,37 @@ func shouldThink(model string) bool {
 	return false
 }
 
-// ollamaMessages accommodates strict custom chat templates that accept a
-// system role only as the first message. Stable instructions are combined at
-// the beginning. A trailing engine observation must remain after the previous
-// assistant action, so expose it as a clearly marked provider-level user turn;
-// internally it remains a system-owned fact and is never added to chat history
-// as user-authored content.
+// ollamaMessages accommodates strict custom chat templates that require one
+// leading system message and alternating user/assistant text turns. Athena's
+// internal system observations must remain in chronological order: hoisting a
+// prior execution result can leave two assistant plans adjacent and makes the
+// model see the result before the action that produced it.
 func ollamaMessages(messages []models.Message) []models.Message {
-	lastNonSystem := -1
-	for index, message := range messages {
-		if message.Role != "system" {
-			lastNonSystem = index
-		}
-	}
-
-	var systemContent []string
-	var continuationContent []string
-	nonSystem := make([]models.Message, 0, len(messages))
-	for index, message := range messages {
+	var leadingSystem []string
+	normalized := make([]models.Message, 0, len(messages)+1)
+	conversationStarted := false
+	for _, message := range messages {
+		content := strings.TrimSpace(message.Content)
 		if message.Role == "system" {
-			if content := strings.TrimSpace(message.Content); content != "" {
-				if lastNonSystem >= 0 && index > lastNonSystem {
-					continuationContent = append(continuationContent, content)
-				} else {
-					systemContent = append(systemContent, content)
-				}
+			if content == "" {
+				continue
 			}
-			continue
+			if !conversationStarted {
+				leadingSystem = append(leadingSystem, content)
+				continue
+			}
+			message = models.Message{
+				Role: "user",
+				Content: "[ATHENA ENGINE CONTINUATION — NOT USER-AUTHORED]\n" +
+					content + "\n[END ATHENA ENGINE CONTINUATION]",
+			}
+		} else {
+			conversationStarted = true
 		}
-		nonSystem = append(nonSystem, message)
+		normalized = appendOllamaMessage(normalized, message)
 	}
-
-	normalized := make([]models.Message, 0, len(nonSystem)+2)
-	if len(systemContent) > 0 {
-		normalized = append(normalized, models.Message{Role: "system", Content: strings.Join(systemContent, "\n\n")})
-	}
-	normalized = append(normalized, nonSystem...)
-	if len(continuationContent) > 0 {
-		normalized = append(normalized, models.Message{
-			Role: "user",
-			Content: "[ATHENA ENGINE CONTINUATION — NOT USER-AUTHORED]\n" +
-				strings.Join(continuationContent, "\n\n") +
-				"\n[END ATHENA ENGINE CONTINUATION]",
-		})
+	if len(leadingSystem) > 0 {
+		normalized = append([]models.Message{{Role: "system", Content: strings.Join(leadingSystem, "\n\n")}}, normalized...)
 	}
 	if !hasUserMessage(normalized) {
 		normalized = append(normalized, models.Message{
@@ -511,6 +540,26 @@ func ollamaMessages(messages []models.Message) []models.Message {
 		})
 	}
 	return normalized
+}
+
+// appendOllamaMessage coalesces adjacent plain text turns of the same role.
+// Tool-call messages keep their exact boundaries because their IDs pair them
+// with provider tool results.
+func appendOllamaMessage(messages []models.Message, message models.Message) []models.Message {
+	if len(messages) == 0 || (message.Role != "user" && message.Role != "assistant") || len(message.ToolCalls) > 0 || message.ToolCallID != "" {
+		return append(messages, message)
+	}
+	last := &messages[len(messages)-1]
+	if last.Role != message.Role || len(last.ToolCalls) > 0 || last.ToolCallID != "" {
+		return append(messages, message)
+	}
+	if content := strings.TrimSpace(message.Content); content != "" {
+		if strings.TrimSpace(last.Content) != "" {
+			last.Content += "\n\n"
+		}
+		last.Content += content
+	}
+	return messages
 }
 
 func hasUserMessage(messages []models.Message) bool {

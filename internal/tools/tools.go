@@ -88,6 +88,27 @@ func (d *Dispatcher) Validate(actions []ai.Action) error {
 	return nil
 }
 
+// RecordRejectedPlan preserves model proposals that failed preflight. They do
+// not reach Run and therefore would otherwise be absent from action_audit,
+// making repeated schema failures impossible to diagnose after the session.
+func (d *Dispatcher) RecordRejectedPlan(actions []ai.Action, validationErr error) {
+	if d.auditor == nil || validationErr == nil {
+		return
+	}
+	for _, action := range actions {
+		payload, err := json.Marshal(action)
+		if err != nil {
+			continue
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		_ = d.auditor.Record(ctx, models.ActionAudit{
+			ActionType: action.Type, ActionJSON: string(payload), Outcome: "rejected",
+			Error: validationErr.Error(), CreatedAt: time.Now(),
+		})
+		cancel()
+	}
+}
+
 func (d *Dispatcher) RegisterVerifier(actionType string, verifier Verifier) {
 	d.verifiers[actionType] = verifier
 }

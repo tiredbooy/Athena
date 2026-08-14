@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+
+	"github.com/tiredbooy/internal/appdirs"
 )
 
 // CredentialStore keeps provider secrets separate from the ordinary YAML
@@ -18,7 +20,7 @@ type CredentialStore struct {
 }
 
 func LoadCredentialStore() (*CredentialStore, error) {
-	path, err := credentialFilePath()
+	path, err := appdirs.PrepareConfigFile("provider-credentials.json")
 	if err != nil {
 		return nil, err
 	}
@@ -112,9 +114,5 @@ func (s *CredentialStore) saveLocked() error {
 }
 
 func credentialFilePath() (string, error) {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return "", fmt.Errorf("resolve home directory: %w", err)
-	}
-	return filepath.Join(home, ".config", "second-brain", "provider-credentials.json"), nil
+	return appdirs.ConfigFile("provider-credentials.json")
 }

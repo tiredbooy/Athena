@@ -2,9 +2,9 @@
 
 ## Ownership
 
-`internal/tui` renders Athena's local Bubble Tea interface. It does not own
-notes, model calls, or action execution; it sends input to `chat.Session` and
-renders status, streamed text, and final action outcomes.
+`apps/tui` renders the primary Ink interface, while `internal/tui` remains the
+Bubble Tea fallback. Neither owns notes, model calls, model selection, or
+action execution; both delegate those responsibilities to `chat.Session`.
 
 ## Current workspace
 
@@ -18,6 +18,9 @@ renders status, streamed text, and final action outcomes.
 - `/clear` clears only the visible pane; `/reset` also clears session history.
 - Selectable command palette: arrows choose, Tab completes, Escape dismisses.
 - `/models` and `/model` query/select local Ollama chat models.
+- The Ink transcript uses a source-aware row viewport with Page Up/Page Down
+  and mouse-wheel scrolling. Selection and copy use the same rows, so long
+  responses remain readable without breaking copied message offsets.
 - `/theme` opens a second selectable choice for `midnight`, `ocean`, and
   `system`.
 

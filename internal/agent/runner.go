@@ -94,7 +94,7 @@ func (r *Runner) Run(ctx context.Context, state *RunState, emit EventSink) (Outc
 				return r.safeStop(state, "the model returned an empty final decision"), nil
 			}
 			r.emit(state, emit, Event{Phase: PhaseCompleted, Message: "Agent run completed"})
-			return Outcome{Reply: reply}, nil
+			return Outcome{Reply: reply, AwaitingUser: decision.Kind == DecisionAskUser}, nil
 		case DecisionAct:
 			actions, skipped := r.prepareActions(state, decision.Actions)
 			if len(skipped) > 0 {
@@ -220,7 +220,8 @@ func (r *Runner) emit(state *RunState, sink EventSink, event Event) {
 }
 
 func appendCorrection(state *RunState, problem error) {
-	state.Messages = append(state.Messages, models.Message{Role: "system", Content: "[ATHENA DECISION REJECTED]\n" + problem.Error() + "\nChoose a different, valid next step. Use read tools to resolve exact note IDs and folder paths. Do not repeat the rejected plan, claim success, or invent missing state."})
+	state.Messages = append(state.Messages, models.Message{Role: "system", Content: "[ATHENA DECISION REJECTED]\n" + problem.Error() + `
+Choose a different, valid next step. Use read tools to resolve exact note IDs and folder paths. If the original goal requires vault changes and no verified execution exists, your next response MUST either call propose_actions with a non-empty actions array, use fenced action JSON when that tool is unavailable, or ask one precise blocking question. A prose promise or description of intended changes is not an executable plan. Do not repeat the rejected plan, claim success, or invent missing state.`})
 }
 
 func appendObservation(state *RunState, results []ai.ActionResult) {
@@ -253,6 +254,17 @@ func appendObservation(state *RunState, results []ai.ActionResult) {
 func actionSignature(action ai.Action) string {
 	action.ID = ""
 	action.DependsOn = nil
+	// Creation is idempotent by target path. A weak model may vary title case or
+	// regenerate body text on a later step, but create_* cannot update an existing
+	// target; treating that as new work only produces noisy duplicate attempts.
+	if action.Type == "create_note" || action.Type == "create_task" || action.Type == "create_book" {
+		action.Title = strings.ToLower(strings.Join(strings.Fields(action.Title), " "))
+		action.Content = ""
+		action.Tags = nil
+		action.ISBN = ""
+		action.Authors = nil
+		action.Genres = nil
+	}
 	raw, _ := json.Marshal(action)
 	sum := sha256.Sum256(raw)
 	return hex.EncodeToString(sum[:])

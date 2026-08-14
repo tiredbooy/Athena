@@ -79,7 +79,7 @@ func TestCodexDeviceLoginCompletesWithoutExternalCLI(t *testing.T) {
 	if opened != codexDeviceURL || len(lines) != 1 || !strings.Contains(lines[0], "OPEN-AI") {
 		t.Fatalf("opened = %q, lines = %#v", opened, lines)
 	}
-	path := filepath.Join(home, ".config", "second-brain", "openai-codex-auth.json")
+	path := filepath.Join(home, ".config", "athena", "openai-codex-auth.json")
 	info, err := os.Stat(path)
 	if err != nil {
 		t.Fatal(err)

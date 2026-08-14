@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/tiredbooy/internal/ai"
+	"github.com/tiredbooy/internal/books"
 	"github.com/tiredbooy/internal/config"
 	"github.com/tiredbooy/internal/retrieval"
 	"github.com/tiredbooy/internal/tools"
@@ -21,6 +22,7 @@ type Loop struct {
 	xaiOAuth    *ai.XAIOAuth
 	retrieval   *retrieval.Service
 	dispatcher  *tools.Dispatcher
+	bookCatalog *books.Resolver
 	config      *config.Config
 	credentials *config.CredentialStore
 }
@@ -35,6 +37,10 @@ func (l *Loop) SetCredentialStore(credentials *config.CredentialStore) {
 
 func (l *Loop) SetXAIOAuth(oauth *ai.XAIOAuth) {
 	l.xaiOAuth = oauth
+}
+
+func (l *Loop) SetBookCatalog(catalog *books.Resolver) {
+	l.bookCatalog = catalog
 }
 
 // Run is the line-oriented fallback UI. It intentionally delegates every turn
@@ -159,6 +165,8 @@ func actionVerb(action ai.Action) string {
 		return "Editing"
 	case "append_note", "mark_done":
 		return "Updating"
+	case "update_book_metadata":
+		return "Updating book metadata for"
 	case "move_note", "move_folder":
 		return "Moving"
 	case "delete_folder", "trash_note":
@@ -191,7 +199,7 @@ func actionTarget(action ai.Action) string {
 	case "create_note", "create_task", "create_book":
 		kind := strings.TrimPrefix(action.Type, "create_")
 		return fmt.Sprintf("%s %q", kind, action.Title)
-	case "update_note", "append_note", "replace_section", "rename_note", "duplicate_note", "trash_note", "restore_note", "archive_note", "unarchive_note":
+	case "update_note", "append_note", "replace_section", "rename_note", "duplicate_note", "trash_note", "restore_note", "archive_note", "unarchive_note", "update_book_metadata":
 		if action.NoteID != 0 {
 			if action.Section != "" {
 				return fmt.Sprintf("section %q in note %d", action.Section, action.NoteID)

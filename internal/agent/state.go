@@ -105,6 +105,9 @@ type Outcome struct {
 	Reply          string
 	PendingMessage string
 	PendingActions []ai.Action
+	// AwaitingUser distinguishes a clarification from a completed answer. The
+	// chat session uses it to preserve the active goal across user turns.
+	AwaitingUser bool
 }
 
 func (o Outcome) NeedsApproval() bool { return len(o.PendingActions) > 0 }

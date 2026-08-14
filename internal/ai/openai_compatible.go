@@ -128,7 +128,7 @@ func (p *OpenAICompatibleProvider) ChatWithToolsResult(ctx context.Context, mess
 	for _, message := range messages {
 		request.Messages = append(request.Messages, openAIMessageFrom(message))
 	}
-	for _, definition := range definitions {
+	for _, definition := range normalizedToolDefinitions(definitions) {
 		request.Tools = append(request.Tools, openAITool{Type: definition.Type, Function: definition.Function})
 	}
 	body, err := json.Marshal(request)

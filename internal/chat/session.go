@@ -21,6 +21,7 @@ type Session struct {
 	loop        *Loop
 	history     []models.Message
 	pendingPlan *PendingPlan
+	pendingTask *PendingTask
 	nextPlanID  uint64
 	nextRunID   uint64
 	// nativeToolsDisabledModel remembers an Ollama model that rejected the
@@ -81,7 +82,14 @@ func (s *Session) submit(ctx context.Context, input string, observer runObserver
 		s.append(input, reply)
 		return reply, nil
 	}
-	result, err := s.loop.retrieval.BuildContextWithProgress(ctx, input, 4, observer.statusMessage)
+	activeGoal := input
+	expectedAction := expectsActionRequest(input)
+	resumedTask := s.pendingTask
+	if resumedTask != nil {
+		activeGoal = resumedTask.resolvedGoal(input)
+		expectedAction = resumedTask.ExpectedAction || expectedAction
+	}
+	result, err := s.loop.retrieval.BuildContextWithProgress(ctx, activeGoal, 4, observer.statusMessage)
 	if err != nil {
 		if s.loop.ai.Name() == "Ollama" {
 			return "", fmt.Errorf("retrieve context: %w", err)
@@ -92,6 +100,9 @@ func (s *Session) submit(ctx context.Context, input string, observer runObserver
 		observer.statusMessage("Vault search is unavailable — answering without vault context")
 		result = nil
 	}
+	if resumedTask != nil {
+		s.pendingTask = nil
+	}
 	s.history = append(s.history, models.Message{Role: "user", Content: input})
 	s.compactHistory(false)
 	messages := append([]models.Message(nil), s.history...)
@@ -101,20 +112,30 @@ func (s *Session) submit(ctx context.Context, input string, observer runObserver
 	// Keep durable conversation history clean while giving this bounded run an
 	// explicit decision contract immediately before the active user request.
 	last := len(messages) - 1
-	messages = append(messages, models.Message{})
-	messages[last+1] = messages[last]
+	extra := 1
+	if resumedTask != nil {
+		extra++
+	}
+	messages = append(messages, make([]models.Message, extra)...)
+	copy(messages[last+extra:], messages[last:last+1])
 	messages[last] = agentRunContractMessage()
+	if resumedTask != nil {
+		messages[last+1] = pendingTaskMessage(resumedTask, input)
+	}
 	s.nextRunID++
-	state := agent.NewRunState(fmt.Sprintf("run-%d", s.nextRunID), input, messages)
+	state := agent.NewRunState(fmt.Sprintf("run-%d", s.nextRunID), activeGoal, messages)
 	state.ContextSupplied = result != nil && result.Context != ""
-	state.ExpectedAction = expectsActionRequest(input)
+	state.ExpectedAction = expectedAction
 	runner := agent.NewRunner(sessionAgentDriver{session: s}, agent.DefaultBudget())
 	outcome, err := runner.Run(ctx, state, observer.agentSink())
 	if err != nil {
 		s.history = s.history[:len(s.history)-1]
+		if resumedTask != nil {
+			s.pendingTask = resumedTask
+		}
 		return "", err
 	}
-	return s.finishAgentOutcome(state, outcome, onToken)
+	return s.finishAgentOutcome(state, outcome, onToken, resumedTask, input)
 }
 
 // implicitFolderCreationWarning blocks the most damaging weak-model failure:
@@ -198,7 +219,7 @@ func asksUserForVaultInventory(reply string) bool {
 		(strings.Contains(reply, "book") || strings.Contains(reply, "folder") || strings.Contains(reply, "vault"))
 }
 
-func (s *Session) finishAgentOutcome(state *agent.RunState, outcome agent.Outcome, onToken func(string)) (string, error) {
+func (s *Session) finishAgentOutcome(state *agent.RunState, outcome agent.Outcome, onToken func(string), resumedTask *PendingTask, latestAnswer string) (string, error) {
 	var reply string
 	if outcome.NeedsApproval() {
 		reply = s.previewActions(state, outcome.PendingActions, outcome.PendingMessage)
@@ -206,6 +227,18 @@ func (s *Session) finishAgentOutcome(state *agent.RunState, outcome agent.Outcom
 		reply = strings.TrimSpace(outcome.Reply)
 		if reply == "" {
 			reply = "The agent stopped without a final answer. No unverified success was reported."
+		}
+		if outcome.AwaitingUser {
+			originalGoal := state.Goal
+			var answers []string
+			if resumedTask != nil {
+				originalGoal = resumedTask.OriginalGoal
+				answers = append(append([]string(nil), resumedTask.Answers...), strings.TrimSpace(latestAnswer))
+			}
+			s.pendingTask = &PendingTask{
+				OriginalGoal: originalGoal, Question: reply, Answers: answers,
+				ExpectedAction: state.ExpectedAction, CreatedAt: time.Now(),
+			}
 		}
 	}
 	s.history = append(s.history, models.Message{Role: "assistant", Content: reply})
@@ -259,6 +292,12 @@ func (s *Session) confirmPending(ctx context.Context) (string, error) {
 }
 
 func (s *Session) cancelPending() (string, error) {
+	if s.pendingPlan == nil && s.pendingTask != nil {
+		s.pendingTask = nil
+		reply := "Pending task discarded."
+		s.append("/cancel", reply)
+		return reply, nil
+	}
 	return s.rejectPlan("")
 }
 
@@ -405,6 +444,7 @@ func (s *Session) Clear() {
 	defer s.mu.Unlock()
 	s.history = s.history[:1]
 	s.pendingPlan = nil
+	s.pendingTask = nil
 }
 
 // HasPendingActions is the UI contract for whether its approval controls are

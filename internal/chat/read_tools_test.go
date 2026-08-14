@@ -13,6 +13,13 @@ import (
 
 func TestReadToolSchemasEncodeRequiredFieldsAsArrays(t *testing.T) {
 	for _, tool := range readToolDefinitions() {
+		if tool.Function.Parameters["type"] != "object" {
+			t.Fatalf("%s parameters type = %v, want object", tool.Function.Name, tool.Function.Parameters["type"])
+		}
+		properties, ok := tool.Function.Parameters["properties"].(map[string]any)
+		if !ok || properties == nil {
+			t.Fatalf("%s properties schema is %T, want a non-nil object", tool.Function.Name, tool.Function.Parameters["properties"])
+		}
 		required, ok := tool.Function.Parameters["required"]
 		if !ok {
 			continue
@@ -23,10 +30,59 @@ func TestReadToolSchemasEncodeRequiredFieldsAsArrays(t *testing.T) {
 	}
 }
 
+func TestTypedProposalSchemaRequiresActionSpecificFolderFields(t *testing.T) {
+	schema := proposalActionSchema([]string{"create_folder", "ensure_folders"})
+	variants, ok := schema["oneOf"].([]any)
+	if !ok || len(variants) != 2 {
+		t.Fatalf("proposal variants = %#v", schema["oneOf"])
+	}
+	requiredByType := make(map[string]map[string]bool)
+	for _, raw := range variants {
+		variant := raw.(map[string]any)
+		properties := variant["properties"].(map[string]any)
+		typeSchema := properties["type"].(map[string]any)
+		actionType := typeSchema["enum"].([]string)[0]
+		required := make(map[string]bool)
+		for _, field := range variant["required"].([]string) {
+			required[field] = true
+		}
+		requiredByType[actionType] = required
+	}
+	if !requiredByType["create_folder"]["folder"] || requiredByType["create_folder"]["paths"] {
+		t.Fatalf("create_folder requirements = %v", requiredByType["create_folder"])
+	}
+	if !requiredByType["ensure_folders"]["paths"] || requiredByType["ensure_folders"]["folder"] {
+		t.Fatalf("ensure_folders requirements = %v", requiredByType["ensure_folders"])
+	}
+}
+
+func TestBookOrganizationNarrowsProposalActions(t *testing.T) {
+	got := actionTypesForGoal("organize my reading books into genre folders and record the author")
+	joined := strings.Join(got, ",")
+	for _, required := range []string{"create_book", "update_book_metadata", "ensure_folders", "move_note"} {
+		if !strings.Contains(joined, required) {
+			t.Fatalf("actions %v omit %s", got, required)
+		}
+	}
+	if strings.Contains(joined, "trash_note") || strings.Contains(joined, "set_graph_node_size") {
+		t.Fatalf("book task received unrelated actions: %v", got)
+	}
+}
+
+func TestPlainFallbackReceivesNarrowedRequiredFieldContract(t *testing.T) {
+	message := taskActionContractMessage([]string{"create_folder", "ensure_folders"})
+	if !strings.Contains(message.Content, "create_folder requires folder") || !strings.Contains(message.Content, "ensure_folders requires paths") {
+		t.Fatalf("contract = %s", message.Content)
+	}
+	if strings.Contains(message.Content, "trash_note") {
+		t.Fatalf("contract included an unrelated action: %s", message.Content)
+	}
+}
+
 func TestOllamaToolFailureDoesNotUseRetryBudget(t *testing.T) {
 	provider := &failingToolProvider{}
 	session := &Session{loop: &Loop{ai: provider}}
-	_, err := session.chatWithRetry(t.Context(), []models.Message{{Role: "user", Content: "hi"}}, []models.ToolDefinition{{Type: "function"}}, nil)
+	_, err := session.chatWithRetry(t.Context(), []models.Message{{Role: "user", Content: "hi"}}, []models.ToolDefinition{{Type: "function"}}, nil, false)
 	if err == nil {
 		t.Fatal("expected tool failure")
 	}
@@ -94,6 +150,49 @@ func TestNativeActionProposalBecomesProviderNeutralDecision(t *testing.T) {
 	last := result.Messages[len(result.Messages)-1]
 	if len(last.ToolCalls) != 0 {
 		t.Fatalf("unresolved proposal tool call remained in provider history: %+v", last.ToolCalls)
+	}
+}
+
+func TestMutationPlanningUsesProviderRequiredToolMode(t *testing.T) {
+	provider := &requiredDecisionProvider{}
+	session := &Session{loop: &Loop{ai: provider}}
+
+	result, err := session.runReadToolLoopStateWithPolicy(t.Context(), []models.Message{{Role: "user", Content: "organize my books"}}, nil, true)
+	if err != nil {
+		t.Fatalf("run required decision loop: %v", err)
+	}
+	_, actions := ai.ExtractActions(result.Content)
+	if provider.requiredCalls != 1 || provider.ordinaryCalls != 0 {
+		t.Fatalf("required calls=%d ordinary calls=%d", provider.requiredCalls, provider.ordinaryCalls)
+	}
+	if len(actions) != 1 || actions[0].Type != "ensure_folders" {
+		t.Fatalf("actions = %+v", actions)
+	}
+}
+
+func TestNativeClarificationBecomesProviderNeutralQuestion(t *testing.T) {
+	message := models.Message{Role: "assistant", ToolCalls: []models.ToolCall{{
+		ID: "call-question", Type: "function", Function: models.ToolCallFunction{
+			Name: "request_clarification", Arguments: json.RawMessage(`{"question":"Did you mean Project Hail Mary?"}`),
+		},
+	}}}
+
+	content, decisionTool, ok := decisionToolContentWithType(message)
+	if !ok || decisionTool != "request_clarification" || content != "Did you mean Project Hail Mary?" || !onlyDecisionTools(message.ToolCalls) {
+		t.Fatalf("content=%q tool=%q ok=%v", content, decisionTool, ok)
+	}
+}
+
+func TestNativeFinishBecomesProviderNeutralAnswer(t *testing.T) {
+	message := models.Message{Role: "assistant", ToolCalls: []models.ToolCall{{
+		ID: "call-finish", Type: "function", Function: models.ToolCallFunction{
+			Name: "finish_run", Arguments: json.RawMessage(`{"message":"All requested changes were verified."}`),
+		},
+	}}}
+
+	content, ok := decisionToolContent(message)
+	if !ok || content != "All requested changes were verified." || !onlyDecisionTools(message.ToolCalls) {
+		t.Fatalf("content=%q ok=%v", content, ok)
 	}
 }
 
@@ -222,5 +321,43 @@ func (p *actionProposalProvider) ChatWithToolsResult(_ context.Context, _ []mode
 	}}, nil
 }
 func (p *actionProposalProvider) StreamChatWith(context.Context, []models.Message, ai.StreamCallbacks) (string, error) {
+	return "", nil
+}
+
+type requiredDecisionProvider struct {
+	requiredCalls int
+	ordinaryCalls int
+}
+
+func (p *requiredDecisionProvider) Name() string        { return "ChatGPT subscription" }
+func (p *requiredDecisionProvider) ChatModel() string   { return "test" }
+func (p *requiredDecisionProvider) SetChatModel(string) {}
+func (p *requiredDecisionProvider) ChatModels(context.Context) ([]ai.ModelInfo, error) {
+	return nil, nil
+}
+func (p *requiredDecisionProvider) ChatWithToolsResult(context.Context, []models.Message, []models.ToolDefinition) (ai.ToolChatResult, error) {
+	p.ordinaryCalls++
+	return ai.ToolChatResult{}, errors.New("ordinary tool mode should not be used")
+}
+func (p *requiredDecisionProvider) ChatWithRequiredToolsResult(_ context.Context, _ []models.Message, tools []models.ToolDefinition) (ai.ToolChatResult, error) {
+	p.requiredCalls++
+	foundProposal := false
+	foundQuestion := false
+	foundFinish := false
+	for _, tool := range tools {
+		foundProposal = foundProposal || tool.Function.Name == "propose_actions"
+		foundQuestion = foundQuestion || tool.Function.Name == "request_clarification"
+		foundFinish = foundFinish || tool.Function.Name == "finish_run"
+	}
+	if !foundProposal || !foundQuestion || !foundFinish {
+		return ai.ToolChatResult{}, errors.New("decision tools were not offered")
+	}
+	return ai.ToolChatResult{Message: models.Message{Role: "assistant", ToolCalls: []models.ToolCall{{
+		ID: "call-actions", Type: "function", Function: models.ToolCallFunction{
+			Name: "propose_actions", Arguments: json.RawMessage(`{"actions":[{"type":"ensure_folders","paths":["books/reading/science-fiction"]}]}`),
+		},
+	}}}}, nil
+}
+func (p *requiredDecisionProvider) StreamChatWith(context.Context, []models.Message, ai.StreamCallbacks) (string, error) {
 	return "", nil
 }

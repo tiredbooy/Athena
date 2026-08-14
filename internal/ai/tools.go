@@ -32,6 +32,7 @@ import (
 //   - archive_note:      NoteID
 //   - unarchive_note:   NoteID
 //   - create_book:      Title, Folder (optional), ISBN (optional)
+//   - update_book_metadata: NoteID, Authors and/or Genres
 //   - finish_book:      NoteID
 type Action struct {
 	// ID identifies an action within a batch plan. It is optional for
@@ -65,6 +66,8 @@ type Action struct {
 	Folders   []string `json:"folders,omitempty"`
 	Done      bool     `json:"done,omitempty"`
 	ISBN      string   `json:"isbn,omitempty"`
+	Authors   []string `json:"authors,omitempty"`
+	Genres    []string `json:"genres,omitempty"`
 }
 
 type ActionResult struct {

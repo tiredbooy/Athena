@@ -3,6 +3,7 @@ package tools
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync/atomic"
 	"testing"
 
@@ -148,6 +149,22 @@ func TestValidateChecksPlansWithoutRunningHandlers(t *testing.T) {
 	}
 	if err := d.Validate([]ai.Action{{Type: "create_note", Folder: "notes.md", Title: "Plan"}}); err == nil {
 		t.Fatal("invalid note-file folder was accepted")
+	}
+}
+
+func TestRejectedPlanIsRecordedForDiagnostics(t *testing.T) {
+	d := NewDispatcher()
+	audit := &recordingAudit{}
+	d.SetAuditLogger(audit)
+	d.Register("create_folder", func(context.Context, ai.Action) (string, error) { return "unused", nil })
+	actions := []ai.Action{{Type: "create_folder"}}
+	err := d.Validate(actions)
+	if err == nil {
+		t.Fatal("invalid folder plan was accepted")
+	}
+	d.RecordRejectedPlan(actions, err)
+	if len(audit.entries) != 1 || audit.entries[0].Outcome != "rejected" || !strings.Contains(audit.entries[0].ActionJSON, `"type":"create_folder"`) || !strings.Contains(audit.entries[0].Error, "requires folder") {
+		t.Fatalf("audit entries = %+v", audit.entries)
 	}
 }
 

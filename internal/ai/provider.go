@@ -32,7 +32,47 @@ type NativeToolSupportProvider interface {
 	NativeToolSupport(context.Context) (NativeToolSupport, error)
 }
 
+// RequiredToolProvider is an optional provider capability for planning turns
+// that must produce a tool decision rather than unstructured prose. Providers
+// implement it only when their API has a native required-tool mode.
+type RequiredToolProvider interface {
+	ChatWithRequiredToolsResult(context.Context, []models.Message, []models.ToolDefinition) (ToolChatResult, error)
+}
+
 type NativeToolSupport struct {
 	Available bool
 	Reason    string
+}
+
+// normalizedToolDefinitions keeps parameterless functions valid across model
+// APIs. A nil Go map otherwise becomes JSON null, but function inputs are JSON
+// Schemas and therefore need an object schema even when they accept no fields.
+func normalizedToolDefinitions(definitions []models.ToolDefinition) []models.ToolDefinition {
+	if len(definitions) == 0 {
+		return definitions
+	}
+	normalized := make([]models.ToolDefinition, len(definitions))
+	copy(normalized, definitions)
+	for i := range normalized {
+		normalized[i].Function.Parameters = normalizedFunctionParameters(normalized[i].Function.Parameters)
+	}
+	return normalized
+}
+
+func normalizedFunctionParameters(parameters map[string]any) map[string]any {
+	if parameters == nil {
+		return map[string]any{"type": "object", "properties": map[string]any{}}
+	}
+	if schemaType, _ := parameters["type"].(string); schemaType != "object" {
+		return parameters
+	}
+	if properties, ok := parameters["properties"].(map[string]any); ok && properties != nil {
+		return parameters
+	}
+	normalized := make(map[string]any, len(parameters)+1)
+	for key, value := range parameters {
+		normalized[key] = value
+	}
+	normalized["properties"] = map[string]any{}
+	return normalized
 }

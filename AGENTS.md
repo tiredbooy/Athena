@@ -168,6 +168,22 @@ Comment:
 - surprising behavior
 - external limitations
 
+# Documentation Freshness
+
+Documentation is part of the implementation, not a follow-up task.
+
+After every behavior, architecture, protocol, configuration, provider, or user
+workflow change:
+
+- update the matching file under `docs/` in the same change
+- update protocol or application README files when their public contract changes
+- describe the behavior that exists now; keep proposals in plan documents
+- remove or correct statements made stale by the change
+- mention explicitly in the final review when no documentation update was needed
+
+A change is not complete while its affected documentation describes the old
+behavior.
+
 ---
 
 # Testing

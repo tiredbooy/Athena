@@ -3,15 +3,23 @@ import { spawn } from "node:child_process";
 import { Box, Text, render, useApp, useInput, useStdout } from "ink";
 import TextInput from "ink-text-input";
 import { EngineClient } from "./engine/EngineClient.js";
-import type { Action, EngineEvent, ProviderConnection, ProviderPreset } from "./protocol/types.js";
+import type { Action, EngineEvent, ModelOption, ProviderConnection, ProviderPreset } from "./protocol/types.js";
+import {
+  buildTranscriptRows,
+  orderedSelection,
+  selectedText,
+  selectionPointAt,
+  windowTranscript,
+  type Selection,
+  type TranscriptContentRow,
+  type TranscriptMessage,
+  type TranscriptRow,
+} from "./transcript.js";
 
-type ChatMessage = { id: number; role: "user" | "assistant"; text: string };
+type ChatMessage = TranscriptMessage;
 type Plan = { id: string; actions: Action[] };
 type PlanDecision = "waiting" | "applying" | "discarding";
 type Command = { name: string; description: string };
-type SelectionPoint = { message: number; offset: number };
-type Selection = { anchor: SelectionPoint; focus: SelectionPoint };
-type MessageLayout = { startRow: number; lines: Array<{ text: string; start: number }> };
 type ConnectStep = "providers" | "name" | "base_url" | "api_key" | "model" | "oauth" | "saving";
 type ConnectFlow = {
   step: ConnectStep;
@@ -21,6 +29,7 @@ type ConnectFlow = {
   values: ProviderConnection;
   oauthLines: string[];
 };
+type ModelFlow = { options: ModelOption[]; selectedIndex: number; selecting: boolean };
 
 const amber = "#e4a853";
 const ink = "#e9e2d0";
@@ -62,9 +71,13 @@ function App(): React.ReactElement {
   const [pulseIndex, setPulseIndex] = useState(0);
   const [loadingPhraseIndex, setLoadingPhraseIndex] = useState(0);
   const [selection, setSelection] = useState<Selection>();
+  const [scrollOffset, setScrollOffset] = useState(0);
   const [connectFlow, setConnectFlow] = useState<ConnectFlow>();
+  const [modelFlow, setModelFlow] = useState<ModelFlow>();
   const activityTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   const activityState = useRef({ lastShownAt: 0, pending: "" });
+  const transcriptError = useRef<string | undefined>(undefined);
+  const previousTranscriptRows = useRef(0);
 
   const addMessage = (role: ChatMessage["role"], text: string) => {
     setMessageID((currentID) => {
@@ -73,6 +86,16 @@ function App(): React.ReactElement {
       return id;
     });
   };
+
+  useEffect(() => {
+    if (!error) {
+      transcriptError.current = undefined;
+      return;
+    }
+    if (transcriptError.current === error) return;
+    transcriptError.current = error;
+    addMessage("error", error);
+  }, [error]);
 
   function setActivityNow(next: string) {
     if (activityTimer.current) clearTimeout(activityTimer.current);
@@ -210,6 +233,21 @@ function App(): React.ReactElement {
           setStatus("ready");
           setActivityNow("Provider connected");
           return;
+        case "model.options":
+          setModelFlow({
+            options: event.models ?? [],
+            selectedIndex: Math.max(0, (event.models ?? []).findIndex((option) => option.current)),
+            selecting: false,
+          });
+          setStatus("ready");
+          setActivityNow("Choose a model");
+          return;
+        case "model.selected":
+          if (event.provider && event.model) setModelName(`${event.provider} · ${shortModel(event.model)}`);
+          setModelFlow(undefined);
+          setStatus("ready");
+          setActivityNow(event.message ?? "Model changed");
+          return;
         case "error":
           setError(event.error ?? "The engine rejected the request.");
           if (event.turnId) setTurnID(undefined);
@@ -252,12 +290,50 @@ function App(): React.ReactElement {
           }
           setEditorKey((current) => current + 1);
         });
-      });
+      }, scrollTranscript);
       return;
     }
     if (key.ctrl && input === "c") {
       client.dispose();
       exit();
+      return;
+    }
+    if (key.pageUp) {
+      scrollTranscript(Math.max(1, transcriptHeight - 1));
+      return;
+    }
+    if (key.pageDown) {
+      scrollTranscript(-Math.max(1, transcriptHeight - 1));
+      return;
+    }
+    if (modelFlow) {
+      if (key.escape) {
+        setModelFlow(undefined);
+        setActivityNow("Model selection closed");
+        resetComposer();
+        return;
+      }
+      if (modelFlow.selecting || modelFlow.options.length === 0) return;
+      if (key.upArrow) {
+        setModelFlow({ ...modelFlow, selectedIndex: (modelFlow.selectedIndex - 1 + modelFlow.options.length) % modelFlow.options.length });
+        return;
+      }
+      if (key.downArrow) {
+        setModelFlow({ ...modelFlow, selectedIndex: (modelFlow.selectedIndex + 1) % modelFlow.options.length });
+        return;
+      }
+      if (key.return) {
+        const selected = modelFlow.options[modelFlow.selectedIndex];
+        setModelFlow({ ...modelFlow, selecting: true });
+        setStatus("working");
+        setActivityNow(`Switching to ${selected.model}…`);
+        void client.selectModel(selected.providerId, selected.model).catch((reason: Error) => {
+          setModelFlow((current) => current ? { ...current, selecting: false } : current);
+          setStatus("error");
+          setError(reason.message);
+        });
+        return;
+      }
       return;
     }
     if (connectFlow) {
@@ -321,18 +397,32 @@ function App(): React.ReactElement {
     if (key.downArrow) restoreHistory(1);
   }, { isActive: interactive });
 
-  const visibleMessages = useMemo(() => {
-    const rows = stdout.rows || 24;
-    const limit = Math.max(3, rows - (plan ? 14 : 10));
-    return messages.slice(-limit);
-  }, [messages, plan, stdout.rows]);
-  const suggestions = connectFlow ? [] : commandSuggestions(draft);
   const terminalWidth = stdout.columns || 80;
   const terminalHeight = stdout.rows || 24;
-  const messageWidth = Math.max(12, terminalWidth - 10);
-  const messageLayouts = useMemo(() => layoutMessages(visibleMessages, messageWidth), [visibleMessages, messageWidth]);
-  const mouseState = useRef({ visibleMessages, messageLayouts, selection });
-  mouseState.current = { visibleMessages, messageLayouts, selection };
+  // Root horizontal padding consumes four columns and each role prefix consumes
+  // seven more. Keeping those out of the content width prevents terminal-level
+  // wrapping from adding rows that Ink did not account for.
+  const messageWidth = Math.max(12, terminalWidth - 11);
+  const suggestions = connectFlow || modelFlow ? [] : commandSuggestions(draft);
+  const activityShown = showActivity(status, activity);
+  const transcriptHeight = Math.max(3, terminalHeight - reservedRows(plan, connectFlow, modelFlow, suggestions, activityShown));
+  const transcriptRows = useMemo(() => buildTranscriptRows(messages, messageWidth), [messages, messageWidth]);
+  const transcript = useMemo(
+    () => windowTranscript(transcriptRows, transcriptHeight, scrollOffset),
+    [transcriptRows, transcriptHeight, scrollOffset],
+  );
+  const mouseState = useRef({ messages, rows: transcript.rows, selection });
+  mouseState.current = { messages, rows: transcript.rows, selection };
+
+  useEffect(() => {
+    const previous = previousTranscriptRows.current;
+    const growth = transcriptRows.length - previous;
+    previousTranscriptRows.current = transcriptRows.length;
+    setScrollOffset((current) => {
+      const preserved = current > 0 && growth > 0 ? current + growth : current;
+      return Math.min(transcript.maxOffset, Math.max(0, preserved));
+    });
+  }, [transcriptRows.length, transcript.maxOffset]);
 
   useEffect(() => {
     if (!interactive) return;
@@ -343,7 +433,9 @@ function App(): React.ReactElement {
       stdout.write(disableMouse);
     };
   }, [interactive, stdout]);
-  const prompt = connectFlow
+  const prompt = modelFlow
+    ? modelFlow.selecting ? "Switching model…" : "↑↓ choose · Enter select · Esc close"
+    : connectFlow
     ? connectFlow.step === "oauth" ? "Esc cancel · complete sign-in in your browser" : "Enter continue · Esc close"
     : plan
     ? planDecision === "applying"
@@ -354,6 +446,11 @@ function App(): React.ReactElement {
     : turnID
       ? "[Esc] cancel"
       : "Enter send · ↑↓ history · Ctrl+C quit";
+
+  function scrollTranscript(delta: number) {
+    setSelection(undefined);
+    setScrollOffset((current) => Math.max(0, Math.min(transcript.maxOffset, current + delta)));
+  }
 
   function restoreHistory(direction: -1 | 1) {
     if (history.length === 0) return;
@@ -382,13 +479,16 @@ function App(): React.ReactElement {
     if (!inputText || status === "working" || status === "starting") return;
     if (inputText === "/clear") {
       setMessages([]);
+      setSelection(undefined);
+      setScrollOffset(0);
       setError(undefined);
       setActivityNow("Transcript cleared");
       resetComposer();
       return;
     }
     if (inputText === "/help") {
-      addMessage("assistant", "Enter send · Shift+Enter newline · Esc cancel · ↑↓ history\n\n" + commands.map((command) => `${command.name} — ${command.description}`).join("\n"));
+      setScrollOffset(0);
+      addMessage("assistant", "Enter send · Shift+Enter newline · Esc cancel · ↑↓ history · PgUp/PgDn or mouse wheel scroll · drag to copy\n\n" + commands.map((command) => `${command.name} — ${command.description}`).join("\n"));
       remember(inputText);
       resetComposer();
       return;
@@ -405,6 +505,20 @@ function App(): React.ReactElement {
       });
       return;
     }
+    if (inputText === "/models") {
+      remember(inputText);
+      resetComposer();
+      setError(undefined);
+      setStatus("working");
+      setActivityNow("Loading available models…");
+      void client.models().catch((reason: Error) => {
+        setModelFlow(undefined);
+        setStatus("error");
+        setError(reason.message);
+      });
+      return;
+    }
+    setScrollOffset(0);
     addMessage("user", inputText);
     remember(inputText);
     resetComposer();
@@ -508,16 +622,16 @@ function App(): React.ReactElement {
   return (
     <Box flexDirection="column" width={terminalWidth} height={terminalHeight} paddingX={2} paddingY={1}>
       <Header />
-      <Box flexDirection="column" flexGrow={1} overflow="hidden" marginTop={1}>
-        {visibleMessages.length === 0 ? <Welcome /> : visibleMessages.map((message, index) => <Message key={message.id} message={message} index={index} layout={messageLayouts[index]} selection={selection} />)}
+      <Box flexDirection="column" height={transcriptHeight} flexShrink={0} overflow="hidden" marginTop={1}>
+        {messages.length === 0 ? <Welcome /> : transcript.rows.map((row) => <TranscriptLine key={row.key} row={row} selection={selection} />)}
       </Box>
       {plan && <ApprovalCard plan={plan} decision={planDecision} />}
       {connectFlow && <ConnectPanel flow={connectFlow} />}
-      {error && <Text color={red}>error · {error}</Text>}
+      {modelFlow && <ModelPanel flow={modelFlow} />}
       {suggestions.length > 0 && <CommandHints suggestions={suggestions} />}
-      {showActivity(status, activity) && <ActivityLine activity={activity} status={status} pulse={pulseFrames[pulseIndex]} phrase={loadingPhrases[loadingPhraseIndex]} />}
-      <Composer key={editorKey} draft={draft} focus={!plan && connectFlow?.step !== "oauth" && connectFlow?.step !== "saving" && interactive} onChange={handleDraftChange} onSubmit={submitDraft} error={status === "error"} placeholder={connectPlaceholder(connectFlow)} mask={connectFlow?.step === "api_key" ? "•" : undefined} />
-      <Footer prompt={prompt} model={modelName} />
+      {activityShown && <ActivityLine activity={activity} status={status} pulse={pulseFrames[pulseIndex]} phrase={loadingPhrases[loadingPhraseIndex]} />}
+      <Composer key={editorKey} draft={draft} focus={!plan && !modelFlow && connectFlow?.step !== "oauth" && connectFlow?.step !== "saving" && interactive} onChange={handleDraftChange} onSubmit={submitDraft} error={status === "error"} placeholder={modelFlow ? "Choose a model above" : connectPlaceholder(connectFlow)} mask={connectFlow?.step === "api_key" ? "•" : undefined} />
+      <Footer prompt={prompt} model={modelName} scrollOffset={transcript.offset} maxScrollOffset={transcript.maxOffset} />
     </Box>
   );
 }
@@ -530,10 +644,13 @@ function Welcome(): React.ReactElement {
   return <Text color={dim}>Ask Athena to find, create, connect, or organize anything in your vault.</Text>;
 }
 
-function Message({ message, index, layout, selection }: { message: ChatMessage; index: number; layout: MessageLayout; selection?: Selection }): React.ReactElement {
-  const isUser = message.role === "user";
-  const prefix = isUser ? "you    " : "athena ";
-  return <Box flexDirection="column" marginBottom={1}>{layout.lines.map((line, lineIndex) => <Text key={`${message.id}-${lineIndex}`} color={ink}><Text color={isUser ? amber : green} bold>{lineIndex === 0 ? prefix : " ".repeat(prefix.length)}</Text>{renderSelectedLine(line.text, line.start, index, selection)}</Text>)}</Box>;
+function TranscriptLine({ row, selection }: { row: TranscriptRow; selection?: Selection }): React.ReactElement {
+  if (row.kind === "spacer") return <Text> </Text>;
+  const isUser = row.role === "user";
+  const isError = row.role === "error";
+  const prefix = row.firstLine ? isUser ? "you    " : isError ? "error  " : "athena " : "       ";
+  const color = isUser ? amber : isError ? red : green;
+  return <Text color={isError ? red : ink} wrap="truncate-end"><Text color={color} bold>{prefix}</Text>{renderSelectedLine(row, selection, isError ? red : ink)}</Text>;
 }
 
 function Composer({ draft, focus, onChange, onSubmit, error, placeholder, mask }: { draft: string; focus: boolean; onChange: (value: string) => void; onSubmit: (value: string) => void; error: boolean; placeholder: string; mask?: string }): React.ReactElement {
@@ -562,6 +679,22 @@ function ConnectPanel({ flow }: { flow: ConnectFlow }): React.ReactElement {
     <Box justifyContent="space-between"><Text color={blue} bold>{flow.step === "saving" ? "SAVING PROVIDER" : "PROVIDER DETAILS"}</Text><Text color={dim}>{flow.preset?.label}</Text></Box>
     <Text color={dim}>{["name", "URL", "secret", "model"].map((label, index) => `${index + 1 === current ? "[" + label + "]" : label}`).join("  →  ")}</Text>
     <Text color={ink}>{connectStepHelp(flow)}</Text>
+  </Box>;
+}
+
+function ModelPanel({ flow }: { flow: ModelFlow }): React.ReactElement {
+  const limit = 6;
+  const start = Math.min(Math.max(0, flow.selectedIndex - limit + 1), Math.max(0, flow.options.length - limit));
+  const visible = flow.options.slice(start, start + limit);
+  return <Box flexDirection="column" borderStyle="double" borderColor={blue} paddingX={1} marginTop={1}>
+    <Box justifyContent="space-between"><Text color={blue} bold>AVAILABLE MODELS</Text><Text color={dim}>{flow.selectedIndex + 1}/{flow.options.length}</Text></Box>
+    {visible.map((option, visibleIndex) => {
+      const index = start + visibleIndex;
+      return <Text key={`${option.providerId}-${option.model}`} color={index === flow.selectedIndex ? amber : ink} wrap="truncate-end">
+        {index === flow.selectedIndex ? "❯ " : "  "}{option.model}<Text color={dim}> · {option.providerName}{option.current ? " · current" : ""}</Text>
+      </Text>;
+    })}
+    <Text color={flow.selecting ? blue : dim}>{flow.selecting ? "Switching model…" : "↑↓ choose · Enter select · Esc close"}</Text>
   </Box>;
 }
 
@@ -639,11 +772,14 @@ function firstURL(value: string): string | undefined {
 
 function ActivityLine({ activity, status, pulse, phrase }: { activity: string; status: string; pulse: string; phrase: string }): React.ReactElement {
   const loading = status === "starting" || status === "working";
-  return <Box marginTop={1}><Text color={status === "error" ? red : amber}>{pulse} </Text><Text color={ink}>{activity}</Text>{loading && <Text color={blue}> · {phrase}…</Text>}</Box>;
+  return <Box marginTop={1}><Text wrap="truncate-end"><Text color={status === "error" ? red : amber}>{pulse} </Text><Text color={ink}>{activity}</Text>{loading && <Text color={blue}> · {phrase}…</Text>}</Text></Box>;
 }
 
-function Footer({ prompt, model }: { prompt: string; model: string }): React.ReactElement {
-  return <Box justifyContent="space-between"><Text color={dim}>{prompt}</Text><Text color={dim}>model · {model}</Text></Box>;
+function Footer({ prompt, model, scrollOffset, maxScrollOffset }: { prompt: string; model: string; scrollOffset: number; maxScrollOffset: number }): React.ReactElement {
+  const scroll = maxScrollOffset > 0
+    ? `PgUp/PgDn scroll${scrollOffset > 0 ? ` · ${scrollOffset} rows up` : ""}`
+    : "";
+  return <Box justifyContent="space-between"><Text color={dim} wrap="truncate-end">{prompt} · {scroll ? scroll + " · " : ""}drag copy</Text><Text color={dim} wrap="truncate-end">model · {model}</Text></Box>;
 }
 
 function ApprovalCard({ plan, decision }: { plan: Plan; decision: PlanDecision }): React.ReactElement {
@@ -669,72 +805,24 @@ function CommandHints({ suggestions }: { suggestions: Command[] }): React.ReactE
   return <Box flexDirection="column" marginTop={1}><Text color={dim}>commands · Tab completes</Text>{suggestions.slice(0, 4).map((command) => <Text key={command.name} color={blue}>  {command.name.padEnd(10)} {command.description}</Text>)}</Box>;
 }
 
-function layoutMessages(messages: ChatMessage[], width: number): MessageLayout[] {
-  let row = 4;
-  return messages.map((message) => {
-    const lines = wrapMessage(message.text, width);
-    const layout = { startRow: row, lines };
-    row += lines.length + 1;
-    return layout;
-  });
-}
-
-function wrapMessage(text: string, width: number): Array<{ text: string; start: number }> {
-  const lines: Array<{ text: string; start: number }> = [];
-  let offset = 0;
-  for (const sourceLine of text.split("\n")) {
-    let remaining = sourceLine;
-    let lineStart = offset;
-    if (remaining.length === 0) lines.push({ text: "", start: lineStart });
-    while (remaining.length > 0) {
-      if (remaining.length <= width) {
-        lines.push({ text: remaining, start: lineStart });
-        break;
-      }
-      let breakAt = remaining.lastIndexOf(" ", width);
-      if (breakAt <= 0) breakAt = width;
-      const line = remaining.slice(0, breakAt);
-      lines.push({ text: line, start: lineStart });
-      const consumed = breakAt < remaining.length && remaining[breakAt] === " " ? breakAt + 1 : breakAt;
-      remaining = remaining.slice(consumed);
-      lineStart += consumed;
-    }
-    offset += sourceLine.length + 1;
-  }
-  return lines;
-}
-
-function renderSelectedLine(text: string, lineStart: number, message: number, selection?: Selection): React.ReactNode {
+function renderSelectedLine(row: TranscriptContentRow, selection: Selection | undefined, color: string): React.ReactNode {
   const range = orderedSelection(selection);
-  if (!range || message < range.start.message || message > range.end.message) return <Text color={ink}>{text}</Text>;
-  const start = message === range.start.message ? range.start.offset : 0;
-  const end = message === range.end.message ? range.end.offset : Number.MAX_SAFE_INTEGER;
-  const selectedStart = Math.max(0, start - lineStart);
-  const selectedEnd = Math.min(text.length, end - lineStart);
-  if (selectedEnd <= selectedStart) return <Text color={ink}>{text}</Text>;
-  return <><Text color={ink}>{text.slice(0, selectedStart)}</Text><Text color={ink} inverse>{text.slice(selectedStart, selectedEnd)}</Text><Text color={ink}>{text.slice(selectedEnd)}</Text></>;
+  if (!range || row.message < range.start.message || row.message > range.end.message) return <Text color={color}>{row.text}</Text>;
+  const start = row.message === range.start.message ? range.start.offset : 0;
+  const end = row.message === range.end.message ? range.end.offset : Number.MAX_SAFE_INTEGER;
+  const selectedStart = Math.max(0, start - row.start);
+  const selectedEnd = Math.min(row.text.length, end - row.start);
+  if (selectedEnd <= selectedStart) return <Text color={color}>{row.text}</Text>;
+  return <><Text color={color}>{row.text.slice(0, selectedStart)}</Text><Text color={color} inverse>{row.text.slice(selectedStart, selectedEnd)}</Text><Text color={color}>{row.text.slice(selectedEnd)}</Text></>;
 }
 
-function orderedSelection(selection?: Selection): { start: SelectionPoint; end: SelectionPoint } | undefined {
-  if (!selection) return undefined;
-  const before = selection.anchor.message < selection.focus.message || (selection.anchor.message === selection.focus.message && selection.anchor.offset <= selection.focus.offset);
-  return before ? { start: selection.anchor, end: selection.focus } : { start: selection.focus, end: selection.anchor };
-}
-
-function selectedText(messages: ChatMessage[], selection?: Selection): string {
-  const range = orderedSelection(selection);
-  if (!range) return "";
-  const chunks: string[] = [];
-  for (let index = range.start.message; index <= range.end.message; index++) {
-    const message = messages[index]?.text ?? "";
-    const start = index === range.start.message ? range.start.offset : 0;
-    const end = index === range.end.message ? range.end.offset : message.length;
-    chunks.push(message.slice(start, end));
-  }
-  return chunks.join("\n").trim();
-}
-
-function handleMouseInput(chunk: string, state: { visibleMessages: ChatMessage[]; messageLayouts: MessageLayout[]; selection?: Selection }, setSelection: (selection?: Selection) => void, onCopy: (text: string) => void): void {
+function handleMouseInput(
+  chunk: string,
+  state: { messages: ChatMessage[]; rows: TranscriptRow[]; selection?: Selection },
+  setSelection: (selection?: Selection) => void,
+  onCopy: (text: string) => void,
+  onScroll: (delta: number) => void,
+): void {
   const mouseEvent = /\u001b?\[<(\d+);(\d+);(\d+)([mM])/g;
   let match: RegExpExecArray | null;
   while ((match = mouseEvent.exec(chunk)) !== null) {
@@ -742,7 +830,11 @@ function handleMouseInput(chunk: string, state: { visibleMessages: ChatMessage[]
     const column = Number(match[2]);
     const row = Number(match[3]);
     const kind = match[4];
-    const point = pointAt(row, column, state.messageLayouts);
+    if ((button & 64) !== 0 && kind === "M") {
+      onScroll((button & 1) === 0 ? 3 : -3);
+      continue;
+    }
+    const point = selectionPointAt(row, column, state.rows);
     const leftButton = (button & 3) === 0;
     if (kind === "M" && leftButton && point) {
       const nextSelection = (button & 32) !== 0 && state.selection
@@ -752,25 +844,12 @@ function handleMouseInput(chunk: string, state: { visibleMessages: ChatMessage[]
       setSelection(nextSelection);
     }
     if (kind === "m" && state.selection) {
-      const text = selectedText(state.visibleMessages, state.selection);
+      const text = selectedText(state.messages, state.selection);
       if (text.length > 0) onCopy(text);
       state.selection = undefined;
       setSelection(undefined);
     }
   }
-}
-
-function pointAt(row: number, column: number, layouts: MessageLayout[]): SelectionPoint | undefined {
-  const contentStartColumn = 10;
-  for (let message = 0; message < layouts.length; message++) {
-    const layout = layouts[message];
-    const lineIndex = row - layout.startRow;
-    if (lineIndex < 0 || lineIndex >= layout.lines.length) continue;
-    const line = layout.lines[lineIndex];
-    const offset = Math.max(0, Math.min(line.text.length, column - contentStartColumn));
-    return { message, offset: line.start + offset };
-  }
-  return undefined;
 }
 
 function osc52Copy(text: string): string {
@@ -865,6 +944,22 @@ function capitalize(value: string): string {
 
 function showActivity(status: string, activity: string): boolean {
   return status !== "ready" || (activity !== "Ready" && activity !== "Ready · your vault stays local");
+}
+
+function reservedRows(plan: Plan | undefined, connectFlow: ConnectFlow | undefined, modelFlow: ModelFlow | undefined, suggestions: Command[], activityShown: boolean): number {
+  // Root padding, header, transcript margin, composer, and footer consume nine
+  // rows before optional panels are rendered.
+  let rows = 9;
+  if (activityShown) rows += 2;
+  if (suggestions.length > 0) rows += Math.min(4, suggestions.length) + 2;
+  if (plan) rows += plan.actions.length + 5;
+  if (modelFlow) rows += Math.min(6, modelFlow.options.length) + 5;
+  if (connectFlow) {
+    if (connectFlow.step === "providers") rows += connectFlow.presets.length + 5;
+    else if (connectFlow.step === "oauth") rows += connectFlow.oauthLines.length + 5;
+    else rows += 6;
+  }
+  return rows;
 }
 
 render(<App />, { exitOnCtrlC: false });

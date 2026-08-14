@@ -79,7 +79,7 @@ func TestNativeToolSupportRejectsToollessTemplateEvenWhenAdvertised(t *testing.T
 	}
 }
 
-func TestOllamaMessagesMergeSystemInstructionsAtBeginning(t *testing.T) {
+func TestOllamaMessagesKeepLaterSystemContextInTurnOrder(t *testing.T) {
 	messages := []models.Message{
 		{Role: "system", Content: "base instructions"},
 		{Role: "user", Content: "organize my books"},
@@ -90,9 +90,9 @@ func TestOllamaMessagesMergeSystemInstructionsAtBeginning(t *testing.T) {
 
 	normalized := ollamaMessages(messages)
 	if len(normalized) != 4 {
-		t.Fatalf("messages = %d, want 4 after merging system instructions", len(normalized))
+		t.Fatalf("messages = %d, want 4 after adjacent user context is coalesced", len(normalized))
 	}
-	if normalized[0].Role != "system" || !strings.Contains(normalized[0].Content, "base instructions") || !strings.Contains(normalized[0].Content, "verified folder result") {
+	if normalized[0].Role != "system" || !strings.Contains(normalized[0].Content, "base instructions") || strings.Contains(normalized[0].Content, "verified folder result") {
 		t.Fatalf("leading system message = %+v", normalized[0])
 	}
 	for index, message := range normalized[1:] {
@@ -100,7 +100,7 @@ func TestOllamaMessagesMergeSystemInstructionsAtBeginning(t *testing.T) {
 			t.Fatalf("message %d retained a non-leading system role", index+1)
 		}
 	}
-	if normalized[1].Content != "organize my books" || normalized[2].Content != "I need the folder inventory" || normalized[3].Content != "continue" {
+	if normalized[1].Content != "organize my books" || normalized[2].Content != "I need the folder inventory" || normalized[3].Role != "user" || !strings.Contains(normalized[3].Content, "verified folder result") || !strings.Contains(normalized[3].Content, "continue") {
 		t.Fatalf("non-system message order changed: %+v", normalized)
 	}
 }
@@ -136,6 +136,34 @@ func TestOllamaMessagesAlwaysIncludeTemplateQuery(t *testing.T) {
 	}
 }
 
+func TestOllamaMessagesSeparateRepeatedAssistantPlansWithObservations(t *testing.T) {
+	messages := []models.Message{
+		{Role: "system", Content: "base instructions"},
+		{Role: "user", Content: "add two books"},
+		{Role: "assistant", Content: "first action plan"},
+		{Role: "system", Content: "first action succeeded"},
+		{Role: "assistant", Content: "second action plan"},
+		{Role: "system", Content: "second action succeeded; evaluate the goal"},
+	}
+
+	normalized := ollamaMessages(messages)
+	for index := 1; index < len(normalized); index++ {
+		if normalized[index-1].Role == "assistant" && normalized[index].Role == "assistant" {
+			t.Fatalf("adjacent assistant messages at %d: %+v", index, normalized)
+		}
+		if normalized[index].Role == "system" {
+			t.Fatalf("non-leading system message at %d: %+v", index, normalized)
+		}
+	}
+	roles := make([]string, len(normalized))
+	for index, message := range normalized {
+		roles[index] = message.Role
+	}
+	if got := strings.Join(roles, ","); got != "system,user,assistant,user,assistant,user" {
+		t.Fatalf("roles = %s", got)
+	}
+}
+
 func TestPlainOllamaPlanningDisablesPrivateThinking(t *testing.T) {
 	client := NewClient("http://ollama.test", "qwen3-thinking", "test-embed")
 	client.http = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
@@ -152,6 +180,54 @@ func TestPlainOllamaPlanningDisablesPrivateThinking(t *testing.T) {
 	result, err := client.ChatWithToolsResult(t.Context(), []models.Message{{Role: "user", Content: "add a book"}}, nil)
 	if err != nil || result.Message.Content != "visible plan" {
 		t.Fatalf("result=%+v err=%v", result, err)
+	}
+}
+
+func TestOllamaContextOverflowExpandsAndCachesSmallestWindow(t *testing.T) {
+	client := NewClient("http://ollama.test", "large-context-model", "test-embed")
+	var contextSizes []int
+	client.http = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		var request models.MessageReq
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		contextSize, _ := request.Options["num_ctx"].(float64)
+		contextSizes = append(contextSizes, int(contextSize))
+		if len(contextSizes) == 1 {
+			return &http.Response{
+				StatusCode: http.StatusBadRequest,
+				Body:       io.NopCloser(strings.NewReader(`{"error":"request (5082 tokens) exceeds the available context size (4096 tokens), try increasing it"}`)),
+				Header:     make(http.Header),
+			}, nil
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Body:       io.NopCloser(strings.NewReader(`{"message":{"role":"assistant","content":"planned"},"done":true}`)),
+			Header:     make(http.Header),
+		}, nil
+	})}
+
+	for range 2 {
+		result, err := client.ChatWithToolsResult(t.Context(), []models.Message{{Role: "user", Content: "add a book"}}, nil)
+		if err != nil || result.Message.Content != "planned" {
+			t.Fatalf("result=%+v err=%v", result, err)
+		}
+	}
+	if len(contextSizes) != 3 {
+		t.Fatalf("request count = %d, want overflow + retry + cached request", len(contextSizes))
+	}
+	if contextSizes[0] != 0 || contextSizes[1] != 8192 || contextSizes[2] != 8192 {
+		t.Fatalf("context sizes = %v, want [0 8192 8192]", contextSizes)
+	}
+}
+
+func TestOllamaContextExpansionRefusesUnboundedGrowth(t *testing.T) {
+	client := NewClient("http://ollama.test", "test-model", "test-embed")
+	if client.expandContextFor("test-model", "request (20000 tokens) exceeds the available context size (4096 tokens)") {
+		t.Fatal("oversized request unexpectedly increased local context beyond the safety cap")
+	}
+	if options := client.localChatOptions("test-model"); options["num_ctx"] != nil {
+		t.Fatalf("context option was cached after rejected expansion: %#v", options)
 	}
 }
 

@@ -7,10 +7,13 @@ action rather than asking the language model to invent bibliographic facts.
 
 1. Look up the normalized title in Athena's local SQLite metadata cache.
 2. If it is not cached, do a small exact-title lookup against Open Library.
-3. Cache a successful result locally and write an Obsidian-compatible book note.
-4. If there is no exact, verifiable match or the lookup is unavailable, create
-   the book note with `metadata_source: unresolved`. Athena never guesses the
-   author, genre, year, or ISBN.
+3. If the catalog returns a strong similar title but no exact title, present it
+   as a correction suggestion. Never silently rename the user's book.
+4. Cache an exact result locally and write an Obsidian-compatible book note.
+5. If there is no exact match or the lookup is unavailable, use authors and
+   genres explicitly supplied by the user as fallback facts. Otherwise create
+   the note with `metadata_source: unresolved`. Athena never invents the author,
+   genre, year, or ISBN.
 
 An ISBN is optional. If supplied, Athena validates its checksum. When it is not
 supplied, the catalog result may provide one; otherwise the field is left empty.
@@ -30,6 +33,16 @@ started_at: 2026-08-03T20:15:00+03:30
 `finish_book` records `finished_at` from Athena's local system clock. The model
 can see the current time for conversation, but it cannot author the stored
 lifecycle timestamp.
+
+`update_book_metadata` fills authors and/or genres on an existing tracked book
+without replacing its reading notes. Empty action fields never erase existing
+metadata, and fallback values cannot replace different non-empty catalog facts.
+A user fallback records `metadata_source: user`; supplementing a partial catalog
+record appends `+user` to its source.
+
+Genre has two distinct representations when the user asks to organize by
+genre: structured `genres` frontmatter describes the book, while the physical
+folder such as `books/reading/Science Fiction` describes its vault location.
 
 ## Storage and optional offline catalog
 

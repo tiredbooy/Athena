@@ -66,7 +66,7 @@ func hasRepairBudget(ctx context.Context) bool {
 }
 
 func repairInstruction(reason string) string {
-	return "Correction required. " + reason + " Re-read the authoritative vault context and use read-only tools if an exact note_id or folder is missing. Then return one concise user-facing answer followed by valid fenced action JSON for every requested change. Do not claim that anything changed until Athena executes it. A folder field is a directory only; never put a note title or .md filename in it. If the request is ambiguous, ask one precise question instead of guessing."
+	return "Correction required. " + reason + " Re-read the authoritative vault context and use read-only tools if an exact note_id or folder is missing. Then call propose_actions with a non-empty actions array when that tool is available; use valid fenced action JSON only when it is unavailable. Do not replace executable action data with a prose promise, and do not claim that anything changed until Athena executes it. A folder field is a directory only; never put a note title or .md filename in it. If the request is ambiguous, ask one precise question instead of guessing."
 }
 
 func expectsActionRequest(input string) bool {
@@ -75,7 +75,7 @@ func expectsActionRequest(input string) bool {
 		return false
 	}
 	return containsAny(input, []string{
-		"create", "add", "make", "write", "save", "move", "rename", "delete", "remove", "update", "edit", "append", "archive", "restore", "link", "connect", "disconnect", "unlink", "mark", "finish",
+		"create", "add", "make", "write", "save", "move", "rename", "delete", "remove", "update", "edit", "append", "archive", "restore", "link", "connect", "disconnect", "unlink", "mark", "finish", "organize", "organise", "style", "color", "colour",
 	}) && containsAny(input, []string{"note", "folder", "directory", "file", "vault", "task", "book", "journal", "idea"})
 }
 

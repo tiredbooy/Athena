@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 
+	"github.com/tiredbooy/internal/appdirs"
 	"gopkg.in/yaml.v3"
 )
 
@@ -46,11 +47,7 @@ type ProviderConfig struct {
 }
 
 func configFilePath() (string, error) {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return "", fmt.Errorf("resolve home dir: %w", err)
-	}
-	return filepath.Join(home, ".config", "second-brain", "config.yaml"), nil
+	return appdirs.ConfigFile("config.yaml")
 }
 
 func defaultConfig() (*Config, error) {
@@ -58,11 +55,14 @@ func defaultConfig() (*Config, error) {
 	if err != nil {
 		return nil, fmt.Errorf("resolve home dir: %w", err)
 	}
-	dataDir := filepath.Join(home, ".local", "share", "second-brain")
+	dbPath, err := appdirs.DataFile("athena.db")
+	if err != nil {
+		return nil, err
+	}
 
 	return &Config{
-		VaultPath:  filepath.Join(home, "SecondBrain"),
-		DBPath:     filepath.Join(dataDir, "second-brain.db"),
+		VaultPath:  filepath.Join(home, "Athena"),
+		DBPath:     dbPath,
 		OllamaHost: DefaultOllamaHost,
 		ChatModel:  DefaultChatModel,
 		EmbedModel: DefaultEmbeddingModel,
@@ -70,7 +70,7 @@ func defaultConfig() (*Config, error) {
 }
 
 func Load() (*Config, error) {
-	path, err := configFilePath()
+	path, err := appdirs.PrepareConfigFile("config.yaml")
 	if err != nil {
 		return nil, err
 	}
@@ -127,7 +127,10 @@ func (c *Config) RestoreOllamaDefaults() {
 }
 
 func save(path string, cfg *Config) error {
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return err
+	}
+	if err := os.Chmod(filepath.Dir(path), 0o700); err != nil {
 		return err
 	}
 	out, err := yaml.Marshal(cfg)
