@@ -35,7 +35,7 @@ type CodexProvider struct {
 }
 
 func NewCodexProvider(auth *CodexOAuth, model string) *CodexProvider {
-	return &CodexProvider{auth: auth, chatModel: model, http: &http.Client{}}
+	return &CodexProvider{auth: auth, chatModel: model, http: newProviderHTTPClient()}
 }
 func (p *CodexProvider) Name() string      { return "ChatGPT subscription" }
 func (p *CodexProvider) ChatModel() string { p.mu.RLock(); defer p.mu.RUnlock(); return p.chatModel }

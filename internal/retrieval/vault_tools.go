@@ -44,7 +44,10 @@ func (s *Service) NoteByRelativePath(rel string) (*NoteView, error) {
 	}
 	for _, entry := range catalog {
 		if entry.Rel == rel {
-			note, err := s.noteStore.GetByID(entry.ID)
+			// The catalog is already trash-free (AllMeta), but this still goes
+			// through liveNoteByID so every model-facing read of a note shares
+			// one definition of "readable" instead of relying on the caller.
+			note, err := s.liveNoteByID(entry.ID)
 			if err != nil || note == nil {
 				return nil, err
 			}
@@ -54,6 +57,16 @@ func (s *Service) NoteByRelativePath(rel string) (*NoteView, error) {
 	return nil, nil
 }
 
+// NotesByID is the batch twin of NoteByID and reads through the same trash
+// guard. Two definitions of "a note the model may read" is exactly how the
+// batch path ended up serving trashed bodies after the single path was fixed.
+//
+// One trashed ID fails the whole call instead of being dropped from the
+// results. Dropping it is silent — the model keeps a dead note_id in its
+// working set and asks again — and get_notes can return either the error or
+// the results, never both. liveNoteByID's error names the offending ID, so the
+// model can immediately retry without it. An unknown ID stays a silent skip,
+// matching NoteByID's nil miss for "not found".
 func (s *Service) NotesByID(ids []int64) ([]*NoteView, error) {
 	if len(ids) == 0 || len(ids) > 8 {
 		return nil, fmt.Errorf("note_ids must contain 1 to 8 IDs")
@@ -65,7 +78,7 @@ func (s *Service) NotesByID(ids []int64) ([]*NoteView, error) {
 			continue
 		}
 		seen[id] = true
-		note, err := s.noteStore.GetByID(id)
+		note, err := s.liveNoteByID(id)
 		if err != nil {
 			return nil, err
 		}
@@ -119,8 +132,13 @@ func (s *Service) Tags() (map[string]int, error) {
 // Links returns direct wiki-link relationships using note titles as targets.
 // It deliberately reports only indexed notes so the model never receives a
 // path outside the user's vault.
+//
+// The subject note goes through liveNoteByID: its outgoing links are parsed
+// out of its body, so answering for a trashed note would hand the model facts
+// derived from soft-deleted content. The per-entry reads below need no guard —
+// they walk the catalog, which AllMeta already returns trash-free.
 func (s *Service) Links(noteID int64) (map[string][]CatalogEntry, error) {
-	note, err := s.noteStore.GetByID(noteID)
+	note, err := s.liveNoteByID(noteID)
 	if err != nil {
 		return nil, err
 	}

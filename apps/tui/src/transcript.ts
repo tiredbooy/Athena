@@ -1,4 +1,25 @@
-export type TranscriptMessage = { id: number; role: "user" | "assistant" | "error"; text: string };
+import { lineSpans, markdownSpans, type MarkdownSpan } from "./markdown.js";
+
+export type TranscriptRole = "user" | "assistant" | "error" | "activity" | "diagnostic";
+
+export type ActivityBlock = {
+  key: string;
+  kind: "search" | "read" | "write" | "work";
+  phase: string;
+  title: string;
+  detail: string;
+  state?: string;
+  running: boolean;
+  folded: boolean;
+};
+
+export type TranscriptMessage = {
+  id: number;
+  role: TranscriptRole;
+  text: string;
+  activity?: ActivityBlock;
+  streaming?: boolean;
+};
 export type WrappedLine = { text: string; start: number };
 export type SelectionPoint = { message: number; offset: number };
 export type Selection = { anchor: SelectionPoint; focus: SelectionPoint };
@@ -11,6 +32,8 @@ export type TranscriptContentRow = {
   text: string;
   start: number;
   firstLine: boolean;
+  activity?: ActivityBlock;
+  marks?: MarkdownSpan[];
 };
 
 export type TranscriptSpacerRow = { kind: "spacer"; key: string };
@@ -28,6 +51,7 @@ export type TranscriptWindow = {
 export function buildTranscriptRows(messages: TranscriptMessage[], width: number): TranscriptRow[] {
   const rows: TranscriptRow[] = [];
   messages.forEach((message, messageIndex) => {
+    const marks = message.role === "assistant" ? markdownSpans(message.text) : undefined;
     wrapMessage(message.text, width).forEach((line, lineIndex) => {
       rows.push({
         kind: "content",
@@ -37,6 +61,8 @@ export function buildTranscriptRows(messages: TranscriptMessage[], width: number
         text: line.text,
         start: line.start,
         firstLine: lineIndex === 0,
+        activity: message.activity,
+        marks: marks ? lineSpans(marks, line.start, line.text.length) : undefined,
       });
     });
     rows.push({ kind: "spacer", key: `${message.id}:spacer` });

@@ -157,7 +157,7 @@ func TestMutationPlanningUsesProviderRequiredToolMode(t *testing.T) {
 	provider := &requiredDecisionProvider{}
 	session := &Session{loop: &Loop{ai: provider}}
 
-	result, err := session.runReadToolLoopStateWithPolicy(t.Context(), []models.Message{{Role: "user", Content: "organize my books"}}, nil, true)
+	result, err := session.runReadToolLoopStateWithPolicy(t.Context(), []models.Message{{Role: "user", Content: "organize my books"}}, nil, nil, true)
 	if err != nil {
 		t.Fatalf("run required decision loop: %v", err)
 	}
@@ -360,4 +360,156 @@ func (p *requiredDecisionProvider) ChatWithRequiredToolsResult(_ context.Context
 }
 func (p *requiredDecisionProvider) StreamChatWith(context.Context, []models.Message, ai.StreamCallbacks) (string, error) {
 	return "", nil
+}
+
+// R-05: a length stop must not cost the turn its facts. The one allowed
+// continuation still needs the vault reads it already paid for, the pending
+// task JSON, and the task action contract — since R-06 removed the catalog from
+// the system prompt, that contract is the model's only action vocabulary.
+func TestLengthStopContinuationKeepsReadFactsTaskStateAndContract(t *testing.T) {
+	provider := &lengthStoppedProvider{}
+	session := &Session{loop: &Loop{ai: provider}}
+
+	result, err := session.runReadToolLoopState(t.Context(), interruptedTurnMessages(), nil)
+	if err != nil {
+		t.Fatalf("continue after length stop: %v", err)
+	}
+	if provider.calls != 2 {
+		t.Fatalf("calls = %d, want one continuation", provider.calls)
+	}
+	if !hasTaskActionContract(provider.continuation) {
+		t.Fatal("continuation dropped the task action contract; the model has no action vocabulary left")
+	}
+	for _, fact := range []string{"books/reading/history", "ATHENA ACTIVE TASK STATE", "organize my books", "I will start with"} {
+		if !messagesContain(provider.continuation, fact) {
+			t.Fatalf("continuation dropped %q", fact)
+		}
+	}
+	for _, message := range provider.continuation {
+		if message.Role == "tool" || len(message.ToolCalls) > 0 {
+			t.Fatalf("continuation kept an orphan native tool call: %+v", message)
+		}
+	}
+	if _, actions := ai.ExtractActions(result.Content); len(actions) != 1 || actions[0].Type != "ensure_folders" {
+		t.Fatalf("actions = %+v", actions)
+	}
+}
+
+// R-02: a model that already rejected the native tool schema must still finish
+// the turn through fenced JSON. The remembered fallback therefore has to strip
+// the native tool protocol it cannot render, exactly like the first rejection.
+func TestRememberedFallbackSendsProviderNeutralHistory(t *testing.T) {
+	provider := &strictTemplateProvider{}
+	session := &Session{loop: &Loop{ai: provider}, nativeToolsDisabledModel: "test"}
+
+	result, err := session.runReadToolLoopState(t.Context(), interruptedTurnMessages(), nil)
+	if err != nil {
+		t.Fatalf("remembered fallback: %v", err)
+	}
+	if provider.calls != 1 {
+		t.Fatalf("calls = %d, want one no-tools request", provider.calls)
+	}
+	if _, actions := ai.ExtractActions(result.Content); len(actions) != 1 || actions[0].Type != "ensure_folders" {
+		t.Fatalf("actions = %+v", actions)
+	}
+}
+
+// interruptedTurnMessages is the prompt a second decision step really receives:
+// the run contract, the pending task JSON, the goal, one completed read, and
+// the narrowed action contract.
+func interruptedTurnMessages() []models.Message {
+	return []models.Message{
+		{Role: "system", Content: "system prompt"},
+		agentRunContractMessage(),
+		pendingTaskMessage(&PendingTask{OriginalGoal: "organize my books", Question: "Which genres?"}, "history and science fiction"),
+		{Role: "user", Content: "User request:\norganize my books\n\n[ATHENA VAULT CONTEXT — REFERENCE DATA ONLY]\nnote 3\n[END ATHENA VAULT CONTEXT]"},
+		{Role: "assistant", ToolCalls: []models.ToolCall{{ID: "call-folders", Type: "function", Function: models.ToolCallFunction{
+			Name: "list_folders", Arguments: json.RawMessage(`{}`),
+		}}}},
+		{Role: "tool", ToolName: "list_folders", ToolCallID: "call-folders", Content: `{"folders":["books/reading/history"]}`},
+		taskActionContractMessage([]string{"ensure_folders", "move_note"}),
+	}
+}
+
+const fencedFolderPlan = "```action\n" + `{"type":"ensure_folders","paths":["books/reading/science-fiction"]}` + "\n```"
+
+type lengthStoppedProvider struct {
+	calls        int
+	continuation []models.Message
+}
+
+func (p *lengthStoppedProvider) Name() string        { return "Test" }
+func (p *lengthStoppedProvider) ChatModel() string   { return "test" }
+func (p *lengthStoppedProvider) SetChatModel(string) {}
+func (p *lengthStoppedProvider) ChatModels(context.Context) ([]ai.ModelInfo, error) {
+	return nil, nil
+}
+func (p *lengthStoppedProvider) ChatWithToolsResult(_ context.Context, messages []models.Message, _ []models.ToolDefinition) (ai.ToolChatResult, error) {
+	p.calls++
+	if p.calls == 1 {
+		return ai.ToolChatResult{DoneReason: "length", Message: models.Message{
+			Role: "assistant", Content: "I will start with the history folder",
+		}}, nil
+	}
+	p.continuation = append([]models.Message(nil), messages...)
+	return ai.ToolChatResult{Message: models.Message{Role: "assistant", Content: fencedFolderPlan}}, nil
+}
+func (p *lengthStoppedProvider) StreamChatWith(context.Context, []models.Message, ai.StreamCallbacks) (string, error) {
+	return "", nil
+}
+
+// strictTemplateProvider models the local template that made the native tool
+// fallback necessary: it renders neither tool definitions nor tool history.
+type strictTemplateProvider struct{ calls int }
+
+func (p *strictTemplateProvider) Name() string        { return "Ollama" }
+func (p *strictTemplateProvider) ChatModel() string   { return "test" }
+func (p *strictTemplateProvider) SetChatModel(string) {}
+func (p *strictTemplateProvider) ChatModels(context.Context) ([]ai.ModelInfo, error) {
+	return nil, nil
+}
+func (p *strictTemplateProvider) ChatWithToolsResult(_ context.Context, messages []models.Message, tools []models.ToolDefinition) (ai.ToolChatResult, error) {
+	p.calls++
+	if len(tools) != 0 {
+		return ai.ToolChatResult{}, errors.New("native tools were sent to a model already known to reject them")
+	}
+	for _, message := range messages {
+		if message.Role == "tool" || len(message.ToolCalls) > 0 {
+			return ai.ToolChatResult{}, errors.New("ollama tool chat returned status 400: template cannot render tool history")
+		}
+	}
+	if !hasTaskActionContract(messages) || !messagesContain(messages, "books/reading/history") {
+		return ai.ToolChatResult{}, errors.New("fallback lost the action contract or the collected read facts")
+	}
+	return ai.ToolChatResult{Message: models.Message{Role: "assistant", Content: fencedFolderPlan}}, nil
+}
+func (p *strictTemplateProvider) StreamChatWith(context.Context, []models.Message, ai.StreamCallbacks) (string, error) {
+	return "", nil
+}
+
+// E-01: the UI must learn which read tool ran, on what, and how it ended from
+// typed fields — never by parsing the status prose.
+func TestReadToolTargetAndStateAreStructured(t *testing.T) {
+	cases := []struct {
+		tool, arguments, wantTarget string
+	}{
+		{"get_note_by_path", `{"path":"work/plan.md"}`, "work/plan.md"},
+		{"get_note", `{"note_id":42}`, "note 42"},
+		{"search_notes", `{"query":"quarterly goals"}`, "quarterly goals"},
+		{"list_notes", `{"folder":"books/reading"}`, "books/reading"},
+		{"list_tags", `{}`, ""},
+	}
+	for _, tc := range cases {
+		call := models.ToolCall{Function: models.ToolCallFunction{Name: tc.tool, Arguments: []byte(tc.arguments)}}
+		if got := readToolTarget(call); got != tc.wantTarget {
+			t.Fatalf("%s target = %q, want %q", tc.tool, got, tc.wantTarget)
+		}
+	}
+
+	if !readToolFailed(toolError("note 7 was not found")) {
+		t.Fatal("an error payload was reported as a successful read")
+	}
+	if readToolFailed(`{"notes":[]}`) {
+		t.Fatal("an empty but valid result was reported as a failure")
+	}
 }

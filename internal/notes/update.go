@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/tiredbooy/internal/models"
 	"github.com/tiredbooy/internal/parser"
 	"github.com/tiredbooy/internal/utils"
 )
@@ -29,7 +30,12 @@ func (s *Service) UpdateNote(ctx context.Context, noteID int64, newBody string) 
 	if err != nil {
 		return fmt.Errorf("parse note frontmatter: %w", err)
 	}
+	// Every rewrite restates title and type so the file keeps describing itself
+	// (V-06). Book fields already in the block are carried through untouched, as
+	// is `done:` — a body edit is not a completion change, and the file's flag is
+	// the durable one, so an edit must not overwrite a tick made in Obsidian.
 	frontmatter.Title = n.Title
+	frontmatter.Kind = string(n.Type)
 	content, err := parser.RenderMarkdown(frontmatter, newBody)
 	if err != nil {
 		return fmt.Errorf("render markdown: %w", err)
@@ -40,6 +46,14 @@ func (s *Service) UpdateNote(ctx context.Context, noteID int64, newBody string) 
 
 	n.Content = newBody
 	if err := s.noteStore.Update(n); err != nil {
+		// Same compensating undo as a failed move (notes.saveMovedNote): the
+		// file already holds the new body, so leaving it there would make the
+		// file and the row disagree about the note's content. raw is exactly
+		// what this call overwrote, so putting it back restores the state the
+		// caller started from.
+		if undoErr := utils.OverwriteNoteFile(n.Path, raw); undoErr != nil {
+			return fmt.Errorf("save note record: %w; the file already holds the new body and could not be restored: %v", err, undoErr)
+		}
 		return fmt.Errorf("save note record: %w", err)
 	}
 
@@ -105,16 +119,58 @@ func (s *Service) ReplaceSection(ctx context.Context, noteID int64, section, exp
 	return s.UpdateNote(ctx, noteID, updated)
 }
 
-func (s *Service) readNoteBody(path string) (string, error) {
+// parseNoteFile splits a note's file into its durable YAML block and its body.
+// Write paths that must preserve metadata they do not understand — book fields,
+// an Obsidian-authored tag list — read it from here rather than rebuilding a
+// Frontmatter from the SQLite row, which only knows title, type and done.
+func (s *Service) parseNoteFile(path string) (parser.Frontmatter, string, error) {
 	raw, err := utils.ReadNoteFile(path)
 	if err != nil {
-		return "", fmt.Errorf("read note file: %w", err)
+		return parser.Frontmatter{}, "", fmt.Errorf("read note file: %w", err)
 	}
-	_, body, err := parser.ParseMarkdown(raw)
+	frontmatter, body, err := parser.ParseMarkdown(raw)
 	if err != nil {
-		return "", fmt.Errorf("parse note frontmatter: %w", err)
+		return parser.Frontmatter{}, "", fmt.Errorf("parse note frontmatter: %w", err)
 	}
-	return body, nil
+	return frontmatter, body, nil
+}
+
+func (s *Service) readNoteBody(path string) (string, error) {
+	_, body, err := s.parseNoteFile(path)
+	return body, err
+}
+
+// syncNoteFrontmatter restates the note's title, type and done state in its
+// file, leaving the body byte-identical. Renaming used to change only the
+// filename and the row, so Obsidian kept showing the old `title:` forever, and
+// ticking a task changed nothing on disk at all (V-06).
+func (s *Service) syncNoteFrontmatter(n *models.Note) error {
+	frontmatter, body, err := s.parseNoteFile(n.Path)
+	if err != nil {
+		return err
+	}
+	// `done:` is a task's field (models.Note.Done is meaningless for the other
+	// types), so a note or book keeps whatever its own YAML said. Restating the
+	// row's always-false Done onto them would silently strip a `done:` the user
+	// wrote in Obsidian.
+	done := frontmatter.Done
+	if n.Type == models.NoteTypeTask {
+		done = n.Done
+	}
+	if frontmatter.Title == n.Title && frontmatter.Kind == string(n.Type) && frontmatter.Done == done {
+		return nil
+	}
+	frontmatter.Title = n.Title
+	frontmatter.Kind = string(n.Type)
+	frontmatter.Done = done
+	content, err := parser.RenderMarkdown(frontmatter, body)
+	if err != nil {
+		return fmt.Errorf("render note markdown: %w", err)
+	}
+	if err := utils.OverwriteNoteFile(n.Path, content); err != nil {
+		return fmt.Errorf("write note file: %w", err)
+	}
+	return nil
 }
 
 func replaceMarkdownSection(body, section, replacement string) (updated, current string, found bool) {

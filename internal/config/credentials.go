@@ -25,10 +25,17 @@ func LoadCredentialStore() (*CredentialStore, error) {
 		return nil, err
 	}
 	store := &CredentialStore{path: path, APIKeys: make(map[string]string)}
-	raw, err := os.ReadFile(path)
+	info, err := os.Stat(path)
 	if os.IsNotExist(err) {
 		return store, nil
 	}
+	if err != nil {
+		return nil, fmt.Errorf("inspect provider credentials: %w", err)
+	}
+	if err := restrictCredentialsToOwner(path, info.Mode().Perm()); err != nil {
+		return nil, err
+	}
+	raw, err := os.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("read provider credentials: %w", err)
 	}
@@ -69,6 +76,49 @@ func (s *CredentialStore) SaveAPIKey(providerID, key string) error {
 			delete(s.APIKeys, providerID)
 		}
 		return err
+	}
+	return nil
+}
+
+// DeleteAPIKey removes a stored key, so a leaked or rotated credential can be
+// taken out of the file instead of being overwritten with a placeholder.
+// Deleting a provider that has no stored key succeeds: the caller's intent —
+// no key on disk for this provider — already holds.
+func (s *CredentialStore) DeleteAPIKey(providerID string) error {
+	if s == nil {
+		return fmt.Errorf("provider credential store is unavailable")
+	}
+	providerID = strings.TrimSpace(providerID)
+	if providerID == "" {
+		return fmt.Errorf("provider is required")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	previous, existed := s.APIKeys[providerID]
+	if !existed {
+		return nil
+	}
+	delete(s.APIKeys, providerID)
+	if err := s.saveLocked(); err != nil {
+		s.APIKeys[providerID] = previous
+		return err
+	}
+	return nil
+}
+
+// restrictCredentialsToOwner repairs a credential file that anyone but its
+// owner can read. Athena warns and tightens the mode rather than refusing to
+// load: the key is already exposed, so failing shut protects nothing, while it
+// would lock the user out of every configured provider with no in-app way to
+// fix the permissions. The warning goes to stderr because it asks for a human
+// decision — rotating the key — that Athena cannot make.
+func restrictCredentialsToOwner(path string, mode os.FileMode) error {
+	if mode&0o077 == 0 {
+		return nil
+	}
+	fmt.Fprintf(os.Stderr, "athena: %s had mode %04o (readable outside its owner); tightening to 0600 — rotate any API key it holds\n", path, mode)
+	if err := os.Chmod(path, 0o600); err != nil {
+		return fmt.Errorf("secure provider credentials: %w", err)
 	}
 	return nil
 }

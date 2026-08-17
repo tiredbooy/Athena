@@ -24,7 +24,7 @@ type AnthropicProvider struct {
 }
 
 func NewAnthropicProvider(name, baseURL, keyEnv, model string) *AnthropicProvider {
-	return &AnthropicProvider{name: name, baseURL: strings.TrimRight(baseURL, "/"), keyEnv: keyEnv, model: model, http: &http.Client{}}
+	return &AnthropicProvider{name: name, baseURL: strings.TrimRight(baseURL, "/"), keyEnv: keyEnv, model: model, http: newProviderHTTPClient()}
 }
 func (p *AnthropicProvider) Name() string      { return p.name }
 func (p *AnthropicProvider) ChatModel() string { p.mu.RLock(); defer p.mu.RUnlock(); return p.model }

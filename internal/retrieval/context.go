@@ -159,7 +159,9 @@ func reportProgress(progress ProgressFunc, message string) {
 }
 
 func (s *Service) buildCatalog() ([]CatalogEntry, error) {
-	notes, err := s.noteStore.All()
+	// AllMeta, not All: the catalog is titles and ids, so loading every note
+	// body here would read the whole vault out of SQLite for nothing.
+	notes, err := s.noteStore.AllMeta()
 	if err != nil {
 		return nil, fmt.Errorf("list notes: %w", err)
 	}

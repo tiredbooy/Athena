@@ -15,20 +15,35 @@ const (
 
 // ConfigFile returns the canonical location for an Athena configuration file.
 func ConfigFile(name string) (string, error) {
-	home, err := os.UserHomeDir()
+	root, err := xdgRoot("XDG_CONFIG_HOME", ".config")
 	if err != nil {
-		return "", fmt.Errorf("resolve home directory: %w", err)
+		return "", err
 	}
-	return filepath.Join(home, ".config", configDirectoryName, name), nil
+	return filepath.Join(root, configDirectoryName, name), nil
 }
 
 // DataFile returns the canonical location for an Athena application-data file.
 func DataFile(name string) (string, error) {
+	root, err := xdgRoot("XDG_DATA_HOME", filepath.Join(".local", "share"))
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(root, configDirectoryName, name), nil
+}
+
+// xdgRoot resolves an XDG base directory. The specification requires the
+// variable to hold an absolute path and says a relative one must be ignored,
+// so anything else falls back to the documented location under $HOME instead
+// of resolving against the working directory.
+func xdgRoot(variable, homeFallback string) (string, error) {
+	if root := os.Getenv(variable); filepath.IsAbs(root) {
+		return root, nil
+	}
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return "", fmt.Errorf("resolve home directory: %w", err)
 	}
-	return filepath.Join(home, ".local", "share", configDirectoryName, name), nil
+	return filepath.Join(home, homeFallback), nil
 }
 
 // PrepareConfigFile copies a file from the former second-brain config
@@ -46,11 +61,11 @@ func PrepareConfigFile(name string) (string, error) {
 		return "", fmt.Errorf("inspect Athena config file: %w", err)
 	}
 
-	home, err := os.UserHomeDir()
+	configRoot, err := xdgRoot("XDG_CONFIG_HOME", ".config")
 	if err != nil {
-		return "", fmt.Errorf("resolve home directory: %w", err)
+		return "", err
 	}
-	legacy := filepath.Join(home, ".config", legacyConfigDirectoryName, name)
+	legacy := filepath.Join(configRoot, legacyConfigDirectoryName, name)
 	legacyFile, err := os.Open(legacy)
 	if os.IsNotExist(err) {
 		return target, nil

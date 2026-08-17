@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/tiredbooy/internal/models"
 	"github.com/tiredbooy/internal/utils"
 )
 
@@ -43,11 +44,37 @@ func (s *Service) SearchNotes(ctx context.Context, query string, limit int) ([]R
 }
 
 func (s *Service) NoteByID(noteID int64) (*NoteView, error) {
-	note, err := s.noteStore.GetByID(noteID)
+	note, err := s.liveNoteByID(noteID)
 	if err != nil || note == nil {
 		return nil, err
 	}
 	return s.noteView(note), nil
+}
+
+// liveNoteByID is the trash guard for reading one note by ID.
+//
+// storage.NoteStore.GetByID has no trashed filter on purpose: trash is a soft
+// delete, and internal/notes must still load a trashed row to restore it. The
+// filter therefore belongs on the paths that feed model context. The catalog
+// (NoteStore.AllMeta) and semantic search (ChunkStore.Searchable) already
+// exclude trashed notes; this is the direct-by-ID path, which stays reachable
+// in the very run that trashed the note because the model is still holding the
+// old note_id.
+//
+// A trashed note is an error, not a nil miss: nil reads as "try another ID"
+// and the model retries, while the error teaches it the note is gone. A
+// genuinely unknown ID stays a nil miss so callers can report "not found".
+func (s *Service) liveNoteByID(noteID int64) (*models.Note, error) {
+	note, err := s.noteStore.GetByID(noteID)
+	if err != nil || note == nil {
+		return nil, err
+	}
+	if note.TrashedFrom != "" {
+		// No title and no body in the message: the point is to stop trashed
+		// content reaching the model, and an error string reaches it too.
+		return nil, fmt.Errorf("note %d is in the trash and cannot be read; restore it first", noteID)
+	}
+	return note, nil
 }
 
 func (s *Service) Folders() ([]string, error) {

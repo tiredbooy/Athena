@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -23,12 +24,21 @@ type OpenAICompatibleProvider struct {
 	chatModel, apiKey        string
 	tokenSource              func(context.Context) (string, error)
 	http                     *http.Client
+	// Models whose server rejected tool_choice=required, so later mutation
+	// turns skip the field instead of paying a failed request for it. Keyed by
+	// model because one endpoint can serve models with different templates.
+	toolChoiceRejected map[string]bool
 }
+
+// errToolChoiceRejected marks a failure that a plain tool request can still
+// answer. It is not exported: outside this adapter the fallback has already
+// happened.
+var errToolChoiceRejected = errors.New("server rejected tool_choice=required")
 
 func NewOpenAICompatibleProvider(name, baseURL, apiKeyEnv, chatModel string) *OpenAICompatibleProvider {
 	return &OpenAICompatibleProvider{
 		name: strings.TrimSpace(name), baseURL: strings.TrimRight(strings.TrimSpace(baseURL), "/"),
-		apiKeyEnv: strings.TrimSpace(apiKeyEnv), chatModel: strings.TrimSpace(chatModel), http: &http.Client{},
+		apiKeyEnv: strings.TrimSpace(apiKeyEnv), chatModel: strings.TrimSpace(chatModel), http: newProviderHTTPClient(),
 	}
 }
 
@@ -124,12 +134,65 @@ func (p *OpenAICompatibleProvider) ChatModels(ctx context.Context) ([]ModelInfo,
 }
 
 func (p *OpenAICompatibleProvider) ChatWithToolsResult(ctx context.Context, messages []models.Message, definitions []models.ToolDefinition) (ToolChatResult, error) {
+	return p.chatWithToolsResult(ctx, messages, definitions, false)
+}
+
+// ChatWithRequiredToolsResult forces a tool decision so a mutation-planning
+// turn cannot degrade into a prose promise, which is how a small local model
+// usually answers "change my vault".
+//
+// tool_choice is not implemented by every OpenAI-compatible server — Ollama,
+// LM Studio, llama.cpp and vLLM all differ — and a server that rejects the
+// field fails the whole request. A rejection therefore falls back to an
+// ordinary tool request and is remembered for that model, rather than turning
+// an unsupported field into a dead turn.
+func (p *OpenAICompatibleProvider) ChatWithRequiredToolsResult(ctx context.Context, messages []models.Message, definitions []models.ToolDefinition) (ToolChatResult, error) {
+	if len(definitions) == 0 {
+		return ToolChatResult{}, fmt.Errorf("required tool selection needs at least one tool definition")
+	}
+	model := p.ChatModel()
+	if p.rejectsToolChoice(model) {
+		return p.chatWithToolsResult(ctx, messages, definitions, false)
+	}
+	result, err := p.chatWithToolsResult(ctx, messages, definitions, true)
+	if err == nil || !errors.Is(err, errToolChoiceRejected) {
+		return result, err
+	}
+	fallback, fallbackErr := p.chatWithToolsResult(ctx, messages, definitions, false)
+	if fallbackErr != nil {
+		// The same request without tool_choice failed too, so the field was not
+		// the problem. Report the original failure and keep required mode on.
+		return ToolChatResult{}, err
+	}
+	p.rememberToolChoiceRejected(model)
+	return fallback, nil
+}
+
+func (p *OpenAICompatibleProvider) rejectsToolChoice(model string) bool {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.toolChoiceRejected[model]
+}
+
+func (p *OpenAICompatibleProvider) rememberToolChoiceRejected(model string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.toolChoiceRejected == nil {
+		p.toolChoiceRejected = make(map[string]bool, 1)
+	}
+	p.toolChoiceRejected[model] = true
+}
+
+func (p *OpenAICompatibleProvider) chatWithToolsResult(ctx context.Context, messages []models.Message, definitions []models.ToolDefinition, requireTool bool) (ToolChatResult, error) {
 	request := openAIChatRequest{Model: p.ChatModel(), Messages: make([]openAIMessage, 0, len(messages))}
 	for _, message := range messages {
 		request.Messages = append(request.Messages, openAIMessageFrom(message))
 	}
 	for _, definition := range normalizedToolDefinitions(definitions) {
 		request.Tools = append(request.Tools, openAITool{Type: definition.Type, Function: definition.Function})
+	}
+	if requireTool {
+		request.ToolChoice = "required"
 	}
 	body, err := json.Marshal(request)
 	if err != nil {
@@ -149,7 +212,14 @@ func (p *OpenAICompatibleProvider) ChatWithToolsResult(ctx context.Context, mess
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return ToolChatResult{}, providerStatusError(p.name, "chat", resp)
+		status := providerStatusError(p.name, "chat", resp)
+		// 400 and 422 are how OpenAI-compatible servers report a request field
+		// they do not implement, so only those are treated as a tool_choice
+		// rejection. Auth, rate-limit and server errors stay fatal.
+		if requireTool && (resp.StatusCode == http.StatusBadRequest || resp.StatusCode == http.StatusUnprocessableEntity) {
+			return ToolChatResult{}, fmt.Errorf("%w: %w", errToolChoiceRejected, status)
+		}
+		return ToolChatResult{}, status
 	}
 	var result struct {
 		Choices []struct {
@@ -188,9 +258,10 @@ func (p *OpenAICompatibleProvider) StreamChatWith(ctx context.Context, messages 
 }
 
 type openAIChatRequest struct {
-	Model    string          `json:"model"`
-	Messages []openAIMessage `json:"messages"`
-	Tools    []openAITool    `json:"tools,omitempty"`
+	Model      string          `json:"model"`
+	Messages   []openAIMessage `json:"messages"`
+	Tools      []openAITool    `json:"tools,omitempty"`
+	ToolChoice string          `json:"tool_choice,omitempty"`
 }
 type openAITool struct {
 	Type     string              `json:"type"`

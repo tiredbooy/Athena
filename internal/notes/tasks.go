@@ -5,27 +5,25 @@ import (
 	"fmt"
 
 	"github.com/tiredbooy/internal/models"
+	"github.com/tiredbooy/internal/parser"
 )
 
-// CreateTask is CreateNote with the type flipped to task — same file/DB/
-// embedding pipeline, since a task is just a note that can be done/undone.
+// CreateTask is CreateNote with the type set to task — same file/DB/embedding
+// pipeline, since a task is just a note that can be done/undone. It goes
+// through createNote rather than CreateNote so the type reaches the file's YAML
+// in the first write; flipping it in the row afterwards left `kind: note` on
+// disk, and Obsidian only ever sees the file (V-06).
 func (s *Service) CreateTask(ctx context.Context, title, body, folder string) (*models.Note, bool, error) {
-	n, created, err := s.CreateNote(ctx, title, body, folder, nil)
-	if err != nil {
-		return n, created, err
-	}
-	if !created {
-		return n, false, nil
-	}
-	n.Type = models.NoteTypeTask
-	if err := s.noteStore.Update(n); err != nil {
-		return n, true, fmt.Errorf("mark as task: %w", err)
-	}
-	return n, true, nil
+	return s.createNote(ctx, title, body, folder, parser.Frontmatter{}, models.NoteTypeTask)
 }
 
-// MarkDone flips a task's Done flag. Doesn't touch chunks/embeddings —
-// completion status isn't semantic content worth re-embedding over.
+// MarkDone flips a task's Done flag in the row and in the file's YAML. Doesn't
+// touch chunks/embeddings — completion status isn't semantic content worth
+// re-embedding over.
+//
+// The file matters because the row is only an index: without `done:` on disk a
+// ticked task is indistinguishable from an open one in Obsidian, and rebuilding
+// the database from the vault (ReconcileVault) reopens every finished task.
 func (s *Service) MarkDone(taskID int64, done bool) error {
 	n, err := s.noteStore.GetByID(taskID)
 	if err != nil {
@@ -41,6 +39,12 @@ func (s *Service) MarkDone(taskID int64, done bool) error {
 	n.Done = done
 	if err := s.noteStore.Update(n); err != nil {
 		return fmt.Errorf("update task status: %w", err)
+	}
+	// YAML last, as in RenameNote: the row is what every listing reads, so a
+	// file updated ahead of a row that then refuses the write would be the
+	// harder half-state to explain.
+	if err := s.syncNoteFrontmatter(n); err != nil {
+		return fmt.Errorf("task status saved, but its file's `done:` was not updated: %w", err)
 	}
 	return nil
 }

@@ -57,6 +57,10 @@ type SessionEvent struct {
 	Activity *ActivityEvent `json:"activity,omitempty"`
 	Plan     *PendingPlan   `json:"plan,omitempty"`
 	Error    string         `json:"error,omitempty"`
+	// Ledger is the verified execution record for a turn that mutated the
+	// vault. It is present on the terminal event so a UI can show what actually
+	// happened without parsing the reply text.
+	Ledger []agent.LedgerRecord `json:"ledger,omitempty"`
 }
 
 type EventSink func(SessionEvent)
@@ -65,20 +69,26 @@ type EventSink func(SessionEvent)
 // It is deliberately additive so the legacy UI keeps its established contract
 // while the new stdio engine is introduced.
 func (s *Session) SubmitWithEvents(ctx context.Context, input string, emit EventSink) (string, error) {
-	s.mu.Lock()
-	var beforeID string
-	if s.pendingPlan != nil {
-		beforeID = s.pendingPlan.ID
+	s.turnMu.Lock()
+	beforeID := ""
+	if before := s.PendingPlan(); before != nil {
+		beforeID = before.ID
 	}
 	reply, err := s.submit(ctx, input, runObserver{session: s, events: emit}, nil)
-	plan := clonePendingPlan(s.pendingPlan)
-	s.mu.Unlock()
+	plan := s.PendingPlan()
+	// E-03: read the record once, while the turn lock still guarantees it belongs
+	// to THIS turn, and attach it to whichever terminal event follows. A cancelled
+	// or failed turn can already have changed the vault, so the user learns what
+	// happened on every exit, not only the happy one. A turn that executed nothing
+	// leaves this nil, which is silence rather than an empty artefact.
+	ledger := s.LastLedger()
+	s.turnMu.Unlock()
 	if err != nil {
 		if emit != nil {
 			if ctx.Err() != nil {
-				emit(SessionEvent{Type: EventCancelled, Message: "The request was cancelled."})
+				emit(SessionEvent{Type: EventCancelled, Message: "The request was cancelled.", Ledger: ledger})
 			} else {
-				emit(SessionEvent{Type: EventError, Error: err.Error()})
+				emit(SessionEvent{Type: EventError, Error: err.Error(), Ledger: ledger})
 			}
 		}
 		return "", err
@@ -90,7 +100,7 @@ func (s *Session) SubmitWithEvents(ctx context.Context, input string, emit Event
 		} else {
 			emit(SessionEvent{Type: EventResponse, Message: reply})
 		}
-		emit(SessionEvent{Type: EventCompleted, Message: reply})
+		emit(SessionEvent{Type: EventCompleted, Message: reply, Ledger: ledger})
 	}
 	return reply, nil
 }
@@ -118,6 +128,18 @@ func (o runObserver) statusMessage(message string) {
 			activity = o.session.activityEvent(message)
 		}
 		o.events(SessionEvent{Type: EventActivity, Activity: activity})
+	}
+}
+
+// step reports a fully-formed activity. Callers that already know the phase,
+// tool, target, and state use this instead of statusMessage, which has to
+// recover those from English.
+func (o runObserver) step(activity ActivityEvent) {
+	if o.status != nil && strings.TrimSpace(activity.Message) != "" {
+		o.status(activity.Message)
+	}
+	if o.events != nil {
+		o.events(SessionEvent{Type: EventActivity, Activity: &activity})
 	}
 }
 

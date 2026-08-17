@@ -1,7 +1,10 @@
 # Athena documentation
 
+Install and launch flags are in the [root README](../README.md).
+
 This folder documents Athena by responsibility. Each domain has its own folder
-and `README.md`. Future proposals live outside this folder in `/plans`.
+and `README.md`. Future proposals live in this folder's [plans](plans/)
+subdirectory.
 
 | Domain | Responsibility | Document |
 | --- | --- | --- |
@@ -12,11 +15,15 @@ and `README.md`. Future proposals live outside this folder in `/plans`.
 | Data and search | SQLite records, embeddings, and retrieval context. | [retrieval](retrieval/README.md) |
 | AI planning and execution | Ollama client, action extraction, batches, and dispatching. | [ai](ai/README.md) |
 | Chat behavior | Turn orchestration, shortcuts, history, and visible errors. | [chat](chat/README.md) |
-| Terminal user interface | Bubble Tea workspace, command palette, streaming, and themes. | [tui](tui/README.md) |
+| Terminal user interface | Ink client, Bubble Tea fallback, and which one starts. | [tui](tui/README.md) |
 
 ## Future plans
 
-- [Organization recommendations](../plans/organization-recommendations.md)
+- [Improvement backlog](../tasks.md) (Claude vs Grok queues are labeled there)
+- [Organization recommendations](plans/organization-recommendations.md)
+- [Session snapshot and opt-in restore](plans/session-restore.md) (M-03)
+- [Permanent delete and empty trash](plans/permanent-delete.md) (S-08)
+- [Multi-device / synced vault](plans/multi-device-vault.md) (L-05)
 
 ## Architectural rule
 
@@ -46,7 +53,7 @@ such as "yes".
 2. Preserve the markdown file and SQLite record together; neither is the
    single source of truth by itself.
 3. Add or extend a test for behavior that does not require Ollama.
-4. Run `go test ./...`. If the home build cache is read-only, use
-   `env GOCACHE=/tmp/athena-go-build go test ./...`.
+4. Run `make test` from the repo root (or `go test ./...`). If the home
+   Go build cache is read-only, use `make test-gocache`.
 5. Update every affected domain document in the same change. Documents describe
    current behavior; future designs belong in plan documents.

@@ -33,6 +33,27 @@ func (l *Loop) Doctor(ctx context.Context) string {
 	} else {
 		check(true, "SQLite vault index", "readable")
 	}
+	// V-03: an index built by one embedding model and searched with another
+	// returns plausible nonsense rather than an error — nothing else in Athena
+	// can notice it, which is why this is a problem line and not a note. Skipped
+	// entirely when no vault service is wired in, since there is then nothing
+	// that could rebuild the index anyway.
+	if l.notes != nil {
+		health, err := l.notes.IndexHealth()
+		switch {
+		case err != nil:
+			check(false, "Embedding index", err.Error())
+		case health.Mismatch:
+			check(false, "Embedding index", fmt.Sprintf("vectors were built with %q but %q is configured; search results are meaningless until you run /reindex", health.IndexedWith, health.ConfiguredAs))
+		case health.IndexedWith == "":
+			// Unknown is not a mismatch (see notes.IndexHealth): warning about
+			// every vault that has never been rebuilt would teach the user to
+			// ignore the line above, which is the one that matters.
+			check(true, "Embedding index", fmt.Sprintf("%s is configured; no rebuild recorded, so what built the vectors is unknown — /reindex makes it certain", health.ConfiguredAs))
+		default:
+			check(true, "Embedding index", fmt.Sprintf("built with %s at %d dimensions, matching the configured model", health.IndexedWith, health.Dimensions))
+		}
+	}
 	if l.config == nil {
 		check(false, "Vault", "configuration is unavailable")
 	} else if err := checkWritableDir(l.config.VaultPath); err != nil {

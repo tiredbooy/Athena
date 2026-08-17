@@ -5,8 +5,10 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/tiredbooy/internal/storage"
 )
@@ -93,5 +95,64 @@ func TestInspectSuggestsLikelyMisspelledTitleWithoutAcceptingIt(t *testing.T) {
 	var suggestion *TitleSuggestionError
 	if !errors.As(err, &suggestion) || suggestion.Suggested != "Project Hail Mary" {
 		t.Fatalf("resolve error = %v", err)
+	}
+}
+
+// The lookup URL carries the user's book title, which is text out of their
+// vault, and net/http sends the original URL as Referer when it follows a
+// redirect. The client cmd/athena gets (NewResolver with a nil client) must
+// therefore refuse to follow a redirect to another host.
+func TestDefaultResolverClientRefusesOffHostRedirect(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", "")
+	db, err := storage.Open(t.TempDir() + "/athena.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	offHostHits := 0
+	offHost := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		offHostHits++
+		_, _ = w.Write([]byte(`{"docs":[]}`))
+	}))
+	defer offHost.Close()
+
+	sameHostHits := 0
+	catalog := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/off":
+			http.Redirect(w, r, offHost.URL+"/search.json", http.StatusFound)
+		case "/same":
+			http.Redirect(w, r, "/landing", http.StatusFound)
+		default:
+			sameHostHits++
+			_, _ = w.Write([]byte(`{"docs":[]}`))
+		}
+	}))
+	defer catalog.Close()
+
+	client := NewResolver(storage.NewBookMetadataStore(db), nil).client
+	if client.Timeout != 8*time.Second {
+		t.Fatalf("client.Timeout = %s, want the 8s metadata-lookup budget", client.Timeout)
+	}
+
+	resp, err := client.Get(catalog.URL + "/off?title=The+Users+Private+Book")
+	if err == nil {
+		resp.Body.Close()
+		t.Fatal("client followed a redirect to another host, carrying the book title with it")
+	}
+	if offHostHits != 0 {
+		t.Fatalf("off-host server received %d requests", offHostHits)
+	}
+
+	// A redirect that stays on the same host must still be followed, or an
+	// ordinary catalog response would start failing.
+	resp, err = client.Get(catalog.URL + "/same")
+	if err != nil {
+		t.Fatalf("same-host redirect refused: %v", err)
+	}
+	resp.Body.Close()
+	if sameHostHits != 1 {
+		t.Fatalf("same-host redirect landed %d times, want 1", sameHostHits)
 	}
 }

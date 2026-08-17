@@ -6,6 +6,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/tiredbooy/internal/ai"
 	"github.com/tiredbooy/internal/models"
@@ -19,10 +20,22 @@ type Service struct {
 	noteStore  *storage.NoteStore
 	chunkStore *storage.ChunkStore
 	ai         ai.EmbeddingProvider
+	jobs       *storage.JobStore
 }
 
 func NewService(vaultPath string, noteStore *storage.NoteStore, chunkStore *storage.ChunkStore, aiClient ai.EmbeddingProvider) *Service {
 	return &Service{vaultPath: vaultPath, noteStore: noteStore, chunkStore: chunkStore, ai: aiClient}
+}
+
+// TrackJobsIn records long-running work — currently only Reindex — in the jobs
+// table, and returns the same Service so wiring reads as one expression.
+//
+// It is deliberately not a NewService parameter: a job record is bookkeeping,
+// not something a reindex needs to run, and callers that only create and read
+// notes should not have to supply a store they never use.
+func (s *Service) TrackJobsIn(jobStore *storage.JobStore) *Service {
+	s.jobs = jobStore
+	return s
 }
 
 func (s *Service) VaultPath() string { return s.vaultPath }
@@ -41,9 +54,13 @@ func (s *Service) GetNoteByPath(path string) (*models.Note, error) {
 // CreateNote writes a new .md file into the vault (optionally under folder),
 // saves it to SQLite, and embeds it so it is searchable immediately.
 //
-// If a note already exists at the target path, it returns that note with
-// created=false instead of erroring — small models often re-emit create_note
-// when the user only asks to list notes.
+// Re-creating the SAME title returns the existing note with created=false
+// instead of erroring — small models often re-emit create_note when the user
+// only asks to list notes. A different title that slugifies onto the same
+// filename ("Go Slices" vs "Go: Slices") is an error, not a duplicate.
+//
+// folder must already exist. Athena never invents directories for note
+// writes; see docs/notes/README.md.
 func (s *Service) CreateNote(ctx context.Context, title, body, folder string, tags []string) (note *models.Note, created bool, err error) {
 	return s.createNote(ctx, title, body, folder, parser.Frontmatter{Title: title, Tags: tags}, models.NoteTypeNote)
 }
@@ -75,6 +92,14 @@ func (s *Service) createNote(ctx context.Context, title, body, folder string, fr
 	if existing, err := s.noteStore.GetByPath(path); err != nil {
 		return nil, false, err
 	} else if existing != nil {
+		// Re-creating the same title stays idempotent (see CreateNote), but a
+		// *different* title that slugifies to the same filename is a different
+		// note: returning the old one would silently drop the new content.
+		// Books are exempt — a catalog title differs from the typed title only
+		// in punctuation, and CreateBook repairs that note in place.
+		if noteType != models.NoteTypeBook && !strings.EqualFold(strings.TrimSpace(existing.Title), strings.TrimSpace(title)) {
+			return nil, false, fmt.Errorf("%q and the existing note %q both become %s; rename one of them", title, existing.Title, utils.RelVault(s.vaultPath, path))
+		}
 		return existing, false, nil
 	}
 
@@ -83,7 +108,11 @@ func (s *Service) createNote(ctx context.Context, title, body, folder string, fr
 		return nil, false, fmt.Errorf("file already exists at %s (not in database — import or rename)", utils.RelVault(s.vaultPath, path))
 	}
 
+	// Title and type are written into the YAML as well as the row (V-06). The
+	// row is Athena's index, but the file is the durable record: a vault opened
+	// in Obsidian, or a database rebuilt from scratch, has only the Markdown.
 	frontmatter.Title = title
+	frontmatter.Kind = string(noteType)
 	content, err := parser.RenderMarkdown(frontmatter, body)
 	if err != nil {
 		return nil, false, fmt.Errorf("render markdown: %w", err)
@@ -96,6 +125,13 @@ func (s *Service) createNote(ctx context.Context, title, body, folder string, fr
 	n := &models.Note{Title: title, Path: path, Content: body, Type: noteType}
 	id, err := s.noteStore.Create(n)
 	if err != nil {
+		// Compensating undo: the file and the row are not one transaction, and
+		// a file with no row is invisible to Athena forever. Removing it is
+		// safe here and only here — the checks above proved nothing existed at
+		// this path before this call wrote it.
+		if undoErr := os.Remove(path); undoErr != nil {
+			return nil, false, fmt.Errorf("save note record: %w; the new file at %s could not be removed: %v", err, utils.RelVault(s.vaultPath, path), undoErr)
+		}
 		return nil, false, fmt.Errorf("save note record: %w", err)
 	}
 	n.ID = id
@@ -175,15 +211,13 @@ func (s *Service) MoveNote(ctx context.Context, noteID int64, folder string) (*m
 		return nil, fmt.Errorf("a note already exists at %s", utils.RelVault(s.vaultPath, newPath))
 	}
 
-	if err := os.MkdirAll(filepath.Dir(newPath), 0o755); err != nil {
-		return nil, err
-	}
-	if err := os.Rename(n.Path, newPath); err != nil {
+	oldPath := n.Path
+	if err := utils.MoveFile(oldPath, newPath); err != nil {
 		return nil, fmt.Errorf("move file: %w", err)
 	}
 
 	n.Path = newPath
-	if err := s.noteStore.Update(n); err != nil {
+	if err := s.saveMovedNote(n, oldPath); err != nil {
 		return nil, fmt.Errorf("update path: %w", err)
 	}
 	return n, nil
@@ -266,36 +300,6 @@ func (s *Service) embedNote(ctx context.Context, n *models.Note) error {
 		if err != nil {
 			return fmt.Errorf("store chunk %d: %w", i, err)
 		}
-	}
-	return nil
-}
-
-// Reindex prepares all vectors before replacing the index in one transaction.
-// This prevents mixed embedding dimensions when a provider/model changes.
-func (s *Service) Reindex(ctx context.Context, progress func(int, int)) error {
-	notes, err := s.noteStore.All()
-	if err != nil {
-		return fmt.Errorf("list notes: %w", err)
-	}
-	prepared := make([]*models.Chunk, 0)
-	for i, note := range notes {
-		texts := parser.ChunkText(note.Content, 200, 40)
-		if len(texts) == 0 {
-			texts = []string{note.Title}
-		}
-		for index, text := range texts {
-			vector, err := s.ai.Embed(ctx, text)
-			if err != nil {
-				return fmt.Errorf("embed %q: %w", note.Title, err)
-			}
-			prepared = append(prepared, &models.Chunk{NoteID: note.ID, Content: text, ChunkIdx: index, Embedding: vector})
-		}
-		if progress != nil {
-			progress(i+1, len(notes))
-		}
-	}
-	if err := s.chunkStore.ReplaceAll(prepared); err != nil {
-		return err
 	}
 	return nil
 }

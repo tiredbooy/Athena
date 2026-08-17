@@ -1,0 +1,1 @@
+{"version":1,"requestId":"r7","type":"model.options","models":[{"providerId":"ollama","providerName":"Ollama","model":"llama3.2:latest","current":true},{"providerId":"xai","providerName":"xAI","model":"grok-3","current":false}]}

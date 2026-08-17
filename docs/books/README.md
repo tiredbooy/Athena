@@ -18,6 +18,15 @@ action rather than asking the language model to invent bibliographic facts.
 An ISBN is optional. If supplied, Athena validates its checksum. When it is not
 supplied, the catalog result may provide one; otherwise the field is left empty.
 
+## What leaves the machine
+
+Step 2 is the only step that leaves the device, and the title it sends is text
+from the user's vault. The lookup goes to `openlibrary.org` and nowhere else:
+the resolver's HTTP client refuses to follow a redirect to any other host, so a
+redirecting or compromised catalog cannot forward the query — or the `Referer`
+header carrying it — to a third party. Nothing else about the note is sent, no
+credential is attached, and a cache hit (step 1) makes no request at all.
+
 Book notes default to `books/reading` and contain frontmatter such as:
 
 ```yaml

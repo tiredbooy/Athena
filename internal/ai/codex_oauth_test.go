@@ -42,6 +42,91 @@ func TestPKCEChallengeUsesURLSafeSHA256(t *testing.T) {
 	}
 }
 
+// fakeCodexCLIHome points HOME at a scratch directory holding a signed-in
+// Codex CLI. The real ~/.codex is never read.
+func fakeCodexCLIHome(t *testing.T) string {
+	t.Helper()
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	// appdirs prefers XDG_CONFIG_HOME when it is absolute; clear it so the
+	// decision and credential files land under the scratch HOME.
+	t.Setenv("XDG_CONFIG_HOME", "")
+	if err := os.MkdirAll(filepath.Join(home, ".codex"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	auth := []byte(`{"tokens":{"access_token":"cli-access","refresh_token":"cli-refresh","account_id":"cli-account"}}`)
+	if err := os.WriteFile(filepath.Join(home, ".codex", "auth.json"), auth, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return home
+}
+
+func TestCodexCLIImportIsOfferedNotTaken(t *testing.T) {
+	fakeCodexCLIHome(t)
+	oauth, err := LoadCodexOAuth()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if oauth.Connected() {
+		t.Fatal("an unanswered import used the Codex CLI tokens")
+	}
+	if _, err := oauth.Credentials(context.Background()); err == nil {
+		t.Fatal("an unanswered import handed out the Codex CLI tokens")
+	}
+	if !oauth.PendingCLIImport() {
+		t.Fatal("expected the import to be offered")
+	}
+}
+
+func TestCodexCLIImportDeclineSurvivesReload(t *testing.T) {
+	fakeCodexCLIHome(t)
+	oauth, err := LoadCodexOAuth()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := oauth.ResolveCLIImport(false); err != nil {
+		t.Fatal(err)
+	}
+	if oauth.PendingCLIImport() || oauth.Connected() {
+		t.Fatal("a declined import was still pending or connected")
+	}
+	reloaded, err := LoadCodexOAuth()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reloaded.PendingCLIImport() {
+		t.Fatal("a declined import was asked again after a restart")
+	}
+	if reloaded.Connected() {
+		t.Fatal("a declined import was used after a restart")
+	}
+}
+
+func TestCodexCLIImportApprovalAdoptsCredentials(t *testing.T) {
+	fakeCodexCLIHome(t)
+	oauth, err := LoadCodexOAuth()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := oauth.ResolveCLIImport(true); err != nil {
+		t.Fatal(err)
+	}
+	if !oauth.Connected() || oauth.PendingCLIImport() {
+		t.Fatal("an approved import did not connect")
+	}
+	reloaded, err := LoadCodexOAuth()
+	if err != nil {
+		t.Fatal(err)
+	}
+	credentials, err := reloaded.Credentials(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if credentials.AccessToken != "cli-access" || credentials.RefreshToken != "cli-refresh" {
+		t.Fatalf("credentials = %#v", credentials)
+	}
+}
+
 func TestCodexDeviceLoginCompletesWithoutExternalCLI(t *testing.T) {
 	var opened string
 	client := &http.Client{Transport: roundTripper(func(request *http.Request) (*http.Response, error) {
@@ -71,6 +156,11 @@ func TestCodexDeviceLoginCompletesWithoutExternalCLI(t *testing.T) {
 	})}
 	home := t.TempDir()
 	t.Setenv("HOME", home)
+	// appdirs prefers an absolute XDG_CONFIG_HOME over $HOME, so isolating HOME
+	// alone is not enough: RunDeviceLogin saves credentials, and on a machine
+	// where XDG_CONFIG_HOME is set this test would overwrite the user's real
+	// openai-codex-auth.json with these fake tokens.
+	t.Setenv("XDG_CONFIG_HOME", "")
 	oauth := &CodexOAuth{http: client, openBrowser: func(rawURL string) error { opened = rawURL; return nil }}
 	var lines []string
 	if err := oauth.RunDeviceLogin(context.Background(), func(line string) { lines = append(lines, line) }); err != nil {

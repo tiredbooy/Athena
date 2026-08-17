@@ -1,0 +1,1 @@
+{"version":1,"requestId":"r1","type":"engine.ready","message":"Athena engine is ready","provider":"ollama","model":"llama3.2:latest"}

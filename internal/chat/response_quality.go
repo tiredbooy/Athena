@@ -1,73 +1,11 @@
 package chat
 
-import (
-	"context"
-	"strings"
-	"time"
+import "strings"
 
-	"github.com/tiredbooy/internal/ai"
-	"github.com/tiredbooy/internal/models"
-)
-
-const (
-	maxResponseRepairs        = 1
-	maxResponseRepairDuration = 60 * time.Second
-	minimumRepairBudget       = 20 * time.Second
-)
-
-// refineModelResponse gives a local model one focused correction pass when it
-// claims it will change the vault but fails to produce executable actions, or
-// when its action JSON fails the dispatcher contract. This belongs in the
-// application layer: it coordinates the model and policy without teaching the
-// domain layer about language-model phrasing.
-func (s *Session) refineModelResponse(ctx context.Context, messages []models.Message, input, raw string, status func(string)) (string, error) {
-	for attempt := 0; attempt < maxResponseRepairs; attempt++ {
-		_, actions := ai.ExtractActions(raw)
-		reason := ""
-		if len(actions) > 0 && s.loop.dispatcher != nil {
-			if err := s.loop.dispatcher.Validate(actions); err != nil {
-				reason = "The proposed action plan failed validation: " + err.Error()
-			}
-		} else if len(actions) == 0 && expectsActionRequest(input) && claimsAction(raw) {
-			reason = "The previous reply described a change but did not contain executable action JSON."
-		}
-		if reason == "" {
-			return raw, nil
-		}
-		if !hasRepairBudget(ctx) {
-			return raw, nil
-		}
-
-		if status != nil {
-			status("The first plan was incomplete — refining it")
-		}
-		repairMessages := append([]models.Message(nil), messages...)
-		repairMessages = append(repairMessages,
-			models.Message{Role: "assistant", Content: raw},
-			models.Message{Role: "user", Content: repairInstruction(reason)},
-		)
-		repairCtx, cancel := context.WithTimeout(ctx, maxResponseRepairDuration)
-		refined, err := s.runReadToolLoop(repairCtx, repairMessages, status)
-		cancel()
-		if err != nil {
-			// A correction pass is an optional quality improvement. Preserve the
-			// original reply so the caller can safely decline an unexecutable plan
-			// instead of reporting a second model timeout as an application error.
-			return raw, nil
-		}
-		raw = refined
-	}
-	return raw, nil
-}
-
-func hasRepairBudget(ctx context.Context) bool {
-	deadline, ok := ctx.Deadline()
-	return !ok || time.Until(deadline) >= minimumRepairBudget
-}
-
-func repairInstruction(reason string) string {
-	return "Correction required. " + reason + " Re-read the authoritative vault context and use read-only tools if an exact note_id or folder is missing. Then call propose_actions with a non-empty actions array when that tool is available; use valid fenced action JSON only when it is unavailable. Do not replace executable action data with a prose promise, and do not claim that anything changed until Athena executes it. A folder field is a directory only; never put a note title or .md filename in it. If the request is ambiguous, ask one precise question instead of guessing."
-}
+// These classifiers decide, from the user's own words and the model's reply,
+// whether a turn was supposed to change the vault and whether the model only
+// claimed it did. The agent driver (R-03) owns what to do about that; this file
+// only answers the question.
 
 func expectsActionRequest(input string) bool {
 	input = strings.ToLower(strings.TrimSpace(input))
@@ -79,10 +17,26 @@ func expectsActionRequest(input string) bool {
 	}) && containsAny(input, []string{"note", "folder", "directory", "file", "vault", "task", "book", "journal", "idea"})
 }
 
+// notClaiming strips the phrasings in which a model states it cannot act, or
+// needs more information, before the weak claim tokens below are matched. Both
+// forms are the opposite of a claim — the model is asking, not pretending the
+// vault changed — but "i can't" contains "i can" and "i'll need" contains
+// "i'll". R-03 spends one correction and then stops, so a false positive here
+// burns that single correction on a reply that was already correct.
+var notClaiming = strings.NewReplacer(
+	"i can't", "", "i cannot", "", "i can not", "",
+	"i'll need", "", "i will need", "", "i'd need", "", "i would need", "",
+)
+
 func claimsAction(reply string) bool {
 	reply = strings.ToLower(strings.TrimSpace(reply))
-	return containsAny(reply, []string{
-		"i'll", "i will", "i can", "sure", "creating", "creating a", "moving", "renaming", "deleting", "updating", "saving", "archiving", "restoring", "created", "moved", "renamed", "deleted", "updated", "saved", "done",
+	// "Sure" reads as agreement only at the very start of the reply. Mid-sentence
+	// it is almost always "make sure" or "ensure", which is advice.
+	if strings.HasPrefix(reply, "sure") {
+		return true
+	}
+	return containsAny(notClaiming.Replace(reply), []string{
+		"i'll", "i will", "i can", "creating", "moving", "renaming", "deleting", "updating", "saving", "archiving", "restoring", "created", "moved", "renamed", "deleted", "updated", "saved", "done",
 	})
 }
 

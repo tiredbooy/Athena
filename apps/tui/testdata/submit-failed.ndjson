@@ -1,0 +1,2 @@
+{"version":1,"requestId":"r4","type":"turn.started","turnId":"t3"}
+{"version":1,"requestId":"r4","type":"turn.failed","turnId":"t3","error":"ollama is not running"}

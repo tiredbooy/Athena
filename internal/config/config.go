@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/tiredbooy/internal/appdirs"
 	"gopkg.in/yaml.v3"
@@ -27,6 +28,11 @@ type Config struct {
 	// migration is implemented.
 	Providers      []ProviderConfig `yaml:"providers,omitempty"`
 	ActiveProvider string           `yaml:"active_provider,omitempty"`
+
+	// path records where this config was loaded from. Save writes back to it
+	// rather than re-deriving the user's config path, so a Config built in
+	// code — a test fixture, say — cannot overwrite the real file by default.
+	path string `yaml:"-"`
 }
 type EmbeddingProviderConfig struct {
 	Type      string `yaml:"type"`
@@ -80,6 +86,7 @@ func Load() (*Config, error) {
 		if err != nil {
 			return nil, err
 		}
+		cfg.path = path
 		if err := save(path, cfg); err != nil {
 			return nil, fmt.Errorf("write default config: %w", err)
 		}
@@ -95,12 +102,34 @@ func Load() (*Config, error) {
 	if err := yaml.Unmarshal(raw, &cfg); err != nil {
 		return nil, fmt.Errorf("parse config: %w", err)
 	}
+	cfg.path = path
+	if err := cfg.validateDataPaths(path); err != nil {
+		return nil, err
+	}
 	if cfg.RestoreMissingOllamaDefaults() {
 		if err := save(path, &cfg); err != nil {
 			return nil, fmt.Errorf("repair missing Ollama defaults: %w", err)
 		}
 	}
 	return &cfg, nil
+}
+
+// validateDataPaths refuses a config that does not say where the user's notes
+// and database live. Unlike the Ollama fields these are not repaired to
+// defaults: an empty path is joined against the process working directory, so
+// repairing it silently would either create a second empty vault somewhere
+// surprising or point Athena at a different database than the one holding the
+// user's notes. Failing names the file and field so the user can fix it.
+func (c *Config) validateDataPaths(path string) error {
+	for _, field := range []struct{ name, value string }{
+		{"vault_path", c.VaultPath},
+		{"db_path", c.DBPath},
+	} {
+		if strings.TrimSpace(field.value) == "" {
+			return fmt.Errorf("config %s: %s is empty; set it to the path Athena should use", path, field.name)
+		}
+	}
+	return nil
 }
 
 // RestoreMissingOllamaDefaults repairs incomplete configuration without
@@ -142,11 +171,25 @@ func save(path string, cfg *Config) error {
 
 // Save writes the config back to the standard config path (e.g. after
 // the user switches chat models with /model).
+// Save writes the config back to the file it was loaded from. A Config that
+// was never loaded has no path, and saving it is refused: silently falling
+// back to the user's real config file turned an in-memory fixture into a
+// destructive write.
 func (c *Config) Save() error {
-	path, err := configFilePath()
-	if err != nil {
-		return err
+	if c.path == "" {
+		return fmt.Errorf("config was not loaded from a file; nothing to save")
 	}
+	return save(c.path, c)
+}
+
+// SaveTo writes the config to an explicit path and remembers it, so later
+// Save calls target the same file. Callers that build a config in code use
+// this instead of Save.
+func (c *Config) SaveTo(path string) error {
+	if strings.TrimSpace(path) == "" {
+		return fmt.Errorf("config path cannot be empty")
+	}
+	c.path = path
 	return save(path, c)
 }
 

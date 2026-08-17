@@ -15,12 +15,18 @@ import (
 //	tags: [go, backend]
 //	---
 //	body content here...
+//
+// Done carries a task's completion state (V-06). `omitempty` is deliberate:
+// "absent" and "false" both mean not done, so an untouched note is not rewritten
+// with a `done: false` line the first time Athena writes it, and un-ticking a
+// task removes the key again rather than leaving it behind.
 type Frontmatter struct {
 	Title          string     `yaml:"title"`
 	Tags           []string   `yaml:"tags"`
 	AthenaIndex    bool       `yaml:"athena_index,omitempty"`
 	LinkedFolders  []string   `yaml:"linked_folders,omitempty"`
 	Kind           string     `yaml:"kind,omitempty"`
+	Done           bool       `yaml:"done,omitempty"`
 	Authors        []string   `yaml:"authors,omitempty"`
 	Genres         []string   `yaml:"genres,omitempty"`
 	PublishedYear  int        `yaml:"published_year,omitempty"`
@@ -36,6 +42,12 @@ type Frontmatter struct {
 // markdown files too, not just ones we generated ourselves.
 func ParseMarkdown(raw string) (Frontmatter, string, error) {
 	var fm Frontmatter
+
+	// Notes authored on Windows or synced through Obsidian use CRLF. Without
+	// this the "---\n" delimiter never matches and the whole file — metadata
+	// included — falls through as plain body text. Every consumer of the body
+	// (rendering, section splitting, chunking) works in LF anyway.
+	raw = strings.ReplaceAll(raw, "\r\n", "\n")
 
 	if !strings.HasPrefix(raw, "---\n") {
 		return fm, raw, nil

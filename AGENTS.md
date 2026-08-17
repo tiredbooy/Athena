@@ -75,6 +75,92 @@ Ask.
 
 Do not invent a new architecture.
 
+The improvement backlog lives in `tasks.md`. Treat it as planned work, not
+current behavior. When a task is completed, mark it there in the same change
+and update the matching `docs/` file.
+
+## Who does which tasks
+
+`tasks.md` assigns every row to **Claude** or **Grok**.
+
+- User says **take Claude tasks** → only `Owner = Claude`. Start at Claude's
+  queue. Do not edit `apps/tui` source (README only if the task is docs).
+- User says **take Grok tasks** → only `Owner = Grok`. Start at Grok's queue.
+  Do not rewrite engine policy in `internal/chat`, `internal/notes`, or
+  `internal/tools` unless the row names that file.
+
+Pickup rules are also in `CLAUDE.md` so Claude Code sees them on its own.
+
+---
+
+# Product Constraints
+
+These are standing product rules. Do not "fix" them away in a one-off change.
+
+## Engine and TUI
+
+- The Go process is the engine: chat, tools, vault, providers, memory policy.
+- The product TUI is TypeScript/Ink in `apps/tui`. New interactive work goes
+  there.
+- `internal/tui` (Bubble Tea) is a fallback only. Do not add features to it.
+- Do not maintain two feature-complete clients.
+- The UI stays thin. It renders engine events and sends requests. It does not
+  own vault I/O, plan validity, provider catalogs, or conversation policy.
+
+## Event-driven UI
+
+- The engine is the source of truth. The TUI is an event renderer.
+- Loading, tool progress, plans, errors, and completion must come from typed
+  protocol events, not from parsing English status strings.
+- `/clear` is view-only unless the engine also receives `session.reset`.
+- `Esc` cancels the active turn. Typed `/cancel` must not mean something else
+  unless the hint says so.
+
+## Providers
+
+- Connecting a provider persists credentials (OAuth files or the credential
+  store). Switching to Ollama must not discard them.
+- `/models` and provider pickers must list every already-connected provider.
+- Re-login only when tokens are missing, expired, or revoked. Valid Codex or
+  xAI sessions must be reusable without another device-login.
+
+## Retrieval and vault
+
+- Soft-deleted / trashed notes must never enter RAG, semantic search, or
+  injected vault context.
+- Markdown file and SQLite row stay together. Neither is the single source of
+  truth.
+- Filesystem and SQLite are not one transaction; new multi-step writes need
+  compensating undo or a journal.
+
+## Small-model reliability
+
+- A ~2B local model is a first-class target, not an afterthought.
+- Prefer application-owned state, narrowed action contracts, validation,
+  fenced-JSON fallback, and one correction over trusting model prose.
+- Do not add features that only work with frontier models unless a local
+  fallback exists.
+
+## Memory
+
+- The application owns the active goal, pending question, and pending plan.
+  Never reconstruct those from a short reply such as "yes".
+- Compaction must keep the facts needed to finish the current goal.
+- Conversation transcripts stay in-memory by default. Durable session recovery
+  is opt-in and needs explicit retention/privacy rules.
+
+## Obsidian graph
+
+- Folder orbs, colors, and graph size are first-class vault features.
+- Requests like "make the work orb better" or "add X to the graph" must map to
+  typed actions, not keyword-only luck.
+
+## Documentation
+
+- `docs/` describes behavior that exists now. `tasks.md` and `docs/plans/`
+  describe work that does not exist yet.
+- A change is not complete while its docs still describe the old behavior.
+
 ---
 
 # Preferred Workflow

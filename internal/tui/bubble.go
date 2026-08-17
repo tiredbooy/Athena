@@ -1,3 +1,8 @@
+// Package tui is the frozen Bubble Tea fallback, kept only for terminals where
+// the built Ink client in apps/tui is unavailable (`athena --legacy-tui`, or a
+// missing build). That Ink client is the product: new interactive work goes
+// there, not here. Changes in this package should be limited to keeping it
+// compiling and correct against chat.Session.
 package tui
 
 import (

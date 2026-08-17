@@ -24,7 +24,7 @@ type OpenAIEmbeddingProvider struct {
 }
 
 func NewOpenAIEmbeddingProvider(name, baseURL, keyEnv, model string) *OpenAIEmbeddingProvider {
-	return &OpenAIEmbeddingProvider{name: name, baseURL: strings.TrimRight(baseURL, "/"), keyEnv: keyEnv, model: model, http: &http.Client{}}
+	return &OpenAIEmbeddingProvider{name: name, baseURL: strings.TrimRight(baseURL, "/"), keyEnv: keyEnv, model: model, http: newProviderHTTPClient()}
 }
 func (p *OpenAIEmbeddingProvider) Name() string       { return p.name }
 func (p *OpenAIEmbeddingProvider) EmbedModel() string { return p.model }

@@ -69,7 +69,7 @@ func LoadXAIOAuth() (*XAIOAuth, error) {
 		return nil, err
 	}
 	oauth := &XAIOAuth{
-		http:                   &http.Client{Timeout: 30 * time.Second},
+		http:                   newOAuthHTTPClient(),
 		tokenURL:               xaiTokenURL,
 		deviceAuthorizationURL: xaiDeviceAuthorizationURL,
 		openBrowser:            openBrowser,
@@ -210,6 +210,14 @@ func (o *XAIOAuth) pollDeviceToken(ctx context.Context, device xaiDeviceCode, on
 		}
 	}
 	return xaiTokenResponse{}, fmt.Errorf("xAI device authorization timed out; start /connect again")
+}
+
+// Connected reports whether a stored session exists, without touching the
+// network. See CodexOAuth.Connected for the same caveat about revocation.
+func (o *XAIOAuth) Connected() bool {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return o.credentials.AccessToken != "" || o.credentials.RefreshToken != ""
 }
 
 func (o *XAIOAuth) AccessToken(ctx context.Context) (string, error) {

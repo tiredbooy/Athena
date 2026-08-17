@@ -4,6 +4,7 @@ export type RequestType =
   | "engine.hello"
   | "session.submit"
   | "session.cancel"
+  | "session.reset"
   | "plan.approve"
   | "plan.reject"
   | "model.list"
@@ -22,6 +23,7 @@ export type ProviderPreset = {
   base_url?: string;
   api_key_env?: string;
   chat_model?: string;
+  fields?: string[];
   available: boolean;
   unavailable?: string;
 };
@@ -50,11 +52,16 @@ export type Action = {
   title?: string;
   content?: string;
   folder?: string;
+  path?: string;
   include_children?: boolean;
   node_size_multiplier?: number;
+  // Engine-owned orb color when present. Not sent today (G-02 / E-03).
+  color?: string;
   paths?: string[];
   folders?: string[];
   new_folder?: string;
+  // Engine-owned line for the plan card when present. Not sent today (F-01).
+  summary?: string;
 };
 
 export type Activity = {

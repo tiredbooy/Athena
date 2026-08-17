@@ -1,3 +1,6 @@
+// The read-tool decision loop: how one model step becomes reads, a decision, or
+// a continuation, and how a rejected native tool schema is recognized.
+
 package chat
 
 import (
@@ -9,7 +12,6 @@ import (
 
 	"github.com/tiredbooy/internal/ai"
 	"github.com/tiredbooy/internal/models"
-	"github.com/tiredbooy/internal/retrieval"
 )
 
 const (
@@ -19,62 +21,15 @@ const (
 	maxReadToolLimit  = 24
 	maxToolContent    = 6_000
 	readToolTimeout   = 10 * time.Second
+
+	// continuationReadFactLimit bounds one read result carried into a length-stop
+	// continuation. The continuation must keep the facts, not the payload.
+	continuationReadFactLimit = 1_200
+	// athenaStateBlockPrefix marks every application-owned system block —
+	// contracts, task state, verified observations, retained state. They are
+	// Athena's own records, so they survive any compaction the engine performs.
+	athenaStateBlockPrefix = "[ATHENA"
 )
-
-func readToolDefinitions(actionTypes ...[]string) []models.ToolDefinition {
-	allowedActions := allowedProposalActionTypes(actionTypes...)
-	return []models.ToolDefinition{
-		toolDefinition("propose_actions", "Required for any mutation decision while this tool is available. Submit the smallest non-empty vault action plan needed for the current goal. Actions available for this task: "+strings.Join(allowedActions, ", ")+". This proposes work only; Athena validates, approves, executes, and verifies it outside the model.", objectSchema(
-			map[string]any{
-				"summary": stringSchema("Short user-facing description of the proposed work; do not claim it already happened"),
-				"actions": map[string]any{"type": "array", "items": proposalActionSchema(allowedActions), "minItems": 1},
-			}, []string{"actions"})),
-		toolDefinition("request_clarification", "Ask one precise blocking question only when the missing information cannot be resolved from the supplied inventory or read tools. Do not use this merely to ask for vault contents Athena can inspect.", objectSchema(
-			map[string]any{"question": stringSchema("The single concise question to show the user")}, []string{"question"})),
-		toolDefinition("finish_run", "Finish the current mutation run only when the goal needs no actions or verified execution observations prove every requested change succeeded. Return the concise user-facing result; never claim unverified work.", objectSchema(
-			map[string]any{"message": stringSchema("The concise final answer to show the user")}, []string{"message"})),
-		toolDefinition("search_notes", "Search note content semantically. Returns matching note IDs and excerpts.", objectSchema(
-			map[string]any{"query": stringSchema("What to search for"), "limit": integerSchema("Maximum results, 1-8")}, []string{"query"})),
-		toolDefinition("get_note", "Read the full current content of one note by its note_id.", objectSchema(
-			map[string]any{"note_id": integerSchema("The note ID from inventory or a previous search")}, []string{"note_id"})),
-		toolDefinition("list_notes", "List notes, optionally limited to a folder or task status. Returns metadata, not full content.", objectSchema(
-			map[string]any{"folder": stringSchema("Optional vault-relative folder"), "status": stringSchema("Optional task status: open, done, or any"), "limit": integerSchema("Maximum results, 1-8")}, nil)),
-		toolDefinition("list_folders", "List the authoritative vault folder tree, including each folder's existing parent, children, and explicit graph links.", objectSchema(nil, nil)),
-		toolDefinition("find_notes_by_title", "Find notes by a case-insensitive title fragment. Use this before guessing a note ID.", objectSchema(
-			map[string]any{"query": stringSchema("Title words to match"), "limit": integerSchema("Maximum results, 1-8")}, []string{"query"})),
-		toolDefinition("get_notes", "Read up to eight notes by ID in one call.", objectSchema(map[string]any{"note_ids": map[string]any{"type": "array", "items": integerSchema("Note ID")}}, []string{"note_ids"})),
-		toolDefinition("get_note_by_path", "Read a note by its vault-relative Markdown path.", objectSchema(map[string]any{"path": stringSchema("For example projects/example.md")}, []string{"path"})),
-		toolDefinition("list_tags", "List tags and their note counts.", objectSchema(nil, nil)),
-		toolDefinition("get_note_links", "Get a note's direct outgoing links and backlinks.", objectSchema(map[string]any{"note_id": integerSchema("Note ID")}, []string{"note_id"})),
-		toolDefinition("find_duplicate_titles", "Find potentially duplicate notes by normalized title.", objectSchema(nil, nil)),
-		toolDefinition("get_daily_note", "Read a daily note at daily/YYYY-MM-DD.md; omit date for today.", objectSchema(map[string]any{"date": stringSchema("Optional ISO date YYYY-MM-DD")}, nil)),
-		toolDefinition("lookup_book", "Check an exact book title against the local cache and optional Open Library catalog before creating or renaming a book. If suggested_title is returned, ask the user to confirm it; never silently replace their title.", objectSchema(
-			map[string]any{"title": stringSchema("Book title exactly as the user supplied it"), "isbn": stringSchema("Optional ISBN")}, []string{"title"})),
-	}
-}
-
-func toolDefinition(name, description string, parameters map[string]any) models.ToolDefinition {
-	return models.ToolDefinition{Type: "function", Function: models.ToolFunction{Name: name, Description: description, Parameters: parameters}}
-}
-
-func objectSchema(properties map[string]any, required []string) map[string]any {
-	if properties == nil {
-		properties = map[string]any{}
-	}
-	schema := map[string]any{"type": "object", "properties": properties}
-	if len(required) > 0 {
-		schema["required"] = required
-	}
-	return schema
-}
-
-func stringSchema(description string) map[string]any {
-	return map[string]any{"type": "string", "description": description}
-}
-
-func integerSchema(description string) map[string]any {
-	return map[string]any{"type": "integer", "description": description}
-}
 
 type modelLoopResult struct {
 	Content      string
@@ -89,26 +44,35 @@ func (s *Session) runReadToolLoop(ctx context.Context, messages []models.Message
 }
 
 func (s *Session) runReadToolLoopState(ctx context.Context, messages []models.Message, status func(string)) (modelLoopResult, error) {
-	return s.runReadToolLoopStateWithPolicy(ctx, messages, status, false)
+	return s.runReadToolLoopStateWithPolicy(ctx, messages, status, nil, false)
 }
 
-func (s *Session) runReadToolLoopStateWithPolicy(ctx context.Context, messages []models.Message, status func(string), requireToolDecision bool, actionTypes ...[]string) (modelLoopResult, error) {
+func (s *Session) runReadToolLoopStateWithPolicy(ctx context.Context, messages []models.Message, status func(string), onTool toolStepFunc, requireToolDecision bool, actionTypes ...[]string) (modelLoopResult, error) {
 	messages = append([]models.Message(nil), messages...)
 	tools := readToolDefinitions(actionTypes...)
+	// Every no-native-tools request goes out provider-neutral. A model that
+	// cannot render tool definitions usually cannot render tool history either,
+	// so a later step of the same run must not replay the earlier steps' native
+	// tool calls at it (R-02).
 	if s.loop.ai.Name() == "Ollama" && s.nativeToolsDisabledModel == s.loop.ai.ChatModel() {
 		if status != nil {
 			status("Generating a plan")
 		}
-		return s.runPlainChatState(ctx, messages)
+		return s.runPlainChatState(ctx, providerNeutralReadMessages(messages))
 	}
 	if supportProvider, ok := s.loop.ai.(ai.NativeToolSupportProvider); ok {
 		support, err := supportProvider.NativeToolSupport(ctx)
 		if err != nil || !support.Available {
-			s.nativeToolsDisabledModel = s.loop.ai.ChatModel()
+			// Only a definitive capability answer is remembered: a failed probe is
+			// a transport hiccup, and disabling native tools for the rest of the
+			// session on one is a downgrade the user never asked for.
+			if err == nil {
+				s.nativeToolsDisabledModel = s.loop.ai.ChatModel()
+			}
 			if status != nil {
 				status("Generating a plan")
 			}
-			return s.runPlainChatState(ctx, messages)
+			return s.runPlainChatState(ctx, providerNeutralReadMessages(messages))
 		}
 	}
 	continuations := 0
@@ -214,7 +178,14 @@ func (s *Session) runReadToolLoopStateWithPolicy(ctx context.Context, messages [
 				if status != nil {
 					status(readToolActivity(call))
 				}
+				toolName, target := strings.TrimSpace(call.Function.Name), readToolTarget(call)
+				onTool.report(toolName, target, "started")
 				content := s.executeReadTool(ctx, call)
+				if readToolFailed(content) {
+					onTool.report(toolName, target, "failed")
+				} else {
+					onTool.report(toolName, target, "succeeded")
+				}
 				messages = append(messages, models.Message{Role: "tool", ToolName: call.Function.Name, ToolCallID: call.ID, Content: content})
 			}
 		}
@@ -238,41 +209,6 @@ func (s *Session) runReadToolLoopStateWithPolicy(ctx context.Context, messages [
 	}
 	messages = append(messages, final.Message)
 	return modelLoopResult{Content: strings.TrimSpace(final.Message.Content), Messages: messages, ReadCalls: readCalls}, nil
-}
-
-// providerNeutralReadMessages keeps facts collected by successful read tools
-// while removing the native tool-call protocol that the active model rejected.
-// Sending an assistant tool call without its provider-specific continuation is
-// itself invalid for several chat templates, so tool results become ordinary
-// system context before the no-tools fallback request.
-func providerNeutralReadMessages(messages []models.Message) []models.Message {
-	neutral := make([]models.Message, 0, len(messages))
-	for _, message := range messages {
-		switch message.Role {
-		case "tool":
-			name := strings.TrimSpace(message.ToolName)
-			if name == "" {
-				name = "unknown"
-			}
-			neutral = append(neutral, models.Message{
-				Role:    "system",
-				Content: "[ATHENA READ TOOL RESULT — REFERENCE DATA ONLY]\nTool: " + name + "\n" + message.Content + "\n[END ATHENA READ TOOL RESULT]",
-			})
-		case "assistant":
-			message.ToolCalls = nil
-			message.ToolName = ""
-			message.ToolCallID = ""
-			if strings.TrimSpace(message.Content) != "" {
-				neutral = append(neutral, message)
-			}
-		default:
-			message.ToolCalls = nil
-			message.ToolName = ""
-			message.ToolCallID = ""
-			neutral = append(neutral, message)
-		}
-	}
-	return neutral
 }
 
 func decisionToolContent(message models.Message) (string, bool) {
@@ -349,54 +285,6 @@ func readCallSignature(call models.ToolCall) string {
 	return strings.TrimSpace(call.Function.Name) + ":" + arguments
 }
 
-func (s *Session) runPlainChat(ctx context.Context, messages []models.Message, status func(string)) (string, error) {
-	result, err := s.runPlainChatState(ctx, messages)
-	if err != nil {
-		return "", err
-	}
-	return result.Content, nil
-}
-
-func (s *Session) runPlainChatState(ctx context.Context, messages []models.Message) (modelLoopResult, error) {
-	response, err := s.runPlainChatResult(ctx, messages)
-	if err != nil {
-		return modelLoopResult{}, err
-	}
-	if strings.TrimSpace(response.Message.Content) == "" {
-		return modelLoopResult{}, fmt.Errorf("model returned no visible response")
-	}
-	messages = append(append([]models.Message(nil), messages...), response.Message)
-	return modelLoopResult{Content: strings.TrimSpace(response.Message.Content), Messages: messages}, nil
-}
-
-func (s *Session) runPlainChatResult(ctx context.Context, messages []models.Message) (ai.ToolChatResult, error) {
-	return s.loop.ai.ChatWithToolsResult(ctx, messages, nil)
-}
-
-func readToolActivity(call models.ToolCall) string {
-	name := strings.TrimSpace(call.Function.Name)
-	var args map[string]json.RawMessage
-	_ = json.Unmarshal(call.Function.Arguments, &args)
-	switch name {
-	case "get_note_by_path":
-		return "Reading " + optionalString(args, "path")
-	case "get_note":
-		return fmt.Sprintf("Reading note %d", toolID(args, "note_id"))
-	case "get_daily_note":
-		return "Reading daily note " + optionalString(args, "date")
-	case "search_notes":
-		return "Searching notes for “" + optionalString(args, "query") + "”"
-	default:
-		return "Running vault tool: " + name
-	}
-}
-
-func toolID(args map[string]json.RawMessage, key string) int64 {
-	var id int64
-	_ = json.Unmarshal(args[key], &id)
-	return id
-}
-
 func (s *Session) chatWithRetry(ctx context.Context, messages []models.Message, tools []models.ToolDefinition, status func(string), requireTools bool) (ai.ToolChatResult, error) {
 	if status != nil {
 		status(fmt.Sprintf("%s · %s is generating a plan", s.loop.ai.Name(), shortModel(s.loop.ai.ChatModel())))
@@ -456,7 +344,26 @@ func isIncompleteDoneReason(reason string) bool {
 	return strings.Contains(reason, "length") || strings.Contains(reason, "context")
 }
 
+// compactContinuationMessages rebuilds the prompt for the one allowed
+// continuation after a length stop. Conversation prose is dropped, but the
+// application-owned blocks are not: the read results this turn already paid
+// for, the pending-task JSON, and the task action contract, which since R-06
+// is the model's only action vocabulary. Rebuilding from the goal alone left a
+// continuation that could neither cite a vault fact nor name an action (R-05).
 func compactContinuationMessages(messages []models.Message, partial models.Message) []models.Message {
+	carried := make([]models.Message, 0, len(messages))
+	for _, message := range messages {
+		switch {
+		case message.Role == "tool":
+			// ponytail: carry the read as a fact, not the full payload — the
+			// continuation exists because the model already ran out of room. Raise
+			// the limit only if a continuation is seen quoting truncated results.
+			message.Content = compactText(message.Content, continuationReadFactLimit)
+			carried = append(carried, message)
+		case message.Role == "system" && strings.HasPrefix(message.Content, athenaStateBlockPrefix):
+			carried = append(carried, message)
+		}
+	}
 	system := models.Message{Role: "system", Content: ai.SystemPromptAt(time.Now())}
 	goal := ""
 	for i := len(messages) - 1; i >= 0; i-- {
@@ -470,194 +377,8 @@ func compactContinuationMessages(messages []models.Message, partial models.Messa
 		}
 	}
 	state := "Original user goal:\n" + truncateToolContent(goal) + "\n\nPartial response:\n" + truncateToolContent(partial.Content)
-	return []models.Message{system, {Role: "system", Content: state}}
-}
-
-func (s *Session) executeReadTool(ctx context.Context, call models.ToolCall) string {
-	ctx, cancel := context.WithTimeout(ctx, readToolTimeout)
-	defer cancel()
-
-	name := strings.TrimSpace(call.Function.Name)
-	var arguments map[string]json.RawMessage
-	if len(call.Function.Arguments) == 0 || json.Unmarshal(call.Function.Arguments, &arguments) != nil {
-		return toolError("arguments must be a JSON object")
-	}
-
-	limit := toolLimit(arguments)
-	var result any
-	var err error
-	switch name {
-	case "search_notes":
-		query, parseErr := requiredString(arguments, "query")
-		if parseErr != nil {
-			return toolError(parseErr.Error())
-		}
-		result, err = s.loop.retrieval.SearchNotes(ctx, query, limit)
-	case "get_note":
-		noteID, parseErr := requiredInt64(arguments, "note_id")
-		if parseErr != nil {
-			return toolError(parseErr.Error())
-		}
-		result, err = s.loop.retrieval.NoteByID(noteID)
-		if err == nil && result == nil {
-			return toolError(fmt.Sprintf("note %d was not found", noteID))
-		}
-	case "list_notes":
-		result, err = filterCatalog(s.loop.retrieval, optionalString(arguments, "folder"), optionalString(arguments, "status"), limit)
-	case "list_folders":
-		result, err = s.loop.retrieval.FolderInventory()
-	case "find_notes_by_title":
-		query, parseErr := requiredString(arguments, "query")
-		if parseErr != nil {
-			return toolError(parseErr.Error())
-		}
-		result, err = s.loop.retrieval.FindNotesByTitle(query, limit)
-	case "get_notes":
-		ids, parseErr := requiredIDs(arguments, "note_ids")
-		if parseErr != nil {
-			return toolError(parseErr.Error())
-		}
-		result, err = s.loop.retrieval.NotesByID(ids)
-	case "get_note_by_path":
-		path, parseErr := requiredString(arguments, "path")
-		if parseErr != nil {
-			return toolError(parseErr.Error())
-		}
-		result, err = s.loop.retrieval.NoteByRelativePath(path)
-		if err == nil && result == nil {
-			return toolError(fmt.Sprintf("note %q was not found", path))
-		}
-	case "list_tags":
-		result, err = s.loop.retrieval.Tags()
-	case "get_note_links":
-		noteID, parseErr := requiredInt64(arguments, "note_id")
-		if parseErr != nil {
-			return toolError(parseErr.Error())
-		}
-		result, err = s.loop.retrieval.Links(noteID)
-	case "find_duplicate_titles":
-		result, err = s.loop.retrieval.DuplicateTitles()
-	case "get_daily_note":
-		date := optionalString(arguments, "date")
-		if date == "" {
-			date = time.Now().Format("2006-01-02")
-		}
-		if _, parseErr := time.Parse("2006-01-02", date); parseErr != nil {
-			return toolError("date must use YYYY-MM-DD")
-		}
-		result, err = s.loop.retrieval.NoteByRelativePath("daily/" + date + ".md")
-		if err == nil && result == nil {
-			return toolError(fmt.Sprintf("daily note for %s was not found", date))
-		}
-	case "lookup_book":
-		if s.loop.bookCatalog == nil {
-			return toolError("book catalog is unavailable")
-		}
-		title, parseErr := requiredString(arguments, "title")
-		if parseErr != nil {
-			return toolError(parseErr.Error())
-		}
-		result, err = s.loop.bookCatalog.Inspect(ctx, title, optionalString(arguments, "isbn"))
-	default:
-		return toolError(fmt.Sprintf("unknown read tool %q", name))
-	}
-	if err != nil {
-		return toolError(err.Error())
-	}
-	encoded, err := json.Marshal(result)
-	if err != nil {
-		return toolError(fmt.Sprintf("encode result: %v", err))
-	}
-	return truncateToolContent(string(encoded))
-}
-
-func filterCatalog(service *retrieval.Service, folder, status string, limit int) ([]retrieval.CatalogEntry, error) {
-	catalog, err := service.Inventory()
-	if err != nil {
-		return nil, err
-	}
-	folder = strings.Trim(strings.TrimSpace(folder), "/")
-	status = strings.ToLower(strings.TrimSpace(status))
-	if status != "" && status != "any" && status != "open" && status != "done" {
-		return nil, fmt.Errorf("status must be open, done, or any")
-	}
-	filtered := make([]retrieval.CatalogEntry, 0, limit)
-	for _, entry := range catalog {
-		if folder != "" && entry.Folder != folder {
-			continue
-		}
-		if status == "open" && (entry.Type != "task" || entry.Done) {
-			continue
-		}
-		if status == "done" && (entry.Type != "task" || !entry.Done) {
-			continue
-		}
-		filtered = append(filtered, entry)
-		if len(filtered) == limit {
-			break
-		}
-	}
-	return filtered, nil
-}
-
-func requiredString(arguments map[string]json.RawMessage, name string) (string, error) {
-	value := optionalString(arguments, name)
-	if value == "" {
-		return "", fmt.Errorf("%s is required", name)
-	}
-	return value, nil
-}
-
-func optionalString(arguments map[string]json.RawMessage, name string) string {
-	var value string
-	_ = json.Unmarshal(arguments[name], &value)
-	return strings.TrimSpace(value)
-}
-
-func requiredInt64(arguments map[string]json.RawMessage, name string) (int64, error) {
-	var value int64
-	if err := json.Unmarshal(arguments[name], &value); err != nil || value <= 0 {
-		return 0, fmt.Errorf("%s must be a positive integer", name)
-	}
-	return value, nil
-}
-
-func requiredIDs(arguments map[string]json.RawMessage, name string) ([]int64, error) {
-	var ids []int64
-	if err := json.Unmarshal(arguments[name], &ids); err != nil || len(ids) == 0 || len(ids) > 8 {
-		return nil, fmt.Errorf("%s must contain 1 to 8 note IDs", name)
-	}
-	for _, id := range ids {
-		if id <= 0 {
-			return nil, fmt.Errorf("%s must contain positive note IDs", name)
-		}
-	}
-	return ids, nil
-}
-
-func toolLimit(arguments map[string]json.RawMessage) int {
-	var limit int
-	if json.Unmarshal(arguments["limit"], &limit) != nil || limit < 1 {
-		return maxReadToolLimit
-	}
-	if limit > maxReadToolLimit {
-		return maxReadToolLimit
-	}
-	return limit
-}
-
-func toolError(message string) string {
-	return `{"error":` + strconvQuote(message) + `}`
-}
-
-func truncateToolContent(content string) string {
-	if len(content) <= maxToolContent {
-		return content
-	}
-	return content[:maxToolContent] + `…(truncated)`
-}
-
-func strconvQuote(value string) string {
-	encoded, _ := json.Marshal(value)
-	return string(encoded)
+	// The assistant messages that requested those reads are gone, so the results
+	// must travel as reference data rather than as orphan tool-protocol turns.
+	compacted := append([]models.Message{system}, providerNeutralReadMessages(carried)...)
+	return append(compacted, models.Message{Role: "system", Content: state})
 }

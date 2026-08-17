@@ -90,6 +90,40 @@ func (s *NoteStore) All() ([]*models.Note, error) {
 	                 FROM notes WHERE trashed_from = '' ORDER BY updated_at DESC`)
 }
 
+// NoteMeta is a note without its body: everything a catalog, listing, or graph
+// index needs to name a note and point at it.
+type NoteMeta struct {
+	ID    int64
+	Title string
+	Path  string // absolute path on disk, like models.Note.Path
+	Type  models.NoteType
+	Done  bool
+}
+
+// AllMeta returns the same set as All — every non-trashed note, newest first —
+// but never reads the content column. Catalogs only show titles, so All would
+// pull every note's full text out of SQLite just to throw it away.
+func (s *NoteStore) AllMeta() ([]NoteMeta, error) {
+	rows, err := s.db.Query(`SELECT id, title, path, note_type, done
+	                         FROM notes WHERE trashed_from = '' ORDER BY updated_at DESC`)
+	if err != nil {
+		return nil, fmt.Errorf("query note metadata: %w", err)
+	}
+	defer rows.Close()
+
+	var out []NoteMeta
+	for rows.Next() {
+		var m NoteMeta
+		var noteType string
+		if err := rows.Scan(&m.ID, &m.Title, &m.Path, &noteType, &m.Done); err != nil {
+			return nil, fmt.Errorf("scan note metadata: %w", err)
+		}
+		m.Type = models.NoteType(noteType)
+		out = append(out, m)
+	}
+	return out, rows.Err()
+}
+
 // Trashed returns every note currently sitting in .trash.
 func (s *NoteStore) Trashed() ([]*models.Note, error) {
 	return s.query(`SELECT id, title, path, content, note_type, done, archived, archived_from, trashed_from, created_at, updated_at

@@ -150,3 +150,45 @@ func TestServeListsStaticAndCustomProviderOptions(t *testing.T) {
 		}
 	}
 }
+
+func TestServeResetsSessionState(t *testing.T) {
+	input := bytes.NewBufferString(`{"version":1,"requestId":"reset-1","type":"session.reset"}` + "\n")
+	var output bytes.Buffer
+
+	provider := &modelProvider{model: "small-chat"}
+	session := chat.NewSession(chat.NewLoop(provider, map[string]ai.ChatProvider{"ollama": provider}, nil, nil, nil, nil))
+	if err := Serve(context.Background(), input, &output, session); err != nil {
+		t.Fatalf("serve: %v", err)
+	}
+
+	var event Event
+	if err := json.NewDecoder(&output).Decode(&event); err != nil {
+		t.Fatalf("decode reset event: %v", err)
+	}
+	if event.Type != "session.reset" || event.RequestID != "reset-1" {
+		t.Fatalf("reset event = %#v", event)
+	}
+}
+
+// A reset while a turn is in flight would block on the same lock the turn
+// holds, so it is refused with an explanation instead.
+func TestServeRefusesResetWhileBusy(t *testing.T) {
+	var output bytes.Buffer
+	provider := &modelProvider{model: "small-chat"}
+	server := &Server{
+		ctx:     context.Background(),
+		session: chat.NewSession(chat.NewLoop(provider, map[string]ai.ChatProvider{"ollama": provider}, nil, nil, nil, nil)),
+		output:  json.NewEncoder(&output),
+		turns:   make(map[string]context.CancelFunc),
+		busy:    true,
+	}
+	server.handle(Request{Version: ProtocolVersion, RequestID: "reset-2", Type: RequestSessionReset})
+
+	var event Event
+	if err := json.NewDecoder(&output).Decode(&event); err != nil {
+		t.Fatalf("decode busy event: %v", err)
+	}
+	if event.Type != "error" || event.Error == "" {
+		t.Fatalf("expected a refusal event, got %#v", event)
+	}
+}

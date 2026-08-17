@@ -1,0 +1,3 @@
+not json
+{"version":2,"type":"engine.ready"}
+{"version":1,"requestId":"r1","type":"engine.ready","message":"Athena engine is ready"}

@@ -6,7 +6,9 @@ import (
 	"errors"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/tiredbooy/internal/ai"
 	"github.com/tiredbooy/internal/models"
@@ -92,6 +94,80 @@ func TestClarificationAnswerResumesGoalAndSkipsRedundantPermissionQuestion(t *te
 	}
 	if provider.calls != 3 {
 		t.Fatalf("provider calls=%d, want clarification, rejected permission question, and corrected plan", provider.calls)
+	}
+}
+
+// cancelDuringPlanningProvider executes one action, then hangs in the next
+// model call until the turn is cancelled — the shape of a user pressing Escape
+// while Athena is re-planning after its first verified change.
+type cancelDuringPlanningProvider struct {
+	calls    int
+	planning chan struct{}
+	once     sync.Once
+}
+
+func (p *cancelDuringPlanningProvider) Name() string        { return "ChatGPT subscription" }
+func (p *cancelDuringPlanningProvider) ChatModel() string   { return "test" }
+func (p *cancelDuringPlanningProvider) SetChatModel(string) {}
+func (p *cancelDuringPlanningProvider) ChatModels(context.Context) ([]ai.ModelInfo, error) {
+	return nil, nil
+}
+func (p *cancelDuringPlanningProvider) StreamChatWith(context.Context, []models.Message, ai.StreamCallbacks) (string, error) {
+	return "", nil
+}
+func (p *cancelDuringPlanningProvider) ChatWithToolsResult(ctx context.Context, messages []models.Message, tools []models.ToolDefinition) (ai.ToolChatResult, error) {
+	return p.ChatWithRequiredToolsResult(ctx, messages, tools)
+}
+func (p *cancelDuringPlanningProvider) ChatWithRequiredToolsResult(ctx context.Context, _ []models.Message, _ []models.ToolDefinition) (ai.ToolChatResult, error) {
+	p.calls++
+	if p.calls == 1 {
+		return decisionCall("propose_actions", `{"summary":"mark the finished task done","actions":[{"type":"mark_done","note_id":1}]}`), nil
+	}
+	p.once.Do(func() { close(p.planning) })
+	select {
+	case <-ctx.Done():
+	case <-time.After(10 * time.Second):
+	}
+	return ai.ToolChatResult{}, errors.New("planning was interrupted")
+}
+
+// M-01: a cancelled turn that already executed something comes back as a safe
+// stop, not an error. The goal is interrupted, not answered, so the pending
+// question must still be there for the user's next reply.
+func TestCancelledTurnRestoresThePendingTask(t *testing.T) {
+	db, err := storage.Open(filepath.Join(t.TempDir(), "athena.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	retrievalService := retrieval.NewService(t.TempDir(), storage.NewNoteStore(db), storage.NewChunkStore(db), taskStateEmbedder{})
+	dispatcher := tools.NewDispatcher()
+	dispatcher.Register("mark_done", func(context.Context, ai.Action) (string, error) { return "marked note 1 done", nil })
+
+	provider := &cancelDuringPlanningProvider{planning: make(chan struct{})}
+	session := NewSession(NewLoop(provider, map[string]ai.ChatProvider{"test": provider}, nil, retrievalService, dispatcher, nil))
+	pending := &PendingTask{
+		OriginalGoal:   "mark my finished reading tasks done",
+		Question:       "Which task did you finish?",
+		ExpectedAction: true,
+	}
+	session.pendingTask = pending
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() {
+		<-provider.planning
+		cancel()
+	}()
+
+	if _, err := session.Submit(ctx, "the chapter three one", nil, nil); err != nil {
+		t.Fatalf("cancelled turn returned an error instead of a safe stop: %v", err)
+	}
+	if session.pendingTask == nil {
+		t.Fatal("cancelling the turn discarded the goal the user was answering")
+	}
+	if session.pendingTask.OriginalGoal != pending.OriginalGoal || session.pendingTask.Question != pending.Question {
+		t.Fatalf("restored task = %+v, want the original goal and question", session.pendingTask)
 	}
 }
 

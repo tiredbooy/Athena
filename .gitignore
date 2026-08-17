@@ -9,6 +9,20 @@ apps/tui/*.tsbuildinfo
 *.test
 coverage.out
 
+# User data. Fresh installs write the vault to ~/Athena and SQLite to
+# ~/.local/share/athena/athena.db, so these rules only catch a deliberate
+# local override or a stray copy inside the checkout. The already-tracked
+# data/second-brain.db is NOT hidden by them: an ignore rule never applies to
+# a file git already follows. It is removed by a later cleanup task.
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+/data/
+/Athena/
+/vault/
+
 # Local environment and editor files
 .env
 .env.*

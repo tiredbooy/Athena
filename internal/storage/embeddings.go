@@ -9,10 +9,11 @@ import (
 
 // SearchSimilar returns the topK chunks whose embeddings are closest to
 // query, ranked by cosine similarity (1.0 = same direction, 0 = unrelated).
+// Trashed notes are excluded: soft-deleted content must never reach RAG.
 // Brute-force in memory — fine at personal-vault scale (thousands of
 // chunks); revisit with a real vector index only if it ever gets huge.
 func (s *ChunkStore) SearchSimilar(query []float32, topK int) ([]models.ChunkResult, error) {
-	all, err := s.All()
+	all, err := s.Searchable()
 	if err != nil {
 		return nil, err
 	}

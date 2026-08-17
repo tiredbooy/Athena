@@ -1,18 +1,16 @@
 package chat
 
 import (
-	"bufio"
 	"context"
 	"fmt"
-	"os"
 	"strings"
 
 	"github.com/tiredbooy/internal/ai"
 	"github.com/tiredbooy/internal/books"
 	"github.com/tiredbooy/internal/config"
+	"github.com/tiredbooy/internal/notes"
 	"github.com/tiredbooy/internal/retrieval"
 	"github.com/tiredbooy/internal/tools"
-	"github.com/tiredbooy/internal/tui"
 )
 
 type Loop struct {
@@ -25,6 +23,7 @@ type Loop struct {
 	bookCatalog *books.Resolver
 	config      *config.Config
 	credentials *config.CredentialStore
+	notes       *notes.Service
 }
 
 func NewLoop(chatProvider ai.ChatProvider, providers map[string]ai.ChatProvider, oauth *ai.CodexOAuth, retrievalSvc *retrieval.Service, dispatcher *tools.Dispatcher, cfg *config.Config) *Loop {
@@ -43,59 +42,40 @@ func (l *Loop) SetBookCatalog(catalog *books.Resolver) {
 	l.bookCatalog = catalog
 }
 
-// Run is the line-oriented fallback UI. It intentionally delegates every turn
-// to Session so terminal and stdio/TypeScript clients share one agent policy.
-func (l *Loop) Run() {
-	session := NewSession(l)
-	scanner := bufio.NewScanner(os.Stdin)
-
-	fmt.Println()
-	fmt.Println("──────────────────────────────────────────────")
-	fmt.Println("Athena")
-	fmt.Println("──────────────────────────────────────────────")
-	fmt.Println("Ask anything. /models changes your model · exit quits.")
-
-	for {
-		fmt.Print("\n> ")
-		if !scanner.Scan() {
-			break
-		}
-
-		input := strings.TrimSpace(scanner.Text())
-		if input == "" {
-			continue
-		}
-		if input == "exit" || input == "quit" {
-			break
-		}
-		if input == "/help" {
-			fmt.Println("Commands: /models, /model <number-or-name>, /doctor, /compact, /confirm, /cancel, /help, exit")
-			continue
-		}
-
-		ctx, cancel := context.WithTimeout(context.Background(), TurnTimeout)
-		loader := tui.NewLoader()
-		loader.Start()
-		reply, err := session.Submit(ctx, input, loader.Info, nil)
-		cancel()
-		loader.Stop()
-		if err != nil {
-			fmt.Printf("\nError: %v\n", err)
-			continue
-		}
-		if strings.TrimSpace(reply) != "" {
-			fmt.Println("\nAthena")
-			fmt.Println(tui.RenderMarkdown(reply))
-		}
-	}
+// SetNotes gives the loop the vault service so `/doctor` can read index health
+// and `/reindex` can rebuild it. Only user commands reach it: the model's own
+// vault writes go through the dispatcher, which is what keeps the expensive,
+// whole-vault rebuild out of any action a model could propose.
+//
+// Optional, like the setters above: a Loop without it still answers every turn,
+// and `/doctor` simply omits the index-health line.
+func (l *Loop) SetNotes(service *notes.Service) {
+	l.notes = service
 }
 
+// isListingRequest matches complete, exact phrasings of exactly one request:
+// "show me every note in the vault". Matching is whole-string on purpose. A
+// prefix or keyword test would fire on a compound request ("list my notes and
+// delete the old ones"), skip the model, and silently drop the rest of the
+// sentence — so the precision is the feature, not a limitation.
+//
+// R-04: only read-only, unambiguous, self-contained phrasings belong here, and
+// every entry must name notes. "what's in my vault" is deliberately absent:
+// catalogText reports notes only, so a vault-wide question would get an answer
+// that reads complete and is not.
 func isListingRequest(input string) bool {
-	q := strings.Trim(strings.ToLower(strings.TrimSpace(input)), ".?!")
-	return q == "what notes do i have" ||
-		q == "list my notes" ||
-		q == "show my notes" ||
-		q == "list notes" || q == "show notes" || q == "my notes"
+	// Fields collapses stray inner whitespace so sloppy typing still hits an
+	// exact entry; it cannot widen what matches.
+	switch strings.Trim(strings.Join(strings.Fields(strings.ToLower(input)), " "), ".?!") {
+	case "what notes do i have",
+		"what notes are in my vault",
+		"list my notes", "list all my notes", "list notes", "list all notes",
+		"show my notes", "show all my notes", "show notes", "show all notes",
+		"show me my notes", "show me all my notes",
+		"my notes", "all my notes":
+		return true
+	}
+	return false
 }
 
 func catalogText(catalog []retrieval.CatalogEntry) string {
@@ -155,6 +135,24 @@ func actionProgressMessage(progress tools.ActionProgress) string {
 		return progress.Message
 	}
 	return "Finished " + target
+}
+
+// describeActions fills each action's engine-generated Summary before the plan
+// crosses a UI boundary. The engine already knows how to name an action — it
+// prints exactly this in the review text — so every client should not have to
+// rebuild that switch. A model-supplied Summary is discarded: display text is
+// the engine's to write.
+func describeActions(actions []ai.Action) []ai.Action {
+	described := make([]ai.Action, 0, len(actions))
+	for _, action := range actions {
+		summary := actionVerb(action)
+		if target := actionTarget(action); target != "" {
+			summary += " " + target
+		}
+		action.Summary = summary
+		described = append(described, action)
+	}
+	return described
 }
 
 func actionVerb(action ai.Action) string {

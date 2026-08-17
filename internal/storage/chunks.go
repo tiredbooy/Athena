@@ -31,7 +31,23 @@ func (s *ChunkStore) Create(c *models.Chunk) (int64, error) {
 }
 
 func (s *ChunkStore) All() ([]*models.Chunk, error) {
-	rows, err := s.db.Query(`SELECT id, note_id, content, chunk_index, embedding FROM chunks`)
+	return s.queryChunks(`SELECT id, note_id, content, chunk_index, embedding FROM chunks`)
+}
+
+// Searchable returns only the chunks whose note is not in the trash. Soft
+// deletion is a note-level flag, and trashing a note does not currently remove
+// its vectors, so the filter has to happen at read time. Every semantic search
+// path routes through here, which keeps trashed notes out of RAG in one place
+// rather than in each caller.
+func (s *ChunkStore) Searchable() ([]*models.Chunk, error) {
+	return s.queryChunks(`SELECT c.id, c.note_id, c.content, c.chunk_index, c.embedding
+	                        FROM chunks c
+	                        JOIN notes n ON n.id = c.note_id
+	                       WHERE n.trashed_from = ''`)
+}
+
+func (s *ChunkStore) queryChunks(query string) ([]*models.Chunk, error) {
+	rows, err := s.db.Query(query)
 	if err != nil {
 		return nil, fmt.Errorf("query chunks: %w", err)
 	}

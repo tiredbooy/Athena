@@ -11,12 +11,26 @@ import (
 	"github.com/tiredbooy/internal/utils"
 )
 
+// defaultBookFolder is where a book lands when the caller names no folder.
+// This is a code default, not a prompt convention, so an empty folder from a
+// weak model puts the book with the other books instead of the vault root.
+const defaultBookFolder = "books/reading"
+
 // CreateBook writes a structured, Obsidian-readable book note. The caller owns
 // resolving catalog data; this service remains the sole owner of vault writes.
+//
+// A named folder must already exist (same rule as CreateNote); only the
+// default folder is created on demand, because Athena chose it, not the model.
 func (s *Service) CreateBook(ctx context.Context, metadata models.BookMetadata, folder string, startedAt time.Time) (*models.Note, bool, error) {
 	title := strings.TrimSpace(metadata.Title)
 	if title == "" {
 		return nil, false, fmt.Errorf("book title is required")
+	}
+	if strings.TrimSpace(folder) == "" {
+		folder = defaultBookFolder
+		if err := utils.EnsureDir(s.vaultPath, folder); err != nil {
+			return nil, false, fmt.Errorf("create %s: %w", folder, err)
+		}
 	}
 	fm := parser.Frontmatter{
 		Title: title, Tags: []string{"book"}, Kind: "book", Authors: metadata.Authors,

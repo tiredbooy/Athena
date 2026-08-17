@@ -1,0 +1,4 @@
+{"version":1,"requestId":"r3","type":"turn.started","turnId":"t2"}
+{"version":1,"requestId":"r3","type":"activity","activity":{"phase":"planning","message":"Drafting a write plan"}}
+{"version":1,"requestId":"r3","type":"plan.ready","planId":"p1","actions":[{"type":"create_note","title":"Rumera","folder":"work"}]}
+{"version":1,"requestId":"r3","type":"turn.completed","turnId":"t2"}

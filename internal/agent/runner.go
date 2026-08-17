@@ -52,8 +52,11 @@ func (r *Runner) Run(ctx context.Context, state *RunState, emit EventSink) (Outc
 		return Outcome{}, fmt.Errorf("agent run state is required")
 	}
 	for state.Step < r.budget.MaxSteps {
+		// E-03: every exit carries the verified ledger, error paths included. A
+		// cancelled or failed run can already have changed the vault, and the user
+		// must still learn what it did.
 		if err := ctx.Err(); err != nil {
-			return Outcome{}, err
+			return Outcome{Ledger: state.Completed}, err
 		}
 		if state.NoProgressSteps >= r.budget.MaxNoProgressSteps {
 			return r.safeStop(state, "the agent stopped making progress"), nil
@@ -66,17 +69,18 @@ func (r *Runner) Run(ctx context.Context, state *RunState, emit EventSink) (Outc
 			phase = PhaseReplanning
 			message = fmt.Sprintf("Checking results and planning step %d", state.Step)
 		}
-		r.emit(state, emit, Event{Phase: phase, Message: message})
+		r.emit(state, emit, Event{Phase: phase, Message: message, State: StateStarted})
 		decision, err := r.driver.Decide(ctx, state, emit)
 		if err != nil {
 			if len(state.Completed) > 0 {
 				return r.safeStop(state, "the model could not evaluate the verified results: "+err.Error()), nil
 			}
-			return Outcome{}, err
+			return Outcome{Ledger: state.Completed}, err
 		}
 
-		r.emit(state, emit, Event{Phase: PhaseValidating, Message: "Validating the next decision"})
+		r.emit(state, emit, Event{Phase: PhaseValidating, Message: "Validating the next decision", State: StateStarted})
 		if err := r.driver.Validate(state, decision); err != nil {
+			r.emit(state, emit, Event{Phase: PhaseValidating, Message: "The proposed decision was rejected: " + err.Error(), State: StateFailed})
 			state.ValidationFails++
 			state.NoProgressSteps++
 			appendCorrection(state, err)
@@ -85,6 +89,7 @@ func (r *Runner) Run(ctx context.Context, state *RunState, emit EventSink) (Outc
 			}
 			continue
 		}
+		r.emit(state, emit, Event{Phase: PhaseValidating, Message: "Decision accepted", State: StateSucceeded})
 		state.ValidationFails = 0
 
 		switch decision.Kind {
@@ -93,8 +98,8 @@ func (r *Runner) Run(ctx context.Context, state *RunState, emit EventSink) (Outc
 			if reply == "" {
 				return r.safeStop(state, "the model returned an empty final decision"), nil
 			}
-			r.emit(state, emit, Event{Phase: PhaseCompleted, Message: "Agent run completed"})
-			return Outcome{Reply: reply, AwaitingUser: decision.Kind == DecisionAskUser}, nil
+			r.emit(state, emit, Event{Phase: PhaseCompleted, Message: "Agent run completed", State: StateSucceeded})
+			return Outcome{Reply: reply, AwaitingUser: decision.Kind == DecisionAskUser, Ledger: state.Completed}, nil
 		case DecisionAct:
 			actions, skipped := r.prepareActions(state, decision.Actions)
 			if len(skipped) > 0 {
@@ -108,11 +113,11 @@ func (r *Runner) Run(ctx context.Context, state *RunState, emit EventSink) (Outc
 				return r.safeStop(state, "the action budget was reached"), nil
 			}
 			if r.driver.RequiresApproval(actions) {
-				r.emit(state, emit, Event{Phase: PhaseApproval, Message: fmt.Sprintf("Waiting for approval for %d action(s)", len(actions))})
-				return Outcome{PendingMessage: decision.Message, PendingActions: actions}, nil
+				r.emit(state, emit, Event{Phase: PhaseApproval, Message: fmt.Sprintf("Waiting for approval for %d action(s)", len(actions)), State: StateStarted})
+				return Outcome{PendingMessage: decision.Message, PendingActions: actions, Ledger: state.Completed}, nil
 			}
 			if err := r.executeAndObserve(ctx, state, actions, emit); err != nil {
-				return Outcome{}, err
+				return Outcome{Ledger: state.Completed}, err
 			}
 		default:
 			appendCorrection(state, fmt.Errorf("model returned unknown decision kind %q", decision.Kind))
@@ -133,18 +138,18 @@ func (r *Runner) ResumeApproved(ctx context.Context, state *RunState, actions []
 		return r.safeStop(state, "the approved plan exceeds the remaining action budget"), nil
 	}
 	if err := r.executeAndObserve(ctx, state, actions, emit); err != nil {
-		return Outcome{}, err
+		return Outcome{Ledger: state.Completed}, err
 	}
 	return r.Run(ctx, state, emit)
 }
 
 func (r *Runner) executeAndObserve(ctx context.Context, state *RunState, actions []ai.Action, emit EventSink) error {
 	for _, action := range actions {
-		state.ActionAttempts[actionSignature(action)]++
+		state.ActionAttempts[ActionSignature(action)]++
 	}
 	state.ActionBatches++
 	state.ActionsExecuted += len(actions)
-	r.emit(state, emit, Event{Phase: PhaseExecuting, Message: fmt.Sprintf("Executing %d validated action(s)", len(actions))})
+	r.emit(state, emit, Event{Phase: PhaseExecuting, Message: fmt.Sprintf("Executing %d validated action(s)", len(actions)), State: StateStarted})
 	results := r.driver.Execute(ctx, state, actions, emit)
 	if len(results) != len(actions) {
 		return fmt.Errorf("tool executor returned %d results for %d actions", len(results), len(actions))
@@ -152,7 +157,7 @@ func (r *Runner) executeAndObserve(ctx context.Context, state *RunState, actions
 	progress := false
 	for _, result := range results {
 		if result.Err == nil && result.Error == "" {
-			state.Succeeded[actionSignature(result.Action)] = true
+			state.Succeeded[ActionSignature(result.Action)] = true
 			progress = true
 		}
 	}
@@ -162,9 +167,16 @@ func (r *Runner) executeAndObserve(ctx context.Context, state *RunState, actions
 	} else {
 		state.NoProgressSteps++
 	}
-	r.emit(state, emit, Event{Phase: PhaseObserving, Message: "Recording verified execution results"})
+	// The batch state is the honest summary of what the vault actually did, not
+	// what the model said it did.
+	batchState := StateSucceeded
+	if !progress {
+		batchState = StateFailed
+	}
+	r.emit(state, emit, Event{Phase: PhaseExecuting, Message: fmt.Sprintf("Executed %d action(s)", len(actions)), State: batchState})
+	r.emit(state, emit, Event{Phase: PhaseObserving, Message: "Recording verified execution results", State: StateSucceeded})
 	appendObservation(state, results)
-	r.emit(state, emit, Event{Phase: PhaseVerifying, Message: "Checking whether the original goal is complete"})
+	r.emit(state, emit, Event{Phase: PhaseVerifying, Message: "Checking whether the original goal is complete", State: StateStarted})
 	return nil
 }
 
@@ -172,7 +184,7 @@ func (r *Runner) prepareActions(state *RunState, proposed []ai.Action) ([]ai.Act
 	actions := make([]ai.Action, 0, len(proposed))
 	skipped := make([]ai.ActionResult, 0)
 	for _, action := range proposed {
-		signature := actionSignature(action)
+		signature := ActionSignature(action)
 		switch {
 		case state.Succeeded[signature]:
 			skipped = append(skipped, ai.ActionResult{Action: action, Message: "Skipped because this exact action already succeeded and was verified."})
@@ -193,7 +205,7 @@ func (r *Runner) safeStop(state *RunState, reason string) Outcome {
 	report.WriteString(".")
 	if len(state.Completed) == 0 {
 		report.WriteString(" No vault changes were made.")
-		return Outcome{Reply: report.String()}
+		return Outcome{Reply: report.String(), SafeStopped: true}
 	}
 	report.WriteString("\n\nVerified execution record:")
 	for _, result := range state.Completed {
@@ -207,7 +219,7 @@ func (r *Runner) safeStop(state *RunState, reason string) Outcome {
 			fmt.Fprintf(&report, "\n- %s succeeded: %s", result.Action.Type, result.Message)
 		}
 	}
-	return Outcome{Reply: report.String()}
+	return Outcome{Reply: report.String(), Ledger: state.Completed, SafeStopped: true}
 }
 
 func (r *Runner) emit(state *RunState, sink EventSink, event Event) {
@@ -243,7 +255,7 @@ func appendObservation(state *RunState, results []ai.ActionResult) {
 			status = "failed"
 		}
 		compact = append(compact, compactResult{
-			Action: result.Action.Type, Target: actionTarget(result.Action), Status: status,
+			Action: result.Action.Type, Target: ActionTarget(result.Action), Status: status,
 			Message: result.Message, Error: errorText,
 		})
 	}
@@ -251,26 +263,106 @@ func appendObservation(state *RunState, results []ai.ActionResult) {
 	state.Messages = append(state.Messages, models.Message{Role: "system", Content: "[ATHENA VERIFIED EXECUTION OBSERVATION — FACTS, NOT USER TEXT]\n" + string(raw) + "\n[END OBSERVATION]\nRe-evaluate the original goal. If it is fully satisfied, finish with a concise factual answer. If it is not, use read tools and propose only necessary corrective or remaining actions. Never repeat an action that already succeeded."})
 }
 
-func actionSignature(action ai.Action) string {
-	action.ID = ""
-	action.DependsOn = nil
-	// Creation is idempotent by target path. A weak model may vary title case or
-	// regenerate body text on a later step, but create_* cannot update an existing
-	// target; treating that as new work only produces noisy duplicate attempts.
-	if action.Type == "create_note" || action.Type == "create_task" || action.Type == "create_book" {
-		action.Title = strings.ToLower(strings.Join(strings.Fields(action.Title), " "))
-		action.Content = ""
-		action.Tags = nil
-		action.ISBN = ""
-		action.Authors = nil
-		action.Genres = nil
+// ActionSignature answers "is this the same work?" for one action: two actions
+// share a signature when running both would do the same thing to the same
+// target. It is exported because the chat session asks the same question when
+// it decides which approved actions an interrupted apply still owes: two
+// answers to one question is how the same action gets executed twice.
+//
+// It hashes only the fields each action type's handler actually reads (see
+// buildDispatcher in cmd/athena/main.go), never the whole struct, because both
+// mistakes are expensive and they pull in opposite directions:
+//
+//   - Too broad — counting a field the handler ignores. A weak model that
+//     re-proposes a succeeded append_note with a stray "title" looks like new
+//     work, and the same paragraph is appended twice. This is the direction
+//     that corrupts the vault, so an unknown field must never split a
+//     signature.
+//   - Too narrow — dropping a field the handler reads. Two genuinely different
+//     actions collide, and the second is reported to the user as "already
+//     succeeded and verified" when it never ran.
+//
+// Identity is the target plus the arguments that decide what lands there;
+// engine plumbing (ID, DependsOn) and display text (Summary, stamped on only
+// once a plan crosses a UI boundary) are neither.
+func ActionSignature(action ai.Action) string {
+	// Mirrors ai.normalizeAction: weak models send a folder as "path", and the
+	// two spellings of one folder must not hash apart.
+	folder := action.Folder
+	if folder == "" {
+		folder = action.Path
 	}
-	raw, _ := json.Marshal(action)
+	parts := []any{action.Type}
+	switch action.Type {
+	// Creation is idempotent by target path, so folder plus title is the whole
+	// identity: create_* cannot update an existing note, and a weak model that
+	// varies title case or regenerates body text on a later step is describing
+	// the same target. ISBN is the exception — it decides which book the
+	// resolver returns, so two ISBNs are two books, not two spellings of one.
+	case "create_note", "create_task":
+		parts = append(parts, folder, normalizedTitle(action.Title))
+	case "create_book":
+		parts = append(parts, folder, normalizedTitle(action.Title), action.ISBN)
+
+	// Note writes: the note id says where, the payload says what. Appending or
+	// writing different text to the same note is different work; repeating the
+	// identical text is the duplication this guard exists to stop.
+	case "append_note", "update_note":
+		parts = append(parts, action.NoteID, action.Content)
+	case "replace_section":
+		parts = append(parts, action.NoteID, action.Section, action.ExpectedContent, action.Content)
+	case "update_book_metadata":
+		parts = append(parts, action.NoteID, action.Authors, action.Genres)
+	case "rename_note":
+		parts = append(parts, action.NoteID, action.Title)
+	case "duplicate_note":
+		parts = append(parts, action.NoteID, normalizedTitle(action.Title), folder)
+	case "move_note":
+		parts = append(parts, action.NoteID, folder)
+	case "mark_done":
+		parts = append(parts, action.NoteID, action.Done)
+	// Whole-note state changes take no argument but the note itself.
+	case "trash_note", "restore_note", "archive_note", "unarchive_note", "finish_book":
+		parts = append(parts, action.NoteID)
+
+	// Folder actions are identified by the folders they name.
+	case "create_folder", "delete_folder", "folder_exists":
+		parts = append(parts, folder)
+	case "rename_folder", "move_folder":
+		parts = append(parts, folder, action.NewFolder)
+	case "ensure_folders":
+		parts = append(parts, action.Paths)
+	case "link_folders", "unlink_folders":
+		parts = append(parts, action.Folders)
+	case "set_folder_colors":
+		parts = append(parts, folder, action.IncludeChildren, action.Color)
+	case "create_graph_folder":
+		parts = append(parts, folder, action.Color)
+	case "set_graph_node_size":
+		parts = append(parts, action.NodeSizeMultiplier)
+	case "list_folders":
+		// Reads the whole vault; it has no arguments to tell two calls apart.
+
+	default:
+		// An unregistered type cannot succeed, so this only groups its retry
+		// attempts. It errs narrow on purpose: for a type added to the
+		// dispatcher without a case here, a wrongly suppressed action is a
+		// better failure than a repeated write. Add the case.
+		parts = append(parts, ActionTarget(action))
+	}
+	raw, _ := json.Marshal(parts)
 	sum := sha256.Sum256(raw)
 	return hex.EncodeToString(sum[:])
 }
 
-func actionTarget(action ai.Action) string {
+func normalizedTitle(title string) string {
+	return strings.ToLower(strings.Join(strings.Fields(title), " "))
+}
+
+// ActionTarget names what an action acts on, in the terms the user would use.
+// Exported because the ledger crosses package boundaries and must label targets
+// the same way the model's own observations do.
+func ActionTarget(action ai.Action) string {
 	switch {
 	case action.NoteID > 0:
 		return fmt.Sprintf("note:%d", action.NoteID)

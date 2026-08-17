@@ -1,85 +1,85 @@
 package main
 
 import (
-	"context"
-	"path/filepath"
+	"fmt"
+	"os"
+	"strings"
 	"testing"
+	"time"
 
-	"github.com/tiredbooy/internal/ai"
 	"github.com/tiredbooy/internal/notes"
-	"github.com/tiredbooy/internal/storage"
-	"github.com/tiredbooy/internal/utils"
 )
 
-func TestVerifyWriteAcceptsFolderColorActionWithoutNoteID(t *testing.T) {
-	vault := t.TempDir()
-	db, err := storage.Open(filepath.Join(t.TempDir(), "athena.db"))
-	if err != nil {
-		t.Fatalf("open database: %v", err)
-	}
-	defer db.Close()
-	service := notes.NewService(vault, storage.NewNoteStore(db), storage.NewChunkStore(db), nil)
-	for _, folder := range []string{"books/reading", "books/finished"} {
-		if err := utils.EnsureDir(vault, folder); err != nil {
-			t.Fatalf("create %s: %v", folder, err)
-		}
-	}
-	if _, err := service.AddFolderGraphColors("books", true); err != nil {
-		t.Fatalf("add colors: %v", err)
+// F-06: the process used to run under a 3600s deadline, so a session that
+// lasted an hour died mid-conversation. Only a turn is bounded now.
+func TestProcessContextHasNoDeadlineAndEndsOnInterrupt(t *testing.T) {
+	ctx, stop := processContext()
+	defer stop()
+
+	if deadline, ok := ctx.Deadline(); ok {
+		t.Fatalf("process context expires at %v; long sessions would die", deadline)
 	}
 
-	err = verifyWrite(context.Background(), service, ai.Action{
-		Type:            "set_folder_colors",
-		Folder:          "books",
-		IncludeChildren: true,
-	})
+	self, err := os.FindProcess(os.Getpid())
 	if err != nil {
-		t.Fatalf("verify folder colors: %v", err)
+		t.Fatalf("find test process: %v", err)
+	}
+	if err := self.Signal(os.Interrupt); err != nil {
+		t.Fatalf("send interrupt: %v", err)
+	}
+	select {
+	case <-ctx.Done():
+	case <-time.After(5 * time.Second):
+		t.Fatal("interrupt did not cancel the process context")
 	}
 }
 
-func TestVerifyWriteChecksFolderRenameAndMoveDestinations(t *testing.T) {
-	for _, test := range []struct {
-		name   string
-		action ai.Action
-		apply  func(*notes.Service) error
-	}{
-		{
-			name:   "rename",
-			action: ai.Action{Type: "rename_folder", Folder: "work/projects", NewFolder: "clients"},
-			apply: func(service *notes.Service) error {
-				_, err := service.RenameFolder("work/projects", "clients")
-				return err
-			},
-		},
-		{
-			name:   "move",
-			action: ai.Action{Type: "move_folder", Folder: "work/projects", NewFolder: "archive"},
-			apply: func(service *notes.Service) error {
-				_, err := service.MoveFolder("work/projects", "archive")
-				return err
-			},
-		},
+// V-07: a scan that only prints counts is indistinguishable from a scan that
+// found nothing, so every file the startup reconcile refused to settle has to
+// be named with its reason.
+func TestReportVaultScanNamesEveryFlaggedFile(t *testing.T) {
+	var out strings.Builder
+	reportVaultScan(&out, notes.VaultScan{
+		Added:       []string{"inbox/new.md"},
+		Repaired:    []string{"work/moved.md"},
+		Missing:     []notes.VaultIssue{{Path: "work/gone.md", Reason: "no matching file in the vault"}},
+		Conflicting: []notes.VaultIssue{{Path: "work/edited.md", Reason: "edited outside Athena"}},
+	})
+
+	for _, want := range []string{
+		"vault reconcile: 1 indexed, 1 repaired, 1 missing, 1 conflicting",
+		"missing: work/gone.md — no matching file in the vault",
+		"conflicting: work/edited.md — edited outside Athena",
 	} {
-		t.Run(test.name, func(t *testing.T) {
-			vault := t.TempDir()
-			db, err := storage.Open(filepath.Join(t.TempDir(), "athena.db"))
-			if err != nil {
-				t.Fatalf("open database: %v", err)
-			}
-			defer db.Close()
-			service := notes.NewService(vault, storage.NewNoteStore(db), storage.NewChunkStore(db), nil)
-			for _, folder := range []string{"work/projects", "archive"} {
-				if err := utils.EnsureDir(vault, folder); err != nil {
-					t.Fatalf("create %s: %v", folder, err)
-				}
-			}
-			if err := test.apply(service); err != nil {
-				t.Fatalf("apply action: %v", err)
-			}
-			if err := verifyWrite(context.Background(), service, test.action); err != nil {
-				t.Fatalf("verify action: %v", err)
-			}
-		})
+		if !strings.Contains(out.String(), want) {
+			t.Fatalf("report is missing %q:\n%s", want, out.String())
+		}
+	}
+}
+
+// A vault-wide move must not bury the rest of startup, and the user still has
+// to be told the list was cut short.
+func TestReportVaultScanCapsLongIssueLists(t *testing.T) {
+	scan := notes.VaultScan{}
+	for index := 0; index < 12; index++ {
+		scan.Missing = append(scan.Missing, notes.VaultIssue{Path: fmt.Sprintf("note-%d.md", index), Reason: "gone"})
+	}
+	var out strings.Builder
+	reportVaultScan(&out, scan)
+
+	if strings.Contains(out.String(), "note-10.md") {
+		t.Fatalf("report listed an 11th missing file:\n%s", out.String())
+	}
+	if !strings.Contains(out.String(), "… and 2 more missing") {
+		t.Fatalf("report did not say the list was cut short:\n%s", out.String())
+	}
+}
+
+// Nothing to report prints nothing: a quiet startup is the normal case.
+func TestReportVaultScanIsSilentWhenNothingChanged(t *testing.T) {
+	var out strings.Builder
+	reportVaultScan(&out, notes.VaultScan{})
+	if out.Len() != 0 {
+		t.Fatalf("clean scan printed %q", out.String())
 	}
 }

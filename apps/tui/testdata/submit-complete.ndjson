@@ -1,0 +1,8 @@
+{"version":1,"requestId":"r2","type":"turn.started","turnId":"t1"}
+{"version":1,"requestId":"r2","type":"activity","activity":{"phase":"searching","message":"Searching notes about rumera","state":"started","tool":"search_notes","target":"rumera","run_id":"run-1","step":1}}
+{"version":1,"requestId":"r2","type":"activity","activity":{"phase":"searching","message":"Found 2 notes","state":"succeeded","tool":"search_notes","target":"rumera","run_id":"run-1","step":1}}
+{"version":1,"requestId":"r2","type":"activity","activity":{"phase":"reading","message":"Reading work/plan.md","path":"work/plan.md","state":"started","tool":"get_note","target":"work/plan.md","run_id":"run-1","step":2}}
+{"version":1,"requestId":"r2","type":"activity","activity":{"phase":"reading","message":"Read work/plan.md","path":"work/plan.md","state":"succeeded","tool":"get_note","target":"work/plan.md","run_id":"run-1","step":2}}
+{"version":1,"requestId":"r2","type":"activity","activity":{"phase":"provider_wait","message":"Generating a response","provider":"ollama","model":"llama3.2:latest"}}
+{"version":1,"requestId":"r2","type":"response","message":"Rumera is tracked in work/plan.md."}
+{"version":1,"requestId":"r2","type":"turn.completed","turnId":"t1","message":"Rumera is tracked in work/plan.md."}

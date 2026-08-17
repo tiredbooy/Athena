@@ -12,6 +12,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/tiredbooy/internal/agent"
 	"github.com/tiredbooy/internal/ai"
 	"github.com/tiredbooy/internal/chat"
 )
@@ -22,6 +23,7 @@ const (
 	RequestHello           = "engine.hello"
 	RequestSubmit          = "session.submit"
 	RequestCancel          = "session.cancel"
+	RequestSessionReset    = "session.reset"
 	RequestPlanApprove     = "plan.approve"
 	RequestPlanReject      = "plan.reject"
 	RequestModelList       = "model.list"
@@ -47,19 +49,23 @@ type Request struct {
 // Event is one newline-delimited message written by the engine. Standard
 // output contains only these messages; diagnostics belong on standard error.
 type Event struct {
-	Version   int                   `json:"version"`
-	RequestID string                `json:"requestId,omitempty"`
-	Type      string                `json:"type"`
-	TurnID    string                `json:"turnId,omitempty"`
-	PlanID    string                `json:"planId,omitempty"`
-	Message   string                `json:"message,omitempty"`
-	Error     string                `json:"error,omitempty"`
-	Provider  string                `json:"provider,omitempty"`
-	Model     string                `json:"model,omitempty"`
-	Activity  *chat.ActivityEvent   `json:"activity,omitempty"`
-	Actions   []ai.Action           `json:"actions,omitempty"`
-	Models    []chat.ModelOption    `json:"models,omitempty"`
-	Presets   []chat.ProviderPreset `json:"presets,omitempty"`
+	Version   int                 `json:"version"`
+	RequestID string              `json:"requestId,omitempty"`
+	Type      string              `json:"type"`
+	TurnID    string              `json:"turnId,omitempty"`
+	PlanID    string              `json:"planId,omitempty"`
+	Message   string              `json:"message,omitempty"`
+	Error     string              `json:"error,omitempty"`
+	Provider  string              `json:"provider,omitempty"`
+	Model     string              `json:"model,omitempty"`
+	Activity  *chat.ActivityEvent `json:"activity,omitempty"`
+	Actions   []ai.Action         `json:"actions,omitempty"`
+	Models    []chat.ModelOption  `json:"models,omitempty"`
+	// Ledger is the verified execution record for a turn that changed the
+	// vault. It rides the terminal event so a client reports what actually
+	// happened instead of trusting the model's closing sentence.
+	Ledger  []agent.LedgerRecord  `json:"ledger,omitempty"`
+	Presets []chat.ProviderPreset `json:"presets,omitempty"`
 }
 
 // Server serializes one chat session and lets a client cancel its active turn.
@@ -168,6 +174,8 @@ func (s *Server) handle(request Request) {
 		s.startSubmit(request)
 	case RequestCancel:
 		s.cancelTurn(request)
+	case RequestSessionReset:
+		s.resetSession(request)
 	case RequestPlanApprove:
 		s.startPlanApproval(request, true)
 	case RequestPlanReject:
@@ -180,6 +188,9 @@ func (s *Server) handle(request Request) {
 		}
 		s.emit(Event{RequestID: request.RequestID, Type: "model.options", Models: models})
 	case RequestModelSelect:
+		if s.rejectIfBusy(request, "switch models") {
+			return
+		}
 		message, err := s.session.SelectModel(s.ctx, chat.ModelOption{ProviderID: request.ProviderID, Model: request.Model})
 		if err != nil {
 			s.emit(Event{RequestID: request.RequestID, Type: "error", Error: err.Error()})
@@ -190,6 +201,9 @@ func (s *Server) handle(request Request) {
 	case RequestProviderList:
 		s.emit(Event{RequestID: request.RequestID, Type: "provider.presets", Presets: s.session.ProviderPresets()})
 	case RequestProviderConnect:
+		if s.rejectIfBusy(request, "connect a provider") {
+			return
+		}
 		message, err := s.session.Connect(*request.Connection)
 		if err != nil {
 			s.emit(Event{RequestID: request.RequestID, Type: "error", Error: err.Error()})
@@ -292,6 +306,32 @@ func (s *Server) cancelTurn(request Request) {
 	s.emit(Event{RequestID: request.RequestID, Type: "turn.cancellation_requested", TurnID: turnID, Message: "Cancellation requested"})
 }
 
+// rejectIfBusy refuses operations that swap the active provider while a turn
+// is generating. Turn state is only serialized against other turns, so letting
+// a model switch land mid-generation would change the provider a running turn
+// is already using. Read-only requests such as model.list stay allowed.
+func (s *Server) rejectIfBusy(request Request, action string) bool {
+	s.stateMu.Lock()
+	busy := s.busy
+	s.stateMu.Unlock()
+	if busy {
+		s.emit(Event{RequestID: request.RequestID, Type: "error", Error: fmt.Sprintf("cannot %s while a turn is running; cancel it first", action)})
+	}
+	return busy
+}
+
+// resetSession clears engine-side conversation state. A running turn is
+// refused rather than queued: Session.Reset takes the same lock the turn
+// holds, so accepting it here would block the transport, and truncating the
+// history a turn is still appending to is not a state the user asked for.
+func (s *Server) resetSession(request Request) {
+	if s.rejectIfBusy(request, "reset the session") {
+		return
+	}
+	s.session.Reset()
+	s.emit(Event{RequestID: request.RequestID, Type: "session.reset", Message: "Session history, pending plan, and pending question cleared"})
+}
+
 func (s *Server) startPlanApproval(request Request, approve bool) {
 	if strings.TrimSpace(request.PlanID) == "" {
 		s.emit(Event{RequestID: request.RequestID, Type: "error", Error: "planId is required"})
@@ -325,6 +365,20 @@ func (s *Server) startPlanApproval(request Request, approve bool) {
 		}
 		if err != nil {
 			s.emit(Event{RequestID: request.RequestID, Type: "error", PlanID: request.PlanID, Error: err.Error()})
+			// Applying an approved plan can be interrupted part-way. The session
+			// then re-stages the actions its ledger never verified as a new
+			// single-use plan (F-05). Reporting only the error would leave that
+			// plan reachable in the engine but invisible to the client, so the
+			// user could neither resume nor discard the work they approved.
+			if approve {
+				if restaged := s.session.PendingPlan(); restaged != nil && restaged.ID != request.PlanID {
+					s.emit(Event{
+						RequestID: request.RequestID, Type: "plan.ready", PlanID: restaged.ID,
+						Actions: restaged.Actions, Ledger: s.session.LastLedger(),
+						Message: fmt.Sprintf("%d change(s) from the interrupted plan still need review", len(restaged.Actions)),
+					})
+				}
+			}
 			return
 		}
 		nextPlan := s.session.PendingPlan()
@@ -332,7 +386,11 @@ func (s *Server) startPlanApproval(request Request, approve bool) {
 		if approve {
 			typeName = "plan.approved"
 		}
-		s.emit(Event{RequestID: request.RequestID, Type: typeName, PlanID: request.PlanID, Message: message})
+		ledger := s.session.LastLedger()
+		if !approve {
+			ledger = nil
+		}
+		s.emit(Event{RequestID: request.RequestID, Type: typeName, PlanID: request.PlanID, Message: message, Ledger: ledger})
 		// Approval resumes the same agent run. If execution observations reveal
 		// another genuinely necessary high-risk step, expose a fresh one-time
 		// plan instead of hiding it inside the approval response.
@@ -359,6 +417,7 @@ func (s *Server) forwardSessionEvent(requestID, turnID string, event chat.Sessio
 		Message:   event.Message,
 		Error:     event.Error,
 		Activity:  event.Activity,
+		Ledger:    event.Ledger,
 	}
 	if event.Plan != nil {
 		output.PlanID = event.Plan.ID

@@ -23,7 +23,7 @@ import (
 //   - move_folder:      Folder (old), NewFolder (new parent)
 //   - link_folders:     Folders
 //   - unlink_folders:   Folders
-//   - set_folder_colors: Folder, IncludeChildren (optional)
+//   - set_folder_colors: Folder, IncludeChildren (optional), Color (optional)
 //   - set_graph_node_size: NodeSizeMultiplier
 //   - rename_note:      NoteID, Title (new title)
 //   - duplicate_note:   NoteID, Title (optional new title), Folder (optional target)
@@ -41,10 +41,15 @@ type Action struct {
 	ID string `json:"id,omitempty"`
 	// DependsOn names actions that must succeed before this one can run.
 	DependsOn []string `json:"depends_on,omitempty"`
-	Type      string   `json:"type"`
-	NoteID    int64    `json:"note_id,omitempty"`
-	Title     string   `json:"title,omitempty"`
-	Content   string   `json:"content,omitempty"`
+	// Summary is engine-generated display text for this action, filled in
+	// before the action crosses a UI boundary. It exists so a client renders
+	// one string instead of reimplementing a switch over every action type.
+	// Models never supply it; anything they send here is overwritten.
+	Summary string `json:"summary,omitempty"`
+	Type    string `json:"type"`
+	NoteID  int64  `json:"note_id,omitempty"`
+	Title   string `json:"title,omitempty"`
+	Content string `json:"content,omitempty"`
 	// Section and ExpectedContent make a targeted edit conditional on the text
 	// the model actually read, preventing stale plans from overwriting a newer
 	// manual edit.
@@ -55,6 +60,9 @@ type Action struct {
 	// IncludeChildren applies a folder visual setting to direct child folders
 	// as well. It is deliberately not recursive.
 	IncludeChildren bool `json:"include_children,omitempty"`
+	// Color is an explicit orb color as "#RRGGBB". Empty means Athena picks a
+	// deterministic color that contrasts with the folder's siblings.
+	Color string `json:"color,omitempty"`
 	// NodeSizeMultiplier is Obsidian's global graph node-size multiplier.
 	// Obsidian does not support a different native size for each color group.
 	NodeSizeMultiplier float64 `json:"node_size_multiplier,omitempty"`

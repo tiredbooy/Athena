@@ -50,9 +50,33 @@ func (e *TitleSuggestionError) Error() string {
 
 func NewResolver(cache *storage.BookMetadataStore, client *http.Client) *Resolver {
 	if client == nil {
-		client = &http.Client{Timeout: 8 * time.Second}
+		// Timeout covers the whole exchange — dial, TLS handshake, redirects and
+		// body — so a metadata lookup needs no separate transport timeouts; any
+		// added there would sit above this 8s budget and never fire.
+		client = &http.Client{Timeout: 8 * time.Second, CheckRedirect: refuseOffHostRedirect}
 	}
 	return &Resolver{cache: cache, client: client}
+}
+
+// refuseOffHostRedirect keeps the lookup query on openlibrary.org.
+//
+// The query string carries the user's book title, which is text out of their
+// vault, and net/http attaches the original URL as Referer when it follows a
+// redirect — so following one off-host hands that title to a third party the
+// user never chose. There is no credential on this request; the private data
+// is the title itself.
+//
+// Same rule as refuseCredentialLeakingRedirect in internal/ai/http_client.go,
+// restated here because that one is unexported in another package. Six lines
+// beat exporting a helper out of a package this code does not own.
+func refuseOffHostRedirect(req *http.Request, via []*http.Request) error {
+	previous := via[len(via)-1]
+	// An http -> https upgrade of the same host is safe; the reverse exposes the
+	// title in clear text, and any host change exposes it to someone else.
+	if req.URL.Host == previous.URL.Host && (req.URL.Scheme == previous.URL.Scheme || req.URL.Scheme == "https") {
+		return nil
+	}
+	return fmt.Errorf("refusing catalog redirect from %s to %s: the query carries the user's book title", previous.URL.Redacted(), req.URL.Redacted())
 }
 
 func (r *Resolver) Resolve(ctx context.Context, title, isbn string) (models.BookMetadata, error) {

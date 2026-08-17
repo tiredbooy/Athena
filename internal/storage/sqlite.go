@@ -69,21 +69,36 @@ CREATE TABLE IF NOT EXISTS book_metadata (
 );
 `
 
+// connectionPragmas is a DSN query string, not a one-shot statement, and that
+// distinction is the whole point. database/sql keeps a *pool* of connections
+// and opens new ones on demand, while SQLite's foreign_keys and busy_timeout
+// are per-connection settings. A `PRAGMA ...` executed once after Open lands on
+// whichever pooled connection happened to serve it, so a later query on a
+// second connection would silently run with foreign keys OFF. The
+// modernc.org/sqlite driver applies every `_pragma=` DSN parameter inside its
+// connection constructor, so putting them here is what makes them hold on all
+// connections, forever.
+//
+//   - foreign_keys: SQLite defaults them OFF; chunks.note_id ON DELETE CASCADE
+//     is only real with them ON.
+//   - busy_timeout: without it a concurrent writer fails instantly with
+//     SQLITE_BUSY. 5s of waiting is what the UI, engine, and indexer overlapping
+//     on one file need.
+//   - journal_mode WAL: readers no longer block the writer and vice versa. WAL
+//     is persisted in the database file, so this is a no-op after the first
+//     open — it stays listed so a fresh database gets it too.
+const connectionPragmas = "_pragma=foreign_keys(1)&_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)"
+
 func Open(dbPath string) (*sql.DB, error) {
-	db, err := sql.Open("sqlite", dbPath)
+	// The driver splits the DSN at the first '?' and keeps only the prefix as
+	// the filename, so a plain path (or ":memory:") carries the pragmas fine.
+	db, err := sql.Open("sqlite", dbPath+"?"+connectionPragmas)
 	if err != nil {
 		return nil, fmt.Errorf("open sqlite: %w", err)
 	}
 
 	if err := db.Ping(); err != nil {
 		return nil, fmt.Errorf("ping sqlite: %w", err)
-	}
-
-	// Quirk worth knowing: SQLite has foreign keys OFF by default, and it's
-	// a per-connection setting, not a database-level one — so this has to
-	// run every time we open a connection, not just once at DB creation.
-	if _, err := db.Exec("PRAGMA foreign_keys = ON;"); err != nil {
-		return nil, fmt.Errorf("enable foreign keys: %w", err)
 	}
 
 	if _, err := db.Exec(schema); err != nil {

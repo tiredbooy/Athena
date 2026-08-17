@@ -87,6 +87,17 @@ type Decision struct {
 	Actions []ai.Action
 }
 
+// A step's State is its lifecycle, not a judgement of the answer: "started"
+// when Athena begins real work, and "succeeded" or "failed" once that work has
+// an outcome. A UI can therefore show progress without parsing English.
+const (
+	StateStarted   = "started"
+	StateSucceeded = "succeeded"
+	StateFailed    = "failed"
+)
+
+// Event is one factual step. Phase says what kind of work it is; Tool and
+// Target say which operation and on what, for the steps that have them.
 type Event struct {
 	RunID    string
 	Step     int
@@ -108,6 +119,46 @@ type Outcome struct {
 	// AwaitingUser distinguishes a clarification from a completed answer. The
 	// chat session uses it to preserve the active goal across user turns.
 	AwaitingUser bool
+	// SafeStopped marks a run that gave up rather than answering: the budget ran
+	// out, validation failed twice, the model returned nothing usable. The reply
+	// reads like an answer, so callers that must tell "finished" from "gave up"
+	// need this flag — matching the reply text would be exactly the English
+	// parsing this architecture exists to avoid.
+	SafeStopped bool
+	// Ledger is every action this run actually executed, with the verified
+	// result. It travels with the outcome on every path — including a normal
+	// finish — because the model's closing sentence is not evidence. A terse
+	// model, or a 2B model that says nothing at all, must not be able to hide
+	// what happened to the vault.
+	Ledger []ai.ActionResult
+}
+
+// LedgerRecord is one verified action outcome in transport-safe form.
+type LedgerRecord struct {
+	Action  string `json:"action"`
+	Target  string `json:"target,omitempty"`
+	Status  string `json:"status"`
+	Message string `json:"message,omitempty"`
+	Error   string `json:"error,omitempty"`
+}
+
+// Records flattens the ledger for a UI or protocol boundary.
+func (o Outcome) Records() []LedgerRecord {
+	records := make([]LedgerRecord, 0, len(o.Ledger))
+	for _, result := range o.Ledger {
+		status, errorText := "succeeded", result.Error
+		if errorText == "" && result.Err != nil {
+			errorText = result.Err.Error()
+		}
+		if errorText != "" {
+			status = "failed"
+		}
+		records = append(records, LedgerRecord{
+			Action: result.Action.Type, Target: ActionTarget(result.Action),
+			Status: status, Message: result.Message, Error: errorText,
+		})
+	}
+	return records
 }
 
 func (o Outcome) NeedsApproval() bool { return len(o.PendingActions) > 0 }

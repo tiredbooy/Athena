@@ -42,12 +42,25 @@ func (d sessionAgentDriver) Decide(ctx context.Context, state *agent.RunState, e
 			Target: activity.Path,
 		})
 	}
+	// Read tools report themselves structurally. The English status line above
+	// stays for the fallback UI, but a client reading these events never has to
+	// parse it to know which tool ran, on what, and how it ended.
+	var onTool toolStepFunc
+	if emit != nil {
+		onTool = func(tool, target, toolState string) {
+			emit(agent.Event{
+				RunID: state.ID, Step: state.Step, Phase: agent.PhaseReading,
+				Message: readToolStepMessage(tool, target, toolState),
+				Tool:    tool, Target: target, State: toolState,
+			})
+		}
+	}
 	actionTypes := actionTypesForGoal(state.Goal)
 	decisionMessages := state.Messages
 	if !hasTaskActionContract(decisionMessages) {
 		decisionMessages = append(append([]models.Message(nil), decisionMessages...), taskActionContractMessage(actionTypes))
 	}
-	result, err := d.session.runReadToolLoopStateWithPolicy(ctx, decisionMessages, status, state.ExpectedAction, actionTypes)
+	result, err := d.session.runReadToolLoopStateWithPolicy(ctx, decisionMessages, status, onTool, state.ExpectedAction, actionTypes)
 	if err != nil {
 		return agent.Decision{}, err
 	}
@@ -157,7 +170,7 @@ func (d sessionAgentDriver) Execute(ctx context.Context, state *agent.RunState, 
 		emit(agent.Event{
 			RunID: state.ID, Step: state.Step, Phase: agent.PhaseExecuting,
 			Message: actionProgressMessage(progress), Tool: progress.Action.Type,
-			Target: chatActionTarget(progress.Action), State: progress.State,
+			Target: agent.ActionTarget(progress.Action), State: progress.State,
 		})
 	})
 	return d.session.loop.dispatcher.RunBatch(progressCtx, actions, 4)
@@ -170,21 +183,4 @@ func looksLikeClarifyingQuestion(message string) bool {
 	}
 	lower := strings.ToLower(message)
 	return containsAny(lower, []string{"which ", "what ", "where ", "do you mean", "should i", "may i", "would you like", "can you clarify"})
-}
-
-func chatActionTarget(action ai.Action) string {
-	switch {
-	case action.NoteID > 0:
-		return fmt.Sprintf("note:%d", action.NoteID)
-	case strings.TrimSpace(action.Folder) != "":
-		return action.Folder
-	case strings.TrimSpace(action.Title) != "":
-		return action.Title
-	case len(action.Paths) > 0:
-		return strings.Join(action.Paths, ", ")
-	case len(action.Folders) > 0:
-		return strings.Join(action.Folders, ", ")
-	default:
-		return ""
-	}
 }

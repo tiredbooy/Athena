@@ -1,0 +1,7 @@
+{"version":1,"requestId":"r8","type":"turn.started","turnId":"t8"}
+{"version":1,"requestId":"r8","type":"activity","activity":{"phase":"searching","message":"Searching notes about rumera","state":"started","tool":"search_notes","target":"rumera","run_id":"run-8","step":1}}
+{"version":1,"requestId":"r8","type":"activity","activity":{"phase":"searching","message":"Found 1 note","state":"succeeded","tool":"search_notes","target":"rumera","run_id":"run-8","step":1}}
+{"version":1,"requestId":"r8","type":"response.delta","message":"Rumera "}
+{"version":1,"requestId":"r8","type":"response.delta","message":"is tracked."}
+{"version":1,"requestId":"r8","type":"response","message":"Rumera is tracked."}
+{"version":1,"requestId":"r8","type":"turn.completed","turnId":"t8"}

@@ -40,25 +40,22 @@ type CodexCredentials struct {
 }
 
 type CodexOAuth struct {
-	http        *http.Client
-	mu          sync.Mutex
-	credentials CodexCredentials
-	openBrowser func(string) error
+	http          *http.Client
+	mu            sync.Mutex
+	credentials   CodexCredentials
+	pendingImport bool
+	openBrowser   func(string) error
 }
 
 func LoadCodexOAuth() (*CodexOAuth, error) {
-	o := &CodexOAuth{http: &http.Client{Timeout: 30 * time.Second}, openBrowser: openBrowser}
+	o := &CodexOAuth{http: newOAuthHTTPClient(), openBrowser: openBrowser}
 	path, err := appdirs.PrepareConfigFile("openai-codex-auth.json")
 	if err != nil {
 		return nil, err
 	}
 	raw, err := os.ReadFile(path)
 	if os.IsNotExist(err) {
-		credentials, cliErr := loadCodexCLICredentials()
-		if cliErr == nil {
-			o.credentials = credentials
-		}
-		return o, nil
+		return o, o.offerCLIImport()
 	}
 	if err != nil {
 		return nil, fmt.Errorf("read OpenAI subscription credentials: %w", err)
@@ -67,6 +64,104 @@ func LoadCodexOAuth() (*CodexOAuth, error) {
 		return nil, fmt.Errorf("parse OpenAI subscription credentials: %w", err)
 	}
 	return o, nil
+}
+
+// offerCLIImport decides what Athena may do with the OpenAI Codex CLI's tokens
+// when Athena has none of its own. Those tokens belong to another application,
+// so silence is not consent: without a recorded answer they are never used and
+// the import is only *offered*, for a caller with a UI to resolve.
+func (o *CodexOAuth) offerCLIImport() error {
+	approved, decided, err := loadCodexImportDecision()
+	if err != nil {
+		return err
+	}
+	if decided && !approved {
+		return nil
+	}
+	credentials, cliErr := loadCodexCLICredentials()
+	if cliErr != nil {
+		// The Codex CLI is absent or signed out: nothing to offer, and an
+		// earlier approval simply has nothing to import today.
+		return nil
+	}
+	if approved {
+		o.credentials = credentials
+		return nil
+	}
+	o.pendingImport = true
+	return nil
+}
+
+// PendingCLIImport reports that the Codex CLI has credentials Athena could
+// adopt but nobody has answered yet. Until ResolveCLIImport is called those
+// tokens are not used, so a caller that never asks is safe by default.
+func (o *CodexOAuth) PendingCLIImport() bool {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return o.pendingImport
+}
+
+// ResolveCLIImport records the user's answer and, on approval, adopts the Codex
+// CLI credentials as Athena's own. The answer is persisted so the question is
+// asked once: a decline must survive a restart.
+func (o *CodexOAuth) ResolveCLIImport(approve bool) error {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if err := saveCodexImportDecision(approve); err != nil {
+		return err
+	}
+	o.pendingImport = false
+	if !approve {
+		return nil
+	}
+	credentials, err := loadCodexCLICredentials()
+	if err != nil {
+		return err
+	}
+	return o.save(credentials)
+}
+
+// The decision lives in its own 0600 config file rather than inside the
+// credential file so that it survives every rewrite of the tokens — signing in,
+// refreshing, or signing out must not make Athena forget a "no".
+func codexImportDecisionPath() (string, error) {
+	return appdirs.ConfigFile("openai-codex-import.json")
+}
+
+// loadCodexImportDecision reports the persisted answer; decided is false when
+// the question has never been asked.
+func loadCodexImportDecision() (approved, decided bool, err error) {
+	path, err := codexImportDecisionPath()
+	if err != nil {
+		return false, false, err
+	}
+	raw, err := os.ReadFile(path)
+	if os.IsNotExist(err) {
+		return false, false, nil
+	}
+	if err != nil {
+		return false, false, fmt.Errorf("read Codex import decision: %w", err)
+	}
+	var decision struct {
+		Approved bool `json:"approved"`
+	}
+	if err := json.Unmarshal(raw, &decision); err != nil {
+		return false, false, fmt.Errorf("parse Codex import decision: %w", err)
+	}
+	return decision.Approved, true, nil
+}
+
+func saveCodexImportDecision(approved bool) error {
+	path, err := codexImportDecisionPath()
+	if err != nil {
+		return err
+	}
+	if err := writeOwnerOnlyJSON(path, struct {
+		Approved bool `json:"approved"`
+	}{Approved: approved}); err != nil {
+		return fmt.Errorf("save Codex import decision: %w", err)
+	}
+	return nil
 }
 
 func loadCodexCLICredentials() (CodexCredentials, error) {
@@ -354,6 +449,16 @@ func codexAuthorizeURL(challenge, state string) string {
 	// pretending to be another client such as OpenCode.
 	params := url.Values{"response_type": {"code"}, "client_id": {codexOAuthClientID}, "redirect_uri": {codexRedirectURI}, "scope": {"openid profile email offline_access"}, "code_challenge": {challenge}, "code_challenge_method": {"S256"}, "id_token_add_organizations": {"true"}, "codex_cli_simplified_flow": {"true"}, "originator": {"athena"}, "state": {state}}
 	return codexOAuthIssuer + "/oauth/authorize?" + params.Encode()
+}
+
+// Connected reports whether a stored session exists, without touching the
+// network. A stored refresh token can still have been revoked; only a real
+// request proves otherwise. Callers use this to decide whether to offer the
+// provider at all, not to skip error handling.
+func (o *CodexOAuth) Connected() bool {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return o.credentials.RefreshToken != ""
 }
 
 func (o *CodexOAuth) Credentials(ctx context.Context) (CodexCredentials, error) {

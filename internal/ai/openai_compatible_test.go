@@ -65,6 +65,69 @@ func TestOpenAICompatibleProviderPrefersOAuthTokenSource(t *testing.T) {
 	}
 }
 
+func TestOpenAICompatibleProviderRequiresToolChoiceOnlyOnMutationPath(t *testing.T) {
+	provider := NewOpenAICompatibleProvider("Test", "https://provider.test/v1", "", "test-model")
+	var sent []string
+	provider.http = &http.Client{Transport: roundTripper(func(r *http.Request) (*http.Response, error) {
+		sent = append(sent, decodedField(t, r, "tool_choice"))
+		return toolCallResponse(), nil
+	})}
+	tools := []models.ToolDefinition{{Type: "function", Function: models.ToolFunction{Name: "create_note"}}}
+	if _, err := provider.ChatWithRequiredToolsResult(context.Background(), []models.Message{{Role: "user", Content: "make a note"}}, tools); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := provider.ChatWithToolsResult(context.Background(), []models.Message{{Role: "user", Content: "read a note"}}, tools); err != nil {
+		t.Fatal(err)
+	}
+	if len(sent) != 2 || sent[0] != `"required"` || sent[1] != "" {
+		t.Fatalf("tool_choice per request = %#v, want required then absent", sent)
+	}
+}
+
+func TestOpenAICompatibleProviderRequiredToolsSurviveRejectedToolChoice(t *testing.T) {
+	provider := NewOpenAICompatibleProvider("Test", "https://provider.test/v1", "", "test-model")
+	var sent []string
+	provider.http = &http.Client{Transport: roundTripper(func(r *http.Request) (*http.Response, error) {
+		choice := decodedField(t, r, "tool_choice")
+		sent = append(sent, choice)
+		if choice != "" {
+			return &http.Response{StatusCode: http.StatusBadRequest, Body: io.NopCloser(strings.NewReader(`{"error":{"message":"unknown field: tool_choice"}}`)), Header: make(http.Header)}, nil
+		}
+		return toolCallResponse(), nil
+	})}
+	tools := []models.ToolDefinition{{Type: "function", Function: models.ToolFunction{Name: "create_note"}}}
+	result, err := provider.ChatWithRequiredToolsResult(context.Background(), []models.Message{{Role: "user", Content: "make a note"}}, tools)
+	if err != nil {
+		t.Fatalf("rejected tool_choice must not kill the turn: %v", err)
+	}
+	if len(result.Message.ToolCalls) != 1 {
+		t.Fatalf("result = %#v", result)
+	}
+	// The rejection is remembered, so the next mutation turn does not pay a
+	// failed request to rediscover it.
+	if _, err := provider.ChatWithRequiredToolsResult(context.Background(), []models.Message{{Role: "user", Content: "make another"}}, tools); err != nil {
+		t.Fatal(err)
+	}
+	if len(sent) != 3 || sent[0] != `"required"` || sent[1] != "" || sent[2] != "" {
+		t.Fatalf("tool_choice per request = %#v, want one attempt then none", sent)
+	}
+}
+
+// decodedField returns the raw JSON of one request field, or "" when the field
+// was omitted, so a test can tell "absent" from "empty value".
+func decodedField(t *testing.T, r *http.Request, field string) string {
+	t.Helper()
+	var body map[string]json.RawMessage
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		t.Fatal(err)
+	}
+	return string(body[field])
+}
+
+func toolCallResponse() *http.Response {
+	return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(`{"choices":[{"finish_reason":"tool_calls","message":{"role":"assistant","tool_calls":[{"id":"call_1","type":"function","function":{"name":"create_note","arguments":"{}"}}]}}]}`)), Header: make(http.Header)}
+}
+
 type roundTripper func(*http.Request) (*http.Response, error)
 
 func (f roundTripper) RoundTrip(request *http.Request) (*http.Response, error) { return f(request) }

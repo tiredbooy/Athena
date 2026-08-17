@@ -1,0 +1,3 @@
+{"version":1,"requestId":"r6","type":"provider.oauth.started","turnId":"oauth-1"}
+{"version":1,"requestId":"r6","type":"provider.oauth.progress","turnId":"oauth-1","message":"Open https://example.test/device"}
+{"version":1,"requestId":"r6","type":"provider.connected","provider":"xai","model":"grok-3","message":"Connected to xAI"}

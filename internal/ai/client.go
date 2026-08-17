@@ -35,7 +35,7 @@ func NewClient(host, chatModel, embedModel string) *Client {
 		host:        host,
 		chatModel:   chatModel,
 		embedModel:  embedModel,
-		http:        &http.Client{},
+		http:        newProviderHTTPClient(),
 		toolSupport: make(map[string]NativeToolSupport),
 		contextSize: make(map[string]int),
 	}
